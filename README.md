@@ -1,5 +1,7 @@
 # Game Client — Native Win32 C++17 Port (`gclient`)
 
+[![Build GClient Win32 C++ Client](https://github.com/v0ntr3n/gclient/actions/workflows/build-win32.yml/badge.svg)](https://github.com/v0ntr3n/gclient/actions/workflows/build-win32.yml)
+
 Native Win32 C++17 desktop client built on **Cocos2d-x 2.2.6 (Win32 x86)** + Lua.
 
 ## 1. Asset Directory Layout
