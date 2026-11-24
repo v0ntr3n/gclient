@@ -3373,7 +3373,7 @@ int lua_RichText_setVerticalSpace(lua_State* L) {
     if (self) {
         self->setVerticalSpace(space);
         if (auto* skel = dynamic_cast<GClientRichText*>(self)) {
-            gclient->markFormatDirty();
+            skel->markFormatDirty();
         }
     }
     return 0;
@@ -3383,8 +3383,8 @@ int lua_RichText_formatText(lua_State* L) {
     auto* self = getSafeCCObject<cocos2d::ui::RichText>(L, 1);
     if (self) {
         if (auto* skel = dynamic_cast<GClientRichText*>(self)) {
-            gclient->markFormatDirty();
-            gclient->safeFormatText();
+            skel->markFormatDirty();
+            skel->safeFormatText();
         } else {
             self->formatText();
         }
@@ -3436,7 +3436,7 @@ int lua_RichText_getContentSize(lua_State* L) {
     auto* self = getSafeCCObject<cocos2d::ui::RichText>(L, 1);
     if (self) {
         if (auto* skel = dynamic_cast<GClientRichText*>(self)) {
-            gclient->safeFormatText();
+            skel->safeFormatText();
         } else {
             self->formatText();
         }
@@ -4577,7 +4577,7 @@ int lua_Spine_clearTracks(lua_State* L) {
         const int count = static_cast<int>(self->states.size());
         for (int i = 0; i < count; ++i) {
             self->clearAnimation(i);
-            if (gclient) {
+            if (skel) {
                 skel->resetTrackTracking(i);
             }
         }
