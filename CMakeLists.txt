@@ -101,11 +101,13 @@ if(GCLIENT_COCOS2DX_BUILD_FROM_SOURCE AND EXISTS "${GCLIENT_COCOS2DX_ROOT}/CMake
         CocosDenshion
         extensions
         lua
+        glew32
     )
 else()
     target_link_directories(gclient_cocos2dx_interface INTERFACE
         "${GCLIENT_COCOS2DX_LIB_DIR}"
         "${GCLIENT_COCOS2DX_ROOT}/scripting/lua/luajit/win32"
+        "${GCLIENT_COCOS2DX_ROOT}/cocos2dx/platform/third_party/win32/libraries"
     )
     target_link_libraries(gclient_cocos2dx_interface INTERFACE
         libcocos2d
@@ -113,6 +115,7 @@ else()
         libExtensions
         liblua
         lua51
+        glew32
     )
 endif()
 
@@ -171,7 +174,7 @@ foreach(proto_file IN LISTS GCLIENT_PROTO_FILES)
 endforeach()
 
 add_library(gclient_proto STATIC ${GCLIENT_PROTO_SRCS} ${GCLIENT_PROTO_HDRS})
-target_include_directories(gclient_proto PUBLIC "${GCLIENT_PROTO_GEN_DIR}")
+target_include_directories(gclient_proto PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/generated/proto")
 target_link_libraries(gclient_proto PUBLIC protobuf::libprotobuf)
 if(MSVC)
     # Suppress third-party warnings inside generated protobuf code

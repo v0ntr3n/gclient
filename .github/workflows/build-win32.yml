@@ -141,6 +141,25 @@ jobs:
           cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath ci_logs/error.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Bundle Cocos2d-x and Lua runtime DLLs
+        shell: pwsh
+        run: |
+          $dllDirs = @(
+            "external\cocos2d-x-2.2.6\Release.win32",
+            "external\cocos2d-x-2.2.6\scripting\lua\luajit\win32",
+            "external\cocos2d-x-2.2.6\cocos2dx\platform\third_party\win32\libraries"
+          )
+          foreach ($dir in $dllDirs) {
+            if (Test-Path $dir) {
+              Get-ChildItem -Path $dir -Filter "*.dll" | ForEach-Object {
+                $dest = Join-Path "build\Release" $_.Name
+                if (-not (Test-Path $dest)) {
+                  Copy-Item $_.FullName -Destination $dest
+                }
+              }
+            }
+          }
+
       - name: Upload Win32 build artifacts
         uses: actions/upload-artifact@v4
         with:
