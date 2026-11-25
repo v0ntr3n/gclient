@@ -4842,13 +4842,28 @@ def patch_vs2022_vcxproj_and_vcpkg(cocos_root: str, vcpkg_installed_dir: str = "
     if has_vcpkg_glew:
         always_dead_dlls.add("glew32.dll")
 
+    shadowed_legacy_libs = {
+        "libtiff.lib",
+        "websockets.lib",
+        "libcurl_imp.lib",
+        "libiconv.lib",
+        "iconv.lib",
+    }
+    if has_pthread_vc3:
+        shadowed_legacy_libs.add("pthreadvce2.lib")
+    if has_vcpkg_zlib:
+        shadowed_legacy_libs.update({"libzlib.lib", "zlib1.lib"})
+    if has_vcpkg_glew:
+        shadowed_legacy_libs.add("glew32.lib")
+
     for d in legacy_dll_dirs:
         if not os.path.isdir(d):
             continue
         for entry in os.listdir(d):
-            if entry.lower() in always_dead_dlls:
+            low = entry.lower()
+            if low in always_dead_dlls or low in shadowed_legacy_libs:
                 os.remove(os.path.join(d, entry))
-                print(f"[ok] Purged obsolete prebuilt DLL: {os.path.join(d, entry)}")
+                print(f"[ok] Purged obsolete prebuilt binary/import-lib: {os.path.join(d, entry)}")
 
     luajit_win32_dir = os.path.join(cocos_root, "scripting", "lua", "luajit", "win32")
     v143_marker = os.path.join(luajit_win32_dir, "luajit-v143-built.marker")
@@ -4928,14 +4943,42 @@ def patch_vs2022_vcxproj_and_vcpkg(cocos_root: str, vcpkg_installed_dir: str = "
             txt,
         )
 
-        if has_vcpkg and vcpkg_lib not in txt:
-            txt = txt.replace(
-                "<AdditionalLibraryDirectories>",
-                f"<AdditionalLibraryDirectories>{vcpkg_lib};",
-            )
+        tp_libs_dir = os.path.abspath(
+            os.path.join(cocos_root, "cocos2dx", "platform", "third_party", "win32", "libraries")
+        ).replace("\\", "/")
+        lj_libs_dir = os.path.abspath(
+            os.path.join(cocos_root, "scripting", "lua", "luajit", "win32")
+        ).replace("\\", "/")
+        lj_inc_dir = os.path.abspath(
+            os.path.join(cocos_root, "scripting", "lua", "luajit", "include")
+        ).replace("\\", "/")
+
+        extra_lib_parts = []
+        if has_vcpkg:
+            extra_lib_parts.append(vcpkg_lib)
+        extra_lib_parts.extend([lj_libs_dir, tp_libs_dir])
+        extra_lib_prefix = ";".join(extra_lib_parts) + ";"
+
+        extra_inc_parts = [lj_inc_dir]
+        if has_vcpkg:
+            extra_inc_parts.append(vcpkg_inc)
+        extra_inc_prefix = ";".join(extra_inc_parts) + ";"
+
+        if tp_libs_dir not in txt:
+            if "<AdditionalLibraryDirectories>" in txt:
+                txt = txt.replace(
+                    "<AdditionalLibraryDirectories>",
+                    f"<AdditionalLibraryDirectories>{extra_lib_prefix}",
+                )
+            else:
+                txt = txt.replace(
+                    "<Link>",
+                    f"<Link>\n      <AdditionalLibraryDirectories>{extra_lib_prefix}%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>",
+                )
+        if lj_inc_dir not in txt and "<AdditionalIncludeDirectories>" in txt:
             txt = txt.replace(
                 "<AdditionalIncludeDirectories>",
-                f"<AdditionalIncludeDirectories>{vcpkg_inc};",
+                f"<AdditionalIncludeDirectories>{extra_inc_prefix}",
             )
 
         if VS2022_VCXPROJ_MARKER not in txt:
