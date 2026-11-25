@@ -185,6 +185,22 @@ try {
     Remove-Item -LiteralPath $SmokeRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+$CocosDllProbe = $null
+$RepoRootDir = Split-Path -Parent $PSScriptRoot
+$InitProbeExe = Join-Path $RepoRootDir "build\Release\gclient_cocos2d_dll_init_tests.exe"
+$SymbolsDir = Join-Path $RepoRootDir "dist\gclient-win32-symbols"
+if (Test-Path -LiteralPath $InitProbeExe) {
+    $ProbeJsonFile = Join-Path ([System.IO.Path]::GetTempPath()) "cocos2d_dll_init_probe_$PID.json"
+    try {
+        & $InitProbeExe --probe-only --pdb-dir "$SymbolsDir" --json-out "$ProbeJsonFile" | Write-Host
+        if (Test-Path -LiteralPath $ProbeJsonFile) {
+            $CocosDllProbe = Get-Content -LiteralPath $ProbeJsonFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        }
+    } finally {
+        Remove-Item -LiteralPath $ProbeJsonFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $AnyHeadlessGlLimit = @($Results | Where-Object { $_.headless_gl_unavailable }).Count -gt 0
 $Report = [ordered]@{
     generated_at_utc             = (Get-Date).ToUniversalTime().ToString("o")
@@ -195,6 +211,7 @@ $Report = [ordered]@{
     headless_ci_environment      = $IsHeadlessSession
     headless_wgl_limitation_hit  = $AnyHeadlessGlLimit
     gui_runtime_verdict          = if ($HardFailure) { "FAILED" } elseif ($AnyHeadlessGlLimit) { "HEADLESS_GL_UNAVAILABLE_DESKTOP_GPU_VERIFICATION_REQUIRED" } else { "PASSED" }
+    cocos2d_dll_init_probe       = $CocosDllProbe
     runs                         = $Results
 }
 

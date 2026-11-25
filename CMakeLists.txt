@@ -624,6 +624,44 @@ if(GCLIENT_BUILD_TESTS)
         endif()
     endif()
 
+    if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cocos2d_dll_init.cpp")
+        add_executable(gclient_cocos2d_dll_init_tests
+            tests/test_cocos2d_dll_init.cpp
+        )
+        target_include_directories(gclient_cocos2d_dll_init_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        )
+        target_link_libraries(gclient_cocos2d_dll_init_tests PRIVATE
+            gclient_build_options
+            gclient_cocos2dx_interface
+            gclient_diagnostics
+            gclient_assets
+            ZLIB::ZLIB
+            dbghelp
+            psapi
+            opengl32
+            gdi32
+            user32
+            advapi32
+            shell32
+        )
+        if(MSVC)
+            gclient_apply_exe_link_options(gclient_cocos2d_dll_init_tests)
+        endif()
+        add_custom_command(TARGET gclient_cocos2d_dll_init_tests POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                "-DCOCOS_BIN_DIR=${GCLIENT_COCOS2DX_LIB_DIR}"
+                "-DLUAJIT_BIN_DIR=${GCLIENT_LUAJIT_LIB_DIR}"
+                "-DDEST_DIR=$<TARGET_FILE_DIR:gclient_cocos2d_dll_init_tests>"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/stage_engine_runtime.cmake"
+            VERBATIM
+        )
+        add_test(
+            NAME gclient_cocos2d_dll_init_tests
+            COMMAND gclient_cocos2d_dll_init_tests --probe-only
+        )
+    endif()
+
     if(Python3_Interpreter_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_patch_and_pe_validator.py")
         add_test(
             NAME gclient_python_patch_and_pe_tests
