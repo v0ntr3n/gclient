@@ -100,7 +100,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: C:/vcpkg/installed
-          key: vcpkg-x86-windows-v143-v4-${{ hashFiles('CMakeLists.txt') }}
+          key: vcpkg-x86-windows-v143-v5-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-x86-windows-v143-
+            vcpkg-x86-win-
 
       - name: Install Win32 x86 (/MD) dependencies via vcpkg
         if: steps.cache-vcpkg.outputs.cache-hit != 'true'
@@ -123,7 +126,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: C:/vcpkg/installed
-          key: vcpkg-x86-windows-v143-v4-${{ hashFiles('CMakeLists.txt') }}
+          key: vcpkg-x86-windows-v143-v5-${{ hashFiles('CMakeLists.txt') }}
 
       - name: Restore cached Cocos2d-x 2.2.6 + rebuilt LuaJIT 2.0.1 (v143 x86 /MD)
         id: cache-cocos
