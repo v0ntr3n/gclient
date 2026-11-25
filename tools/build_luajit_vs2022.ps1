@@ -173,27 +173,28 @@ $MsvcBuildBat = Join-Path $SrcDir "msvcbuild.bat"
 if (-not (Test-Path -LiteralPath $MsvcBuildBat)) {
     throw "Missing src/msvcbuild.bat in '$SrcDir'."
 }
-$batText = Get-Content -LiteralPath $MsvcBuildBat -Raw -Encoding UTF8
+$batText = (Get-Content -LiteralPath $MsvcBuildBat -Raw -Encoding UTF8) -replace "`r`n", "`n"
 $batText = [regex]::Replace(
     $batText,
-    '(?m)^@set[ \t]+LJCOMPILE=.*$',
+    '(?m)^@set[ \t]+LJCOMPILE=[^\r\n]*$',
     '@set LJCOMPILE=cl /nologo /c /O2 /W3 /Zi /FS /MD /D_CRT_SECURE_NO_DEPRECATE'
 )
 $batText = [regex]::Replace(
     $batText,
-    '(?m)^@set[ \t]+LJLINK=.*$',
+    '(?m)^@set[ \t]+LJLINK=[^\r\n]*$',
     '@set LJLINK=link /nologo /DEBUG /OPT:REF /OPT:ICF'
 )
 $batText = [regex]::Replace(
     $batText,
-    '(?m)%LJLINK%[ \t]+/DLL[ \t]+/out:%LJDLLNAME%[ \t]+(.*)$',
+    '(?m)%LJLINK%[ \t]+/DLL[ \t]+/out:%LJDLLNAME%[ \t]+([^\r\n]*)$',
     '%LJLINK% /DLL /PDB:lua51.pdb /IMPLIB:%LJLIBNAME% /out:%LJDLLNAME% $1'
 )
 $batText = [regex]::Replace(
     $batText,
-    '(?m)^(%LJMT%[ \t]+-manifest[ \t]+([^\s]+)[ \t]+.*)$',
+    '(?m)^@?(%LJMT%[ \t]+-manifest[ \t]+([^\s\r\n]+)[ \t]+[^\r\n]*)$',
     '@if exist $2 $1'
 )
+$batText = $batText -replace "`n", "`r`n"
 [System.IO.File]::WriteAllText($MsvcBuildBat, $batText, [System.Text.Encoding]::ASCII)
 
 # 4. Purge stale VS2010 MSVCR100 prebuilts BEFORE building
@@ -218,15 +219,34 @@ foreach ($stale in @(
 $VcVars32 = Resolve-VcVars32
 Write-Step "Building LuaJIT 2.0.1 x86 (/MD Release + PDB) via: $VcVars32"
 
-$clCheckOut = (& cmd.exe /d /s /c "`"`"$VcVars32`" >nul && cl.exe 2>&1`"" 2>&1) -join "`n"
+$ClCheckCmdPath = Join-Path $WorkRoot "check_cl_x86.cmd"
+@(
+    "@echo off",
+    "call `"$VcVars32`" >nul 2>&1",
+    "if errorlevel 1 exit /b %errorlevel%",
+    "cl.exe 2>&1",
+    "exit /b 0"
+) -join "`r`n" | Set-Content -LiteralPath $ClCheckCmdPath -Encoding ASCII
+
+$clCheckOut = (& cmd.exe /d /c $ClCheckCmdPath) -join "`n"
 Write-Host $clCheckOut
 if ($clCheckOut -notmatch 'Version\s+(19\.[34]\d\.\d+).*for\s+x86') {
     throw "Compiler verification failed: expected MSVC v143 (19.3x/19.4x) for x86, got: $clCheckOut"
 }
 $MsvcCompilerVersion = $Matches[1]
 
-$buildCmd = "`"$VcVars32`" && cd /d `"$SrcDir`" && call msvcbuild.bat"
-& cmd.exe /d /s /c "`"$buildCmd`""
+$BuildWrapperCmdPath = Join-Path $WorkRoot "run_msvcbuild_x86.cmd"
+@(
+    "@echo off",
+    "call `"$VcVars32`" >nul 2>&1",
+    "if errorlevel 1 exit /b %errorlevel%",
+    "cd /d `"$SrcDir`"",
+    "if errorlevel 1 exit /b %errorlevel%",
+    "call msvcbuild.bat 2>&1",
+    "exit /b %errorlevel%"
+) -join "`r`n" | Set-Content -LiteralPath $BuildWrapperCmdPath -Encoding ASCII
+
+& cmd.exe /d /c $BuildWrapperCmdPath
 if ($LASTEXITCODE -ne 0) {
     throw "msvcbuild.bat failed with exit code $LASTEXITCODE."
 }
@@ -242,10 +262,19 @@ foreach ($artifact in @($BuiltDll, $BuiltLib, $BuiltPdb, $BuiltExe)) {
 }
 
 # 6. Validate lua51.dll with dumpbin /headers, /dependents, /imports, /exports
-$hdrOut = (& cmd.exe /d /s /c "`"`"$VcVars32`" >nul && dumpbin /headers `"$BuiltDll`"`"" 2>&1) -join "`n"
-$depOut = (& cmd.exe /d /s /c "`"`"$VcVars32`" >nul && dumpbin /dependents `"$BuiltDll`"`"" 2>&1) -join "`n"
-$impOut = (& cmd.exe /d /s /c "`"`"$VcVars32`" >nul && dumpbin /imports `"$BuiltDll`"`"" 2>&1) -join "`n"
-$expOut = (& cmd.exe /d /s /c "`"`"$VcVars32`" >nul && dumpbin /exports `"$BuiltDll`"`"" 2>&1) -join "`n"
+$DumpbinCmdPath = Join-Path $WorkRoot "run_dumpbin_x86.cmd"
+@(
+    "@echo off",
+    "call `"$VcVars32`" >nul 2>&1",
+    "if errorlevel 1 exit /b %errorlevel%",
+    "dumpbin %1 `"%~2`" 2>&1",
+    "exit /b %errorlevel%"
+) -join "`r`n" | Set-Content -LiteralPath $DumpbinCmdPath -Encoding ASCII
+
+$hdrOut = (& cmd.exe /d /c $DumpbinCmdPath /headers $BuiltDll) -join "`n"
+$depOut = (& cmd.exe /d /c $DumpbinCmdPath /dependents $BuiltDll) -join "`n"
+$impOut = (& cmd.exe /d /c $DumpbinCmdPath /imports $BuiltDll) -join "`n"
+$expOut = (& cmd.exe /d /c $DumpbinCmdPath /exports $BuiltDll) -join "`n"
 
 if ($hdrOut -notmatch '14C\s+machine\s+\(x86\)') {
     throw "dumpbin /headers failed: lua51.dll is not IMAGE_FILE_MACHINE_I386 (0x14C)."
@@ -278,7 +307,13 @@ foreach ($sym in $requiredExports) {
     }
 }
 
-$verOut = (& cmd.exe /d /s /c "`"`"$BuiltExe`" -v 2>&1`"" 2>&1) -join " "
+$VerCmdPath = Join-Path $WorkRoot "run_luajit_ver.cmd"
+@(
+    "@echo off",
+    "`"%~1`" -v 2>&1",
+    "exit /b %errorlevel%"
+) -join "`r`n" | Set-Content -LiteralPath $VerCmdPath -Encoding ASCII
+$verOut = (& cmd.exe /d /c $VerCmdPath $BuiltExe) -join " "
 if ($LASTEXITCODE -ne 0 -or $verOut -notmatch 'LuaJIT 2\.0\.1') {
     throw "luajit.exe -v verification failed: $verOut"
 }
