@@ -279,97 +279,8 @@ jobs:
           path: dist/gclient-win32-symbols/*
           if-no-files-found: error
 
-      - name: Report CI Failure to GitHub Issue
-        if: failure() && github.event_name != 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const sha = context.sha.substring(0, 8);
-            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-            const stepName = fs.existsSync('ci_logs/last_step.txt')
-              ? fs.readFileSync('ci_logs/last_step.txt', 'utf8').trim()
-              : 'Unknown step';
-            let logTail = 'No log captured.';
-            if (fs.existsSync('ci_logs/error.log')) {
-              const lines = fs.readFileSync('ci_logs/error.log', 'utf8').split(/\r?\n/);
-              const errRe = /(\berror\s+[A-Z]+\d+|fatal error|\bLNK\d+|\[VIOLATION\]|\[FAIL\]|\[error\]|CMake Error|Traceback|Exception)/i;
-              const matched = lines.filter(l => errRe.test(l)).slice(-80);
-              const tail = lines.slice(-100);
-              logTail = [
-                '=== Matched Error / Diagnostic Lines ===',
-                ...(matched.length ? matched : ['(no explicit error regex match)']),
-                '',
-                '=== Log Tail (last 100 lines) ===',
-                ...tail
-              ].join('\n').slice(-28000);
-            }
-
-            try {
-              await github.rest.issues.createLabel({ owner, repo, name: 'ci-failure', color: 'd73a4a', description: 'Automated CI build failure report' });
-            } catch (_) {}
-
-            const { data: openIssues } = await github.rest.issues.listForRepo({
-              owner, repo, labels: 'ci-failure', state: 'open'
-            });
-
-            const body = [
-              `### CI Build Failed`,
-              `- **Commit:** \`${sha}\``,
-              `- **Failing Step:** \`${stepName}\``,
-              `- **Workflow Run:** ${runUrl}`,
-              ``,
-              `<details open><summary>Error Log (Matched Diagnostics + Tail)</summary>`,
-              ``,
-              '```text',
-              logTail,
-              '```',
-              `</details>`
-            ].join('\n');
-
-            if (openIssues.length > 0) {
-              const issueNumber = openIssues[0].number;
-              await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
-              await github.rest.issues.update({
-                owner, repo, issue_number: issueNumber,
-                title: `[CI Failure] ${stepName} (${sha})`
-              });
-            } else {
-              await github.rest.issues.create({
-                owner, repo,
-                title: `[CI Failure] ${stepName} (${sha})`,
-                labels: ['ci-failure'],
-                body
-              });
-            }
-
-      - name: Auto-Close CI Failure Issue on Success
-        if: success() && github.event_name != 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const sha = context.sha.substring(0, 8);
-            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-            const { data: openIssues } = await github.rest.issues.listForRepo({
-              owner, repo, labels: 'ci-failure', state: 'open'
-            });
-            for (const issue of openIssues) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: issue.number,
-                body: `CI build, recursive PE32/CRT gate, CTest suite, and smoke harness passed on commit \`${sha}\` (${runUrl}). Auto-closing this issue.`
-              });
-              await github.rest.issues.update({
-                owner, repo, issue_number: issue.number,
-                state: 'closed', state_reason: 'completed'
-              });
-            }
-
       - name: Publish Closed CI Verification Evidence Record
-        if: success() && github.event_name != 'pull_request'
+        if: success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
@@ -447,3 +358,141 @@ jobs:
               state: 'closed',
               state_reason: 'completed'
             });
+
+  ci-issue-sync:
+    name: Synchronize CI error issues
+    needs: [validate-and-unit-test, build-win32]
+    if: ${{ always() && !cancelled() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - name: Create, update or close CI error issues
+        uses: actions/github-script@v7
+        env:
+          VALIDATION_RESULT: ${{ needs.validate-and-unit-test.result }}
+          BUILD_RESULT: ${{ needs.build-win32.result }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const label = 'ci-error';
+            const aliases = [label, 'ci error', 'ci-failure'];
+            const results = [process.env.VALIDATION_RESULT, process.env.BUILD_RESULT];
+            const failed = results.includes('failure');
+            const passed = results.every(result => result === 'success');
+            if (!failed && !passed) {
+              core.info('No definitive CI result; leaving issues unchanged.');
+              return;
+            }
+
+            // Do not let a rerun of an obsolete commit alter main's issue state.
+            const { data: branch } = await github.rest.repos.getBranch({
+              owner, repo, branch: 'main'
+            });
+            if (branch.commit.sha !== context.sha) {
+              core.info('Superseded main commit; leaving issues unchanged.');
+              return;
+            }
+
+            const runUrl = context.serverUrl + '/' + owner + '/' + repo + '/actions/runs/' + context.runId;
+            const attempt = process.env.GITHUB_RUN_ATTEMPT || '1';
+            const marker = '<!-- ci-run:' + context.runId + ':' + attempt + ' -->';
+            const sha = context.sha.slice(0, 8);
+
+            async function ensureLabel() {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name: label });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                try {
+                  await github.rest.issues.createLabel({
+                    owner, repo, name: label, color: 'd73a4a',
+                    description: 'Automated CI failure report'
+                  });
+                } catch (createError) {
+                  if (createError.status !== 422) throw createError;
+                  await github.rest.issues.getLabel({ owner, repo, name: label });
+                }
+              }
+            }
+
+            const byNumber = new Map();
+            for (const name of aliases) {
+              const issues = await github.paginate(github.rest.issues.listForRepo, {
+                owner, repo, state: 'open', labels: name, per_page: 100
+              });
+              for (const issue of issues) {
+                if (!issue.pull_request) byNumber.set(issue.number, issue);
+              }
+            }
+            const open = [...byNumber.values()].sort((a, b) => b.number - a.number);
+
+            if (passed) {
+              for (const issue of open) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body: 'All validation and Win32 build jobs passed on commit ' + sha +
+                    ' ([CI run](' + runUrl + ')). Automatically closing this CI error.'
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: issue.number,
+                  state: 'closed', state_reason: 'completed'
+                });
+              }
+              core.info('Closed ' + open.length + ' CI error issue(s).');
+              return;
+            }
+
+            await ensureLabel();
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner, repo, run_id: context.runId, filter: 'latest', per_page: 100
+            });
+            const failedJobs = jobs.filter(job => job.conclusion === 'failure' &&
+              job.name !== 'Synchronize CI error issues');
+            const details = failedJobs.flatMap(job => [
+              '- **Job:** [' + job.name + '](' + job.html_url + ')',
+              ...((job.steps || []).filter(step => step.conclusion === 'failure')
+                .map(step => '  - Failed step: ' + step.name))
+            ]);
+            const first = failedJobs[0];
+            const step = first?.steps?.find(step => step.conclusion === 'failure');
+            const reason = step?.name || first?.name || 'Validation or Win32 build';
+            const title = ('[CI Error] ' + reason + ' (' + sha + ')').slice(0, 240);
+            const body = [
+              marker,
+              '### CI failed on main',
+              '- Commit: ' + context.sha,
+              '- Workflow: [Run ' + context.runId + ', attempt ' + attempt + '](' + runUrl + ')',
+              '- Validation: ' + results[0],
+              '- Win32 build: ' + results[1],
+              '',
+              '### Failed jobs and steps',
+              ...(details.length ? details : ['See the workflow run for failure details.']),
+              '',
+              'Full logs are available through the linked jobs. This issue closes automatically after successful CI on main.'
+            ].join('\n');
+
+            if (!open.length) {
+              await github.rest.issues.create({ owner, repo, title, body, labels: [label] });
+              core.info('Created CI error issue.');
+              return;
+            }
+
+            // Reuse the existing incident; preserve its previous reports and discussion.
+            const issue = open[0];
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: issue.number, per_page: 100
+            });
+            if (!(issue.body || '').includes(marker) &&
+                !comments.some(comment => (comment.body || '').includes(marker))) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issue.number, body
+              });
+            }
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number: issue.number, labels: [label]
+            });
+            await github.rest.issues.update({ owner, repo, issue_number: issue.number, title });
+            core.info('Updated CI error issue #' + issue.number);
