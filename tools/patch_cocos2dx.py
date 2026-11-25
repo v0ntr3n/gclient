@@ -4753,44 +4753,73 @@ def patch_vs2022_vcxproj_and_vcpkg(cocos_root: str, vcpkg_installed_dir: str = "
             print(f"[ok] Stubbed unused HttpClient.cpp: {http_cpp}")
 
     assets_mgr_cpp = os.path.join(cocos_root, "extensions", "AssetsManager", "AssetsManager.cpp")
+    assets_mgr_h = os.path.join(cocos_root, "extensions", "AssetsManager", "AssetsManager.h")
     if os.path.exists(assets_mgr_cpp):
         txt = _read_text_closed(assets_mgr_cpp)
+        hdr_txt = _read_text_closed(assets_mgr_h) if os.path.exists(assets_mgr_h) else ""
         if "GCLIENT_NO_ASSETSMANAGER_V143" not in txt:
-            stub = (
-                "// GCLIENT_NO_ASSETSMANAGER_V143: unused Cocos2d-x AssetsManager stubbed in favor of AtomicHotUpdater\n"
-                '#include "AssetsManager.h"\n'
-                "NS_CC_EXT_BEGIN\n"
-                "AssetsManager::AssetsManager(const char* packageUrl, const char* versionFileUrl, const char* storagePath)\n"
-                "    : _storagePath(storagePath ? storagePath : \"\"), _version(\"\"),\n"
-                "      _packageUrl(packageUrl ? packageUrl : \"\"), _versionFileUrl(versionFileUrl ? versionFileUrl : \"\"),\n"
-                "      _downloadedVersion(\"\"), _curl(NULL), _tid(NULL), _connectionTimeout(0),\n"
-                "      _delegate(NULL), _isDownloading(false), _shouldDeleteDelegateWhenExit(false) {}\n"
-                "AssetsManager::~AssetsManager() {}\n"
-                "void AssetsManager::checkStoragePath() {}\n"
-                "bool AssetsManager::checkUpdate() { return false; }\n"
-                "void AssetsManager::update() {}\n"
-                "bool AssetsManager::uncompress() { return false; }\n"
-                "bool AssetsManager::downLoad() { return false; }\n"
-                "const char* AssetsManager::getPackageUrl() const { return _packageUrl.c_str(); }\n"
-                "void AssetsManager::setPackageUrl(const char* packageUrl) { _packageUrl = packageUrl ? packageUrl : \"\"; }\n"
-                "const char* AssetsManager::getStoragePath() const { return _storagePath.c_str(); }\n"
-                "void AssetsManager::setStoragePath(const char* storagePath) { _storagePath = storagePath ? storagePath : \"\"; }\n"
-                "const char* AssetsManager::getVersionFileUrl() const { return _versionFileUrl.c_str(); }\n"
-                "void AssetsManager::setVersionFileUrl(const char* versionFileUrl) { _versionFileUrl = versionFileUrl ? versionFileUrl : \"\"; }\n"
-                "std::string AssetsManager::getVersion() { return _version; }\n"
-                "void AssetsManager::deleteVersion() {}\n"
-                "void AssetsManager::setDelegate(AssetsManagerDelegateProtocol* delegate) { _delegate = delegate; }\n"
-                "void AssetsManager::setConnectionTimeout(unsigned int timeout) { _connectionTimeout = timeout; }\n"
-                "unsigned int AssetsManager::getConnectionTimeout() { return _connectionTimeout; }\n"
-                "AssetsManager* AssetsManager::create(const char* packageUrl, const char* versionFileUrl, const char* storagePath, ErrorCallback, ProgressCallback, SuccessCallback) {\n"
-                "    AssetsManager* mgr = new AssetsManager(packageUrl, versionFileUrl, storagePath);\n"
-                "    if (mgr) mgr->autorelease();\n"
-                "    return mgr;\n"
-                "}\n"
-                "void AssetsManager::createStoragePath() {}\n"
-                "void AssetsManager::destroyStoragePath() {}\n"
-                "NS_CC_EXT_END\n"
-            )
+            init_fields = [
+                '_storagePath(storagePath ? storagePath : "")',
+                '_version("")',
+                '_packageUrl(packageUrl ? packageUrl : "")',
+                '_versionFileUrl(versionFileUrl ? versionFileUrl : "")',
+                '_downloadedVersion("")',
+                '_curl(NULL)',
+                '_tid(NULL)',
+                '_connectionTimeout(0)',
+                '_delegate(NULL)',
+            ]
+            if "_isDownloading" in hdr_txt:
+                init_fields.append("_isDownloading(false)")
+            if "_shouldDeleteDelegateWhenExit" in hdr_txt:
+                init_fields.append("_shouldDeleteDelegateWhenExit(false)")
+
+            stub_lines = [
+                "// GCLIENT_NO_ASSETSMANAGER_V143: unused Cocos2d-x AssetsManager stubbed in favor of AtomicHotUpdater",
+                '#include "AssetsManager.h"',
+                "NS_CC_EXT_BEGIN",
+                "AssetsManager::AssetsManager(const char* packageUrl, const char* versionFileUrl, const char* storagePath)",
+                "    : " + ",\n      ".join(init_fields) + " {}",
+            ]
+            if re.search(r"\bAssetsManager\s*\(\s*\)\s*;", hdr_txt):
+                default_fields = [
+                    f.replace('packageUrl ? packageUrl : ""', '""')
+                     .replace('versionFileUrl ? versionFileUrl : ""', '""')
+                     .replace('storagePath ? storagePath : ""', '""')
+                    for f in init_fields
+                ]
+                stub_lines.append("AssetsManager::AssetsManager()\n    : " + ",\n      ".join(default_fields) + " {}")
+            stub_lines.extend([
+                "AssetsManager::~AssetsManager() {}",
+                "void AssetsManager::checkStoragePath() {}",
+                "bool AssetsManager::checkUpdate() { return false; }",
+                "void AssetsManager::update() {}",
+                "bool AssetsManager::uncompress() { return false; }",
+                "bool AssetsManager::downLoad() { return false; }",
+                "const char* AssetsManager::getPackageUrl() const { return _packageUrl.c_str(); }",
+                'void AssetsManager::setPackageUrl(const char* packageUrl) { _packageUrl = packageUrl ? packageUrl : ""; }',
+                "const char* AssetsManager::getStoragePath() const { return _storagePath.c_str(); }",
+                'void AssetsManager::setStoragePath(const char* storagePath) { _storagePath = storagePath ? storagePath : ""; }',
+                "const char* AssetsManager::getVersionFileUrl() const { return _versionFileUrl.c_str(); }",
+                'void AssetsManager::setVersionFileUrl(const char* versionFileUrl) { _versionFileUrl = versionFileUrl ? versionFileUrl : ""; }',
+                "std::string AssetsManager::getVersion() { return _version; }",
+                "void AssetsManager::deleteVersion() {}",
+                "void AssetsManager::setDelegate(AssetsManagerDelegateProtocol* delegate) { _delegate = delegate; }",
+                "void AssetsManager::setConnectionTimeout(unsigned int timeout) { _connectionTimeout = timeout; }",
+                "unsigned int AssetsManager::getConnectionTimeout() { return _connectionTimeout; }",
+            ])
+            if "ErrorCallback" in hdr_txt:
+                stub_lines.append(
+                    "AssetsManager* AssetsManager::create(const char* packageUrl, const char* versionFileUrl, const char* storagePath, ErrorCallback, ProgressCallback, SuccessCallback) {\n"
+                    "    return new AssetsManager(packageUrl, versionFileUrl, storagePath);\n"
+                    "}"
+                )
+            if "createStoragePath" in hdr_txt:
+                stub_lines.append("void AssetsManager::createStoragePath() {}")
+            if "destroyStoragePath" in hdr_txt:
+                stub_lines.append("void AssetsManager::destroyStoragePath() {}")
+            stub_lines.append("NS_CC_EXT_END")
+            stub = "\n".join(stub_lines) + "\n"
             _write_text_closed(assets_mgr_cpp, stub)
             print(f"[ok] Stubbed unused AssetsManager.cpp: {assets_mgr_cpp}")
 
