@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #if defined(_WIN32)
@@ -485,6 +486,76 @@ std::string ReplaceFileExtension(const std::string& path, const std::string& new
     return norm.substr(0, dotPos) + newExt;
 }
 
+#if defined(_WIN32) && (defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD))
+namespace {
+unsigned char* ReadRawBinaryWin32(const std::string& utf8OrLocalPath, unsigned long* outSize) {
+    if (outSize) {
+        *outSize = 0;
+    }
+    if (utf8OrLocalPath.empty()) {
+        return nullptr;
+    }
+    auto tryOpenWide = [](UINT codePage, DWORD flags, const std::string& s) -> FILE* {
+        const int req = ::MultiByteToWideChar(
+            codePage, flags, s.data(), static_cast<int>(s.size()), nullptr, 0);
+        if (req <= 0) {
+            return nullptr;
+        }
+        std::wstring wide(static_cast<size_t>(req), L'\0');
+        if (::MultiByteToWideChar(
+                codePage, flags, s.data(), static_cast<int>(s.size()), wide.data(), req) <= 0) {
+            return nullptr;
+        }
+        for (wchar_t& ch : wide) {
+            if (ch == L'/') {
+                ch = L'\\';
+            }
+        }
+        return ::_wfopen(wide.c_str(), L"rb");
+    };
+
+    FILE* fp = tryOpenWide(CP_UTF8, MB_ERR_INVALID_CHARS, utf8OrLocalPath);
+    if (!fp) {
+        fp = tryOpenWide(CP_UTF8, 0, utf8OrLocalPath);
+    }
+    if (!fp) {
+        fp = tryOpenWide(CP_ACP, 0, utf8OrLocalPath);
+    }
+    if (!fp) {
+        return nullptr;
+    }
+
+    if (::_fseeki64(fp, 0, SEEK_END) != 0) {
+        std::fclose(fp);
+        return nullptr;
+    }
+    const long long fileLen = ::_ftelli64(fp);
+    if (fileLen <= 0 || fileLen > 0x7FFFFFFFLL) {
+        std::fclose(fp);
+        return nullptr;
+    }
+    if (::_fseeki64(fp, 0, SEEK_SET) != 0) {
+        std::fclose(fp);
+        return nullptr;
+    }
+
+    const size_t rawLen = static_cast<size_t>(fileLen);
+    unsigned char* buf = new unsigned char[rawLen + kBtDecryptHeaderSize + 1u];
+    const size_t nRead = std::fread(buf, 1u, rawLen, fp);
+    std::fclose(fp);
+    if (nRead != rawLen) {
+        delete[] buf;
+        return nullptr;
+    }
+    buf[rawLen] = '\0';
+    if (outSize) {
+        *outSize = static_cast<unsigned long>(rawLen);
+    }
+    return buf;
+}
+} // namespace
+#endif
+
 unsigned char* LoadAndDecryptFileData(const std::string& filePath,
                                       unsigned long* outSize,
                                       DecryptResult* outDiag) {
@@ -496,14 +567,44 @@ unsigned char* LoadAndDecryptFileData(const std::string& filePath,
     if (normPath.empty()) {
         return nullptr;
     }
-    auto* fu = cocos2d::CCFileUtils::sharedFileUtils();
-    if (!fu) {
-        return nullptr;
+
+    unsigned long  rawSize       = 0;
+    unsigned char* buffer        = nullptr;
+    bool           fromCocosHeap = false;
+    std::string    fullPath      = normPath;
+
+#if defined(_WIN32)
+    // Open absolute Win32 / UNC paths directly via UTF-16 _wfopen so Unicode directories
+    // never suffer CP_ACP mojibake or trigger blocking CCFileUtils MessageBoxA popups.
+    if (normPath[0] == '/' || (normPath.size() >= 2 && normPath[1] == ':')) {
+        buffer = ReadRawBinaryWin32(normPath, &rawSize);
+    }
+#endif
+
+    if (!buffer) {
+        auto* fu = cocos2d::CCFileUtils::sharedFileUtils();
+        if (!fu) {
+            return nullptr;
+        }
+        const std::string resolved = fu->fullPathForFilename(normPath.c_str());
+        if (!resolved.empty()) {
+            fullPath = resolved;
+        }
+#if defined(_WIN32)
+        buffer = ReadRawBinaryWin32(fullPath, &rawSize);
+        if (!buffer && fullPath != normPath) {
+            buffer = ReadRawBinaryWin32(normPath, &rawSize);
+        }
+#endif
+        if (!buffer) {
+            const bool prevPopup = fu->isPopupNotify();
+            fu->setPopupNotify(false);
+            buffer = fu->getFileData(fullPath.c_str(), "rb", &rawSize);
+            fu->setPopupNotify(prevPopup);
+            fromCocosHeap = true;
+        }
     }
 
-    const std::string fullPath = fu->fullPathForFilename(normPath.c_str());
-    unsigned long     rawSize  = 0;
-    unsigned char*    buffer   = fu->getFileData(fullPath.c_str(), "rb", &rawSize);
     if (!buffer || rawSize == 0) {
         delete[] buffer;
         return nullptr;
@@ -538,16 +639,21 @@ unsigned char* LoadAndDecryptFileData(const std::string& filePath,
         outDiag->message           = "Plaintext or already decrypted by CCFileUtils";
     }
 
-    // Re-home buffer into GCLIENT.exe's CRT heap (+1 NUL byte) so caller `delete[]` never crosses DLL heaps.
-    unsigned char* ownedCopy = new unsigned char[static_cast<size_t>(rawSize) + 1u];
-    std::memcpy(ownedCopy, buffer, static_cast<size_t>(rawSize));
-    ownedCopy[rawSize] = '\0';
-    delete[] buffer;
+    if (fromCocosHeap) {
+        // Re-home buffer into GCLIENT.exe's CRT heap (+1 NUL byte) so caller `delete[]` never crosses DLL heaps.
+        unsigned char* ownedCopy = new unsigned char[static_cast<size_t>(rawSize) + 1u];
+        std::memcpy(ownedCopy, buffer, static_cast<size_t>(rawSize));
+        ownedCopy[rawSize] = '\0';
+        delete[] buffer;
+        buffer = ownedCopy;
+    } else {
+        buffer[rawSize] = '\0';
+    }
 
     if (outSize) {
         *outSize = rawSize;
     }
-    return ownedCopy;
+    return buffer;
 #else
     (void)filePath;
     (void)outDiag;

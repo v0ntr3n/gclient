@@ -110,24 +110,44 @@ bool isHeadlessOrNonInteractive(const gclient::AppConfig& cfg) {
 }
 
 HHOOK g_headlessCbtHook = nullptr;
+HHOOK g_headlessWndRetHook = nullptr;
+HWND  g_lastDismissedDialog = nullptr;
+
+void dismissHeadlessModalDialog(HWND hwnd) noexcept {
+    if (hwnd == nullptr) {
+        return;
+    }
+    wchar_t className[32] = {};
+    if (::GetClassNameW(hwnd, className, _countof(className)) <= 0 ||
+        std::wcscmp(className, L"#32770") != 0) {
+        return;
+    }
+    if (g_lastDismissedDialog != hwnd) {
+        g_lastDismissedDialog = hwnd;
+        wchar_t titleBuf[256] = {};
+        ::GetWindowTextW(hwnd, titleBuf, _countof(titleBuf));
+        std::fwprintf(stderr, L"[GCLIENT][HeadlessDialogSuppressed] Auto-dismissed modal dialog '%ls'\n", titleBuf);
+        std::fflush(stderr);
+    }
+    ::PostMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+    ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+}
 
 LRESULT CALLBACK headlessDialogSuppressorCbtProc(int nCode, WPARAM wParam, LPARAM lParam) noexcept {
     if (nCode == HCBT_ACTIVATE) {
-        HWND hwnd = reinterpret_cast<HWND>(wParam);
-        wchar_t className[32] = {};
-        if (hwnd != nullptr && ::GetClassNameW(hwnd, className, _countof(className)) > 0) {
-            if (std::wcscmp(className, L"#32770") == 0) {
-                wchar_t titleBuf[256] = {};
-                ::GetWindowTextW(hwnd, titleBuf, _countof(titleBuf));
-                std::fwprintf(stderr, L"[GCLIENT][HeadlessDialogSuppressed] Auto-dismissed modal dialog '%ls'\n", titleBuf);
-                std::fflush(stderr);
-                ::PostMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
-                ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
-                return 0;
-            }
-        }
+        dismissHeadlessModalDialog(reinterpret_cast<HWND>(wParam));
     }
     return ::CallNextHookEx(g_headlessCbtHook, nCode, wParam, lParam);
+}
+
+LRESULT CALLBACK headlessDialogSuppressorWndRetProc(int nCode, WPARAM wParam, LPARAM lParam) noexcept {
+    if (nCode >= 0 && lParam != 0) {
+        const auto* cwp = reinterpret_cast<const CWPRETSTRUCT*>(lParam);
+        if (cwp->message == WM_INITDIALOG) {
+            dismissHeadlessModalDialog(cwp->hwnd);
+        }
+    }
+    return ::CallNextHookEx(g_headlessWndRetHook, nCode, wParam, lParam);
 }
 
 class ScopedHeadlessDialogSuppressor {
@@ -135,11 +155,18 @@ public:
     explicit ScopedHeadlessDialogSuppressor(bool enabled) noexcept {
         if (enabled) {
             ::SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+            const DWORD tid = ::GetCurrentThreadId();
             g_headlessCbtHook = ::SetWindowsHookExW(
-                WH_CBT, &headlessDialogSuppressorCbtProc, nullptr, ::GetCurrentThreadId());
+                WH_CBT, &headlessDialogSuppressorCbtProc, nullptr, tid);
+            g_headlessWndRetHook = ::SetWindowsHookExW(
+                WH_CALLWNDPROCRET, &headlessDialogSuppressorWndRetProc, nullptr, tid);
         }
     }
     ~ScopedHeadlessDialogSuppressor() noexcept {
+        if (g_headlessWndRetHook != nullptr) {
+            ::UnhookWindowsHookEx(g_headlessWndRetHook);
+            g_headlessWndRetHook = nullptr;
+        }
         if (g_headlessCbtHook != nullptr) {
             ::UnhookWindowsHookEx(g_headlessCbtHook);
             g_headlessCbtHook = nullptr;

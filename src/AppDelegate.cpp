@@ -413,16 +413,117 @@ AppDelegate::~AppDelegate() {
 }
 
 bool AppDelegate::executeHeadlessAssetValidation() {
+    namespace fs = std::filesystem;
+
     LifecycleState expectedState = LifecycleState::Uninitialized;
     if (!m_lifecycleState.compare_exchange_strong(
             expectedState, LifecycleState::Initializing, std::memory_order_acq_rel)) {
         return m_assetValidationOk;
     }
-    configureFileUtils();
-    m_assetValidationOk = runAssetValidation();
+
+    diagnostics::CrashAndTelemetry::log(
+        diagnostics::LogLevel::Info,
+        "AssetValidation",
+        "Running headless --validate-assets check against '%s'",
+        m_config.resourcesDir.c_str());
+
+    std::error_code ec;
+    if (!m_config.writableDir.empty()) {
+        fs::create_directories(toSafeFsPath(m_config.writableDir), ec);
+        ec.clear();
+    }
+
+    std::vector<fs::path> searchRoots;
+    if (!m_config.writableDir.empty()) {
+        searchRoots.push_back(toSafeFsPath(m_config.writableDir) / "Resources");
+    }
+
+    if (!m_config.hotfixDir.empty()) {
+        update::HotUpdaterConfig hotCfg;
+        hotCfg.patchRootDir = toSafeFsPath(m_config.hotfixDir);
+        if (!m_config.baseAssetsDir.empty()) {
+            hotCfg.baseResourcesDir = toSafeFsPath(m_config.baseAssetsDir);
+        } else if (!m_config.resourcesDir.empty()) {
+            hotCfg.baseResourcesDir = toSafeFsPath(m_config.resourcesDir);
+        }
+        update::AtomicHotUpdater updater(hotCfg);
+        const auto health = updater.initializeAndCheckStartupHealth();
+        if (health.hasActiveOverlay && !health.activeOverlayPath.empty()) {
+            searchRoots.push_back(health.activeOverlayPath);
+        }
+        searchRoots.push_back(toSafeFsPath(m_config.hotfixDir));
+    }
+
+    if (!m_config.resourcesDir.empty()) {
+        searchRoots.push_back(toSafeFsPath(m_config.resourcesDir));
+    }
+    if (!m_config.baseAssetsDir.empty()) {
+        searchRoots.push_back(toSafeFsPath(m_config.baseAssetsDir));
+    }
+
+    fs::path resolvedScriptFs;
+    for (const fs::path& root : searchRoots) {
+        if (root.empty()) {
+            continue;
+        }
+        const fs::path cand1 = root / "scripts" / "main.lua";
+        ec.clear();
+        if (fs::is_regular_file(cand1, ec)) {
+            resolvedScriptFs = cand1;
+            break;
+        }
+        const fs::path cand2 = root / "main.lua";
+        ec.clear();
+        if (fs::is_regular_file(cand2, ec)) {
+            resolvedScriptFs = cand2;
+            break;
+        }
+    }
+
+    if (resolvedScriptFs.empty()) {
+        diagnostics::CrashAndTelemetry::log(
+            diagnostics::LogLevel::Error,
+            "AssetValidation",
+            "Missing entry script 'scripts/main.lua' under resources dir '%s'",
+            m_config.resourcesDir.c_str());
+        diagnostics::CrashAndTelemetry::flushLogs();
+        m_assetValidationOk = false;
+        m_lifecycleState.store(LifecycleState::Failed, std::memory_order_release);
+        return false;
+    }
+
+#ifdef _WIN32
+    const std::string resolvedUtf8 = wideToUtf8Path(resolvedScriptFs.wstring());
+#else
+    const std::string resolvedUtf8 = resolvedScriptFs.string();
+#endif
+
+    unsigned long dataSize = 0;
+    unsigned char* data = gclient::assets::LoadAndDecryptFileData(resolvedUtf8, &dataSize);
+    if (data == nullptr || dataSize == 0) {
+        diagnostics::CrashAndTelemetry::log(
+            diagnostics::LogLevel::Error,
+            "AssetValidation",
+            "Failed to read or decrypt '%s'",
+            resolvedUtf8.c_str());
+        delete[] data;
+        diagnostics::CrashAndTelemetry::flushLogs();
+        m_assetValidationOk = false;
+        m_lifecycleState.store(LifecycleState::Failed, std::memory_order_release);
+        return false;
+    }
+
+    delete[] data;
+    diagnostics::CrashAndTelemetry::log(
+        diagnostics::LogLevel::Info,
+        "AssetValidation",
+        "Validated '%s' (%lu bytes decrypted/loaded successfully)",
+        resolvedUtf8.c_str(),
+        dataSize);
     diagnostics::CrashAndTelemetry::flushLogs();
-    teardownSubsystems(m_assetValidationOk ? LifecycleState::Terminated : LifecycleState::Failed);
-    return m_assetValidationOk;
+    m_assetValidationOk = true;
+    m_lifecycleState.store(LifecycleState::Terminated, std::memory_order_release);
+    return true;
 }
 
 void AppDelegate::shutdown() {
@@ -431,9 +532,12 @@ void AppDelegate::shutdown() {
 
 void AppDelegate::teardownSubsystems(LifecycleState terminalState) {
     LifecycleState cur = m_lifecycleState.load(std::memory_order_acquire);
-    if (cur == LifecycleState::Terminated || cur == LifecycleState::ShuttingDown) {
-        if (terminalState == LifecycleState::Terminated) {
-            m_lifecycleState.store(LifecycleState::Terminated, std::memory_order_release);
+    if (cur == LifecycleState::Terminated ||
+        cur == LifecycleState::ShuttingDown ||
+        cur == LifecycleState::Failed ||
+        cur == LifecycleState::Uninitialized) {
+        if (terminalState == LifecycleState::Terminated || cur == LifecycleState::Uninitialized) {
+            m_lifecycleState.store(terminalState, std::memory_order_release);
         }
         return;
     }
@@ -470,6 +574,13 @@ void AppDelegate::teardownSubsystems(LifecycleState terminalState) {
 
 void AppDelegate::configureFileUtils() {
     cocos2d::CCFileUtils* fileUtils = cocos2d::CCFileUtils::sharedFileUtils();
+    if (m_config.validateAssetsOnly ||
+        isEnvFlagEnabled("GCLIENT_HEADLESS") ||
+        isEnvFlagEnabled("GCLIENT_SUPPRESS_MESSAGEBOX") ||
+        isEnvFlagEnabled("CI") ||
+        isEnvFlagEnabled("GITHUB_ACTIONS")) {
+        fileUtils->setPopupNotify(false);
+    }
 
     if (!m_config.writableDir.empty()) {
         std::error_code ec;

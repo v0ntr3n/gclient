@@ -111,13 +111,26 @@ function Invoke-BoundedGClient([string]$Label, [string[]]$Arguments) {
 
     $logsDir = Join-Path $ProfDir "logs"
     $glContextFailedInHeadless = $false
+    $logTail = ""
     if (Test-Path -LiteralPath $logsDir) {
-        $logTxt = @(
-            Get-ChildItem -LiteralPath $logsDir -Filter "*.log" -ErrorAction SilentlyContinue |
-                ForEach-Object { [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8) }
-        ) -join "`n"
+        $pidLog = Join-Path $logsDir "gclient_pid$($proc.Id).log"
+        $logTxt = ""
+        if (Test-Path -LiteralPath $pidLog) {
+            $logTxt = [System.IO.File]::ReadAllText($pidLog, [System.Text.Encoding]::UTF8)
+        } else {
+            $logTxt = @(
+                Get-ChildItem -LiteralPath $logsDir -Filter "*.log" -ErrorAction SilentlyContinue |
+                    ForEach-Object { [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8) }
+            ) -join "`n"
+        }
         if ($logTxt -match "Failed to create Win32 OpenGL 2\.0 view") {
             $glContextFailedInHeadless = $true
+        }
+        $lines = @($logTxt -split "\r?\n" | Where-Object { $_ -ne "" })
+        if ($lines.Count -gt 12) {
+            $logTail = ($lines[($lines.Count - 12)..($lines.Count - 1)] -join "`n")
+        } else {
+            $logTail = ($lines -join "`n")
         }
     }
     if ($stderrText -match "Failed to initialize Win32 OpenGL context|HeadlessDialogSuppressed") {
@@ -134,6 +147,7 @@ function Invoke-BoundedGClient([string]$Label, [string[]]$Arguments) {
         minidump_count               = $dumps.Count
         headless_gl_unavailable      = $glContextFailedInHeadless
         stderr_snippet               = $stderrText
+        log_tail                     = $logTail
     }
 }
 
