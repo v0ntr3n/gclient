@@ -23,6 +23,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Initialize validation CI log capture
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ci_logs | Out-Null
+          "Init validation" | Set-Content -Path ci_logs/last_step.txt -Encoding UTF8
+          "" | Set-Content -Path ci_logs/error.log -Encoding UTF8
+
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -31,19 +38,46 @@ jobs:
       - name: Syntax-check Python tools & run offline patcher + PE32/PE32+ gate unit tests
         shell: pwsh
         run: |
-          python -m py_compile tools/validate_resources.py
-          python -m py_compile tools/patch_cocos2dx.py
-          python -m py_compile tools/audit_pe_dependencies.py
-          python tests/test_patch_and_pe_validator.py
+          "Syntax-check Python tools & run offline patcher + PE32/PE32+ gate unit tests" | Set-Content ci_logs/last_step.txt -Encoding UTF8
+          "" | Set-Content ci_logs/error.log -Encoding UTF8
+          $env:PYTHONDONTWRITEBYTECODE = "1"
+          python -B -m py_compile tools/validate_resources.py 2>&1 | Tee-Object -FilePath ci_logs/error.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m py_compile tools/patch_cocos2dx.py 2>&1 | Tee-Object -FilePath ci_logs/error.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m py_compile tools/audit_pe_dependencies.py 2>&1 | Tee-Object -FilePath ci_logs/error.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B tests/test_patch_and_pe_validator.py 2>&1 | Tee-Object -FilePath ci_logs/error.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem -Path tools,tests -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
 
       - name: Verify zero prebuilt stale DLLs tracked in repository
         shell: pwsh
         run: |
-          $stale = Get-ChildItem -Recurse -File -Include *.dll,*.exe,*.pdb,*.pyc | Where-Object { $_.FullName -notmatch '\\(build|dist|external)\\' }
-          if ($stale) {
-            Write-Error ("Tracked binary artifacts are prohibited in source tree: " + ($stale.FullName -join ", "))
+          "Verify zero prebuilt stale DLLs tracked in repository" | Set-Content ci_logs/last_step.txt -Encoding UTF8
+          "" | Set-Content ci_logs/error.log -Encoding UTF8
+          $tracked = @(git ls-files '*.dll' '*.exe' '*.pdb' '*.pyc')
+          $untrackedBins = @(
+            Get-ChildItem -Recurse -File -Include *.dll,*.exe,*.pdb |
+              Where-Object { $_.FullName -notmatch '[\\/](?:\.git|__pycache__|build|dist|external|ci_logs)[\\/]' } |
+              ForEach-Object { $_.FullName }
+          )
+          $stale = @($tracked) + @($untrackedBins)
+          if ($stale.Count -gt 0) {
+            $msg = "Tracked or prebuilt binary artifacts are prohibited in source tree: " + ($stale -join ", ")
+            $msg | Set-Content -Path ci_logs/error.log -Encoding UTF8
+            Write-Error $msg
             exit 1
           }
+
+      - name: Upload validation CI failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-error-logs-validate
+          path: ci_logs/*
+          if-no-files-found: ignore
+          retention-days: 3
 
   build-win32:
     name: Build, Audit & Smoke-Test Win32 (x86 v143 /MD Release)
@@ -69,7 +103,7 @@ jobs:
         id: vs-env
         shell: pwsh
         run: |
-          "Verify VS2022 v143 x86 toolchain" | Set-Content ci_logs/last_step.txt
+          "Verify VS2022 v143 x86 toolchain" | Set-Content ci_logs/last_step.txt -Encoding UTF8
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $installPath = (& $vswhere -version "[17.0,18.0)" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
           if (-not $installPath) { throw "Visual Studio 2022 with x86 VC++ v143 toolset not found." }
@@ -85,14 +119,28 @@ jobs:
           if (-not $vcRedistCrt) { throw "Unable to locate x86 Microsoft.VC143.CRT redistributable folder under $vcRedistRoot" }
 
           $dumpbin = Get-ChildItem -LiteralPath (Join-Path $installPath "VC\Tools\MSVC") -Recurse -Filter "dumpbin.exe" |
-            Where-Object { $_.FullName -match "Hostx64\\x86|Hostx86\\x86" } |
+            Where-Object { $_.FullName -match "Hostx64\\x64" } |
             Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) {
+            $dumpbin = Get-ChildItem -LiteralPath (Join-Path $installPath "VC\Tools\MSVC") -Recurse -Filter "dumpbin.exe" |
+              Where-Object { $_.FullName -match "Hostx64\\x86|Hostx86\\x86" } |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
 
           "vcvars32=$vcvars32" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding UTF8
           "vcredist_x86=$vcRedistCrt" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding UTF8
           "dumpbin=$dumpbin" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding UTF8
 
-          cmd /c "`"$vcvars32`" >nul && cl 2>&1 && cmake --version && msbuild -version" 2>&1 | Tee-Object -FilePath ci_logs/error.log
+          @(
+            "@call `"$vcvars32`" >nul",
+            "@if errorlevel 1 exit /b %errorlevel%",
+            "@where cl",
+            "@if errorlevel 1 exit /b %errorlevel%",
+            "@cmake --version",
+            "@if errorlevel 1 exit /b %errorlevel%",
+            "@msbuild -version"
+          ) -join "`r`n" | Set-Content -Path ci_logs/check_vs.cmd -Encoding ASCII
+          & cmd.exe /d /c ci_logs\check_vs.cmd 2>&1 | Tee-Object -FilePath ci_logs/error.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Restore cached vcpkg x86-windows (/MD v143) packages
@@ -109,7 +157,7 @@ jobs:
         if: steps.cache-vcpkg.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          "Install vcpkg x86-windows dependencies" | Set-Content ci_logs/last_step.txt
+          "Install vcpkg x86-windows dependencies" | Set-Content ci_logs/last_step.txt -Encoding UTF8
           $vcpkg = "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe"
           & $vcpkg install `
             sqlite3:x86-windows `
@@ -141,7 +189,7 @@ jobs:
         if: steps.cache-cocos.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          "Fetch stock Cocos2d-x 2.2.6" | Set-Content ci_logs/last_step.txt
+          "Fetch stock Cocos2d-x 2.2.6" | Set-Content ci_logs/last_step.txt -Encoding UTF8
           New-Item -ItemType Directory -Force -Path external | Out-Null
           git clone --branch cocos2d-x-2.2.6 --depth 1 https://github.com/cocos2d/cocos2d-x.git external/cocos2d-x-2.2.6 2>&1 | Tee-Object -FilePath ci_logs/error.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -155,7 +203,7 @@ jobs:
         if: steps.cache-cocos.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          "Patch Cocos2d-x 2.2.6" | Set-Content ci_logs/last_step.txt
+          "Patch Cocos2d-x 2.2.6" | Set-Content ci_logs/last_step.txt -Encoding UTF8
           python tools/patch_cocos2dx.py external/cocos2d-x-2.2.6 `
             --vcpkg-installed "$env:VCPKG_INSTALLATION_ROOT/installed/x86-windows" 2>&1 | Tee-Object -FilePath ci_logs/error.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -164,7 +212,7 @@ jobs:
         if: steps.cache-cocos.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          "Build LuaJIT 2.0.1 from source (v143 x86 /MD)" | Set-Content ci_logs/last_step.txt
+          "Build LuaJIT 2.0.1 from source (v143 x86 /MD)" | Set-Content ci_logs/last_step.txt -Encoding UTF8
           pwsh -NoProfile -ExecutionPolicy Bypass -File tools/build_luajit_vs2022.ps1 `
             -CocosRoot "${{ github.workspace }}/external/cocos2d-x-2.2.6" `
             -ProvenanceOut "${{ github.workspace }}/build/luajit-provenance.json" 2>&1 | Tee-Object -FilePath ci_logs/error.log
@@ -174,9 +222,16 @@ jobs:
         if: steps.cache-cocos.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          "Build Cocos2d-x 2.2.6 Win32 v143 libraries" | Set-Content ci_logs/last_step.txt
+          "Build Cocos2d-x 2.2.6 Win32 v143 libraries" | Set-Content ci_logs/last_step.txt -Encoding UTF8
+          "" | Set-Content ci_logs/error.log -Encoding UTF8
           $vsDev = "${{ steps.vs-env.outputs.vcvars32 }}"
-          $outDir = "${{ github.workspace }}\external\cocos2d-x-2.2.6\Release.win32\\"
+          $outDirNoSlash = "${{ github.workspace }}\external\cocos2d-x-2.2.6\Release.win32"
+          New-Item -ItemType Directory -Force -Path $outDirNoSlash | Out-Null
+          @(
+            "@call `"$vsDev`" >nul",
+            "@if errorlevel 1 exit /b %errorlevel%",
+            "@msbuild `"%~1`" /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0 `"/p:OutDir=%~2\\`" /m /v:minimal"
+          ) -join "`r`n" | Set-Content -Path ci_logs/msbuild_x86.cmd -Encoding ASCII
           $projects = @(
             "external\cocos2d-x-2.2.6\external\Box2D\proj.win32\Box2D.vcxproj",
             "external\cocos2d-x-2.2.6\external\chipmunk\proj.win32\chipmunk.vcxproj",
@@ -187,11 +242,11 @@ jobs:
           )
           foreach ($proj in $projects) {
             Write-Host "=== Building $proj (Win32 | Release | v143) ==="
-            cmd /c "`"$vsDev`" >nul && msbuild `"$proj`" /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0 /p:OutDir=`"$outDir`" /m /v:minimal" 2>&1 | Tee-Object -FilePath ci_logs/error.log -Append
+            & cmd.exe /d /c ci_logs\msbuild_x86.cmd $proj $outDirNoSlash 2>&1 | Tee-Object -FilePath ci_logs/error.log -Append
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-          Copy-Item -Force "external\cocos2d-x-2.2.6\scripting\lua\luajit\win32\lua51.dll" $outDir
-          Copy-Item -Force "external\cocos2d-x-2.2.6\scripting\lua\luajit\win32\lua51.pdb" $outDir
+          Copy-Item -Force "external\cocos2d-x-2.2.6\scripting\lua\luajit\win32\lua51.dll" $outDirNoSlash
+          Copy-Item -Force "external\cocos2d-x-2.2.6\scripting\lua\luajit\win32\lua51.pdb" $outDirNoSlash
 
       - name: Save Cocos2d-x + LuaJIT 2.0.1 cache eagerly
         if: steps.cache-cocos.outputs.cache-hit != 'true'
@@ -205,7 +260,7 @@ jobs:
       - name: Configure CMake (Visual Studio 17 2022, -A Win32, -T v143, /MD, CTest ON)
         shell: pwsh
         run: |
-          "Configure CMake (VS2022 Win32 v143)" | Set-Content ci_logs/last_step.txt
+          "Configure CMake (VS2022 Win32 v143)" | Set-Content ci_logs/last_step.txt -Encoding UTF8
           cmake -B build -G "Visual Studio 17 2022" -A Win32 -T v143 `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x86-windows `
@@ -220,21 +275,23 @@ jobs:
       - name: Build GCLIENT.exe & Regression/LuaJIT ABI Test Targets (Release Win32)
         shell: pwsh
         run: |
-          "Build GCLIENT.exe & CTest targets" | Set-Content ci_logs/last_step.txt
+          "Build GCLIENT.exe & CTest targets" | Set-Content ci_logs/last_step.txt -Encoding UTF8
           cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath ci_logs/error.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Execute CTest C++17 Regression, LuaJIT 2.0.1 ABI & Python PE Gate Suites
         shell: pwsh
         run: |
-          "Run CTest regression & LuaJIT ABI suites" | Set-Content ci_logs/last_step.txt
+          "Run CTest regression & LuaJIT ABI suites" | Set-Content ci_logs/last_step.txt -Encoding UTF8
+          $env:PYTHONDONTWRITEBYTECODE = "1"
+          $env:PATH = "$env:VCPKG_INSTALLATION_ROOT\installed\x86-windows\bin;${{ github.workspace }}\external\cocos2d-x-2.2.6\scripting\lua\luajit\win32;${{ github.workspace }}\external\cocos2d-x-2.2.6\Release.win32;$env:PATH"
           ctest --test-dir build -C Release --output-on-failure --verbose 2>&1 | Tee-Object -FilePath ci_logs/error.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Stage Clean Release Closure & Run Recursive PE32 / CRT / LuaJIT Provenance Gate
         shell: pwsh
         run: |
-          "Stage release & run recursive PE32/CRT dependency gate" | Set-Content ci_logs/last_step.txt
+          "Stage release & run recursive PE32/CRT dependency gate" | Set-Content ci_logs/last_step.txt -Encoding UTF8
           New-Item -ItemType Directory -Force -Path dist/gclient-win32-release | Out-Null
           New-Item -ItemType Directory -Force -Path dist/gclient-win32-symbols | Out-Null
 
@@ -257,7 +314,7 @@ jobs:
       - name: Run Deterministic Win32 Startup & Unicode Smoke Harness
         shell: pwsh
         run: |
-          "Run Win32 startup & Unicode smoke harness" | Set-Content ci_logs/last_step.txt
+          "Run Win32 startup & Unicode smoke harness" | Set-Content ci_logs/last_step.txt -Encoding UTF8
           pwsh -NoProfile -ExecutionPolicy Bypass -File tools/smoke_test_win32.ps1 `
             -ArtifactDir "${{ github.workspace }}/dist/gclient-win32-release" `
             -ReportPath "${{ github.workspace }}/dist/gclient-win32-release/smoke-test-report.json" 2>&1 | Tee-Object -FilePath ci_logs/error.log
@@ -278,6 +335,15 @@ jobs:
           name: gclient-win32-symbols
           path: dist/gclient-win32-symbols/*
           if-no-files-found: error
+
+      - name: Upload Win32 CI failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-error-logs-build
+          path: ci_logs/*
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Publish Closed CI Verification Evidence Record
         if: success() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
@@ -369,6 +435,14 @@ jobs:
       actions: read
       issues: write
     steps:
+      - name: Download captured CI error logs
+        if: needs.validate-and-unit-test.result == 'failure' || needs.build-win32.result == 'failure'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-error-logs-*
+          path: downloaded_ci_logs
+
       - name: Create, update or close CI error issues
         uses: actions/github-script@v7
         env:
@@ -376,6 +450,8 @@ jobs:
           BUILD_RESULT: ${{ needs.build-win32.result }}
         with:
           script: |
+            const fs = require('fs');
+            const path = require('path');
             const { owner, repo } = context.repo;
             const label = 'ci-error';
             const aliases = [label, 'ci error', 'ci-failure'];
@@ -418,6 +494,28 @@ jobs:
               }
             }
 
+            function formatLogLines(rawText, heading) {
+              const clean = rawText
+                .replace(/\u001b\[[0-9;]*m/g, '')
+                .split(/\r?\n/)
+                .map(l => l.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?/, ''));
+              const errRe = /(##\[error\]|\berror\s+[A-Z]+\d+|fatal error|\bLNK\d+|Write-Error|Prohibited|\[VIOLATION\]|\[FAIL\]|\[error\]|CMake Error|Traceback|Exception)/i;
+              const matched = clean.filter(l => errRe.test(l)).slice(-80);
+              const tail = clean.slice(-100);
+              return [
+                '<details open><summary>' + heading + '</summary>',
+                '',
+                '```text',
+                '=== Matched Error / Diagnostic Lines ===',
+                ...(matched.length ? matched : ['(no explicit error regex match)']),
+                '',
+                '=== Log Tail (last 100 lines) ===',
+                ...tail,
+                '```',
+                '</details>'
+              ].join('\n').slice(0, 26000);
+            }
+
             const byNumber = new Map();
             for (const name of aliases) {
               const issues = await github.paginate(github.rest.issues.listForRepo, {
@@ -456,6 +554,43 @@ jobs:
               ...((job.steps || []).filter(step => step.conclusion === 'failure')
                 .map(step => '  - Failed step: ' + step.name))
             ]);
+
+            const logSections = [];
+            function collectArtifactLogs(dir, fallbackLabel) {
+              if (!fs.existsSync(dir)) return;
+              const directErr = path.join(dir, 'error.log');
+              const directStep = path.join(dir, 'last_step.txt');
+              if (fs.existsSync(directErr) && fs.statSync(directErr).isFile()) {
+                const content = fs.readFileSync(directErr, 'utf8').trim();
+                const stepLabel = fs.existsSync(directStep) ? fs.readFileSync(directStep, 'utf8').trim() : fallbackLabel;
+                if (content) logSections.push(formatLogLines(content, 'Captured Step Log: ' + stepLabel));
+                return;
+              }
+              for (const entry of fs.readdirSync(dir).sort()) {
+                const sub = path.join(dir, entry);
+                if (fs.statSync(sub).isDirectory()) collectArtifactLogs(sub, entry);
+              }
+            }
+            collectArtifactLogs('downloaded_ci_logs', 'CI step');
+
+            if (!logSections.length) {
+              for (const job of failedJobs.slice(0, 2)) {
+                try {
+                  const res = await github.rest.actions.downloadJobLogsForWorkflowRun({
+                    owner, repo, job_id: job.id
+                  });
+                  const raw = typeof res.data === 'string'
+                    ? res.data
+                    : Buffer.from(res.data).toString('utf8');
+                  if (raw.trim()) {
+                    logSections.push(formatLogLines(raw, 'Job Log Excerpt: ' + job.name));
+                  }
+                } catch (err) {
+                  core.info('Could not download job log for ' + job.name + ': ' + (err.message || err));
+                }
+              }
+            }
+
             const first = failedJobs[0];
             const step = first?.steps?.find(step => step.conclusion === 'failure');
             const reason = step?.name || first?.name || 'Validation or Win32 build';
@@ -471,8 +606,9 @@ jobs:
               '### Failed jobs and steps',
               ...(details.length ? details : ['See the workflow run for failure details.']),
               '',
+              ...(logSections.length ? ['### Captured Error Logs', ...logSections, ''] : []),
               'Full logs are available through the linked jobs. This issue closes automatically after successful CI on main.'
-            ].join('\n');
+            ].join('\n').slice(0, 62000);
 
             if (!open.length) {
               await github.rest.issues.create({ owner, repo, title, body, labels: [label] });
