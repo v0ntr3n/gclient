@@ -560,6 +560,70 @@ if(GCLIENT_BUILD_TESTS)
         add_test(NAME gclient_luajit_abi_tests COMMAND gclient_luajit_abi_tests)
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cobalt_relay_e2e.cpp")
+        add_executable(gclient_cobalt_relay_e2e_tests
+            tests/test_cobalt_relay_e2e.cpp
+            src/assets/BtDecryptHook.cpp
+            src/net/Amf3Module.cpp
+            src/net/LCPacket.cpp
+            src/net/CConnection.cpp
+            src/net/CNetwork.cpp
+            src/update/AtomicHotUpdater.cpp
+        )
+        target_include_directories(gclient_cobalt_relay_e2e_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${_GCLIENT_ACTIVE_LUA_INCLUDE_DIR}"
+        )
+        target_link_directories(gclient_cobalt_relay_e2e_tests PRIVATE
+            "${GCLIENT_LUAJIT_LIB_DIR}"
+        )
+        target_compile_definitions(gclient_cobalt_relay_e2e_tests PRIVATE
+            GCLIENT_STANDALONE_BUILD=1
+            GCLIENT_WITH_LUAJIT_AMF3=1
+            WIN32_LEAN_AND_MEAN
+            NOMINMAX
+            UNICODE
+            _UNICODE
+            _CRT_SECURE_NO_WARNINGS
+            _WINSOCK_DEPRECATED_NO_WARNINGS
+        )
+        target_link_libraries(gclient_cobalt_relay_e2e_tests PRIVATE
+            lua51
+            ZLIB::ZLIB
+            OpenSSL::Crypto
+            $<$<PLATFORM_ID:Windows>:ws2_32>
+            $<$<PLATFORM_ID:Windows>:bcrypt>
+            $<$<PLATFORM_ID:Windows>:crypt32>
+            $<$<PLATFORM_ID:Windows>:user32>
+            $<$<PLATFORM_ID:Windows>:advapi32>
+            $<$<PLATFORM_ID:Windows>:shell32>
+        )
+        if(MSVC)
+            target_compile_options(gclient_cobalt_relay_e2e_tests PRIVATE /W4 /utf-8 /EHsc /permissive- /FS /Zi)
+            gclient_apply_exe_link_options(gclient_cobalt_relay_e2e_tests)
+        endif()
+        if(WIN32)
+            add_custom_command(TARGET gclient_cobalt_relay_e2e_tests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${GCLIENT_LUAJIT_LIB_DIR}/lua51.dll"
+                    "$<TARGET_FILE_DIR:gclient_cobalt_relay_e2e_tests>/lua51.dll"
+                VERBATIM
+            )
+        endif()
+        if(Python3_Interpreter_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/run_cobalt_relay_e2e.py")
+            add_test(
+                NAME gclient_cobalt_relay_e2e_tests
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/run_cobalt_relay_e2e.py"
+                    --client-test-bin "$<TARGET_FILE:gclient_cobalt_relay_e2e_tests>"
+                    --auto-clone-relay
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            )
+        else()
+            add_test(NAME gclient_cobalt_relay_e2e_tests COMMAND gclient_cobalt_relay_e2e_tests --self-test)
+        endif()
+    endif()
+
     if(Python3_Interpreter_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_patch_and_pe_validator.py")
         add_test(
             NAME gclient_python_patch_and_pe_tests
