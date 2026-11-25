@@ -4820,7 +4820,13 @@ def patch_vs2022_vcxproj_and_vcpkg(cocos_root: str, vcpkg_installed_dir: str = "
     vcpkg_inc = os.path.join(vcpkg_installed_dir, "include").replace("\\", "/") if has_vcpkg else ""
     vcpkg_lib = os.path.join(vcpkg_installed_dir, "lib").replace("\\", "/") if has_vcpkg else ""
     has_pthread_vc3 = has_vcpkg and os.path.exists(os.path.join(vcpkg_lib, "pthreadVC3.lib"))
-    has_vcpkg_zlib = has_vcpkg and os.path.exists(os.path.join(vcpkg_lib, "zlib.lib"))
+    vcpkg_zlib_lib_name = ""
+    if has_vcpkg:
+        for _zlib_cand in ("zlib.lib", "libz.lib", "zdll.lib"):
+            if os.path.exists(os.path.join(vcpkg_lib, _zlib_cand)):
+                vcpkg_zlib_lib_name = _zlib_cand
+                break
+    has_vcpkg_zlib = bool(vcpkg_zlib_lib_name)
     has_vcpkg_glew = has_vcpkg and os.path.exists(os.path.join(vcpkg_lib, "glew32.lib"))
 
     if has_pthread_vc3:
@@ -4927,7 +4933,7 @@ def patch_vs2022_vcxproj_and_vcpkg(cocos_root: str, vcpkg_installed_dir: str = "
         if has_pthread_vc3:
             txt = txt.replace("pthreadVCE2.lib", "pthreadVC3.lib")
         if has_vcpkg_zlib:
-            txt = txt.replace("libzlib.lib", "zlib.lib").replace("zlib1.lib", "zlib.lib")
+            txt = txt.replace("libzlib.lib", vcpkg_zlib_lib_name).replace("zlib1.lib", vcpkg_zlib_lib_name)
 
         # Neutralize legacy PreLinkEvent / PostBuildEvent xcopy commands that dump MSVCR100 DLLs into OutDir
         txt = re.sub(
