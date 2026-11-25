@@ -11,6 +11,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -43,9 +46,10 @@ namespace {
 static const BtKeyEntry kBtDefaultKeyTables[kBtKeyTableCount] = {};
 #endif
 
-std::mutex        g_runtimeKeyTablesMutex;
-BtKeyEntry        g_runtimeKeyTables[kBtKeyTableCount] = {};
-std::atomic<bool> g_warnedMissingKeys{false};
+std::mutex                g_runtimeKeyTablesMutex;
+std::vector<uint8_t>      g_runtimeKeyStorage[kBtKeyTableCount];
+BtKeyEntry                g_runtimeKeyTables[kBtKeyTableCount] = {};
+std::atomic<bool>         g_warnedMissingKeys{false};
 
 #if !defined(GCLIENT_STANDALONE_BUILD)
 gclient::diagnostics::LogLevel ParseLogLevel(const char* level) {
@@ -163,7 +167,8 @@ bool RegisterKeyTable(uint8_t keyIndex, const uint8_t* keyData, uint32_t keyLeng
     }
     {
         std::lock_guard<std::mutex> lock(g_runtimeKeyTablesMutex);
-        g_runtimeKeyTables[keyIndex].data   = keyData;
+        g_runtimeKeyStorage[keyIndex].assign(keyData, keyData + keyLength);
+        g_runtimeKeyTables[keyIndex].data   = g_runtimeKeyStorage[keyIndex].data();
         g_runtimeKeyTables[keyIndex].length = keyLength;
     }
     return true;
@@ -214,6 +219,19 @@ uint32_t DecryptBasic(uint8_t* data, uint32_t totalSize, DecryptResult* outDiag)
     diag.headerPayloadSize = ReadLE32(data + 4);
     diag.algoIndex         = data[8];
     diag.keyIndex          = data[9];
+
+    if (diag.magic != kBtDecryptMagic) {
+        diag.status  = DecryptStatus::NotEncrypted;
+        diag.message = "Missing 0xFEFEFEFE magic in DecryptBasic";
+        if (outDiag) *outDiag = diag;
+        return 3u;
+    }
+    if (diag.algoIndex != 0 && diag.algoIndex != 1) {
+        diag.status  = DecryptStatus::UnsupportedAlgoIndex;
+        diag.message = "Unsupported encryption algorithm index in DecryptBasic";
+        if (outDiag) *outDiag = diag;
+        return 3u;
+    }
 
     const uint32_t payloadLen = totalSize - static_cast<uint32_t>(kBtDecryptHeaderSize);
     diag.actualPayloadSize    = payloadLen;
@@ -520,10 +538,16 @@ unsigned char* LoadAndDecryptFileData(const std::string& filePath,
         outDiag->message           = "Plaintext or already decrypted by CCFileUtils";
     }
 
+    // Re-home buffer into GCLIENT.exe's CRT heap (+1 NUL byte) so caller `delete[]` never crosses DLL heaps.
+    unsigned char* ownedCopy = new unsigned char[static_cast<size_t>(rawSize) + 1u];
+    std::memcpy(ownedCopy, buffer, static_cast<size_t>(rawSize));
+    ownedCopy[rawSize] = '\0';
+    delete[] buffer;
+
     if (outSize) {
         *outSize = rawSize;
     }
-    return buffer;
+    return ownedCopy;
 #else
     (void)filePath;
     (void)outDiag;
@@ -569,7 +593,7 @@ bool bt_decrypt(unsigned char* data, unsigned long* size) {
 }
 
 bool bt_decrypt_u64(uint8_t* data, uint64_t* size) {
-    if (data == nullptr || size == nullptr) {
+    if (data == nullptr || size == nullptr || *size > 0xFFFFFFFFull) {
         return false;
     }
     size_t sz = static_cast<size_t>(*size);

@@ -11,10 +11,11 @@ Win32 Cocos2d-x 2.2.6 C++ client:
   - `.png` / `.jpg` (`.jpeg`): plaintext magic vs. `0xFEFEFEFE` encrypted
     headers and `bt_decrypt` key index (0..15) distribution.
   - `.db`: SQLite 3 magic header verification (`SQLite format 3\x00`) and
-    last-column hex-encoded `0xFEFEFEFE` (`doDecrypt`) presence audit.
+    last-column hex-encoded or raw `0xFEFEFEFE` (`doDecrypt`) presence audit.
 
 Uses only the Python 3 standard library and opens SQLite databases in strictly
-read-only immutable URI mode so `Resources/` is never modified.
+read-only immutable URI mode (RFC 8089 `Path.as_uri()`) so Windows drive letters,
+spaces, and non-ASCII Unicode paths work cleanly without modifying `Resources/`.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote
 
 BT_ENCRYPT_MAGIC = b"\xfe\xfe\xfe\xfe"
 LUAJIT_MAGIC = b"\x1bLJ"
@@ -120,9 +120,9 @@ def read_header(path: Path, n: int = 64) -> bytes:
 
 
 def parse_bt_key_index(header: bytes) -> Optional[int]:
-    """Extract the 1-byte bt_decrypt key index following 0xFEFEFEFE."""
-    if len(header) >= 5 and header[:4] == BT_ENCRYPT_MAGIC:
-        return header[4]
+    """Extract the 1-byte bt_decrypt keyIndex at header[9] ([0..3]=magic, [4..7]=payloadSize, [8]=algoIndex, [9]=keyIndex)."""
+    if len(header) >= 10 and header[:4] == BT_ENCRYPT_MAGIC:
+        return header[9]
     return None
 
 
@@ -134,28 +134,29 @@ def looks_like_plaintext_lua(header: bytes) -> bool:
         return True
     if b"\x00" in sample:
         return False
-    # Allow printable ASCII, whitespace, and valid UTF-8 sequences.
-    try:
-        sample.decode("utf-8", errors="strict")
-        return True
-    except UnicodeDecodeError:
-        # Fallback: partial multi-byte UTF-8 cut at the 64-byte boundary.
+    # Try progressive 0..3 byte trims in case a 2/3/4-byte UTF-8 sequence was cut at byte 64.
+    for trim_len in (0, 1, 2, 3):
+        candidate = sample if trim_len == 0 else sample[:-trim_len]
+        if not candidate:
+            break
         try:
-            sample[:-3].decode("utf-8", errors="strict")
+            candidate.decode("utf-8", errors="strict")
             return True
         except UnicodeDecodeError:
-            return False
+            continue
+    return False
 
 
 def try_decode_hex_fefefefe(value: object) -> Tuple[bool, Optional[int]]:
     """
     Match CConfigManager.cpp's last-column contract:
-    hex-decode the blob/text and check for the 0xFEFEFEFE bt_decrypt header.
-    Returns (is_hex_fefefefe, key_index).
+    detect either raw binary `0xFEFEFEFE` blobs or hex-encoded `fefefefe...` text.
     """
     if value is None:
         return False, None
     if isinstance(value, bytes):
+        if len(value) >= 10 and value[:4] == BT_ENCRYPT_MAGIC:
+            return True, parse_bt_key_index(value)
         try:
             text = value.decode("ascii")
         except UnicodeDecodeError:
@@ -166,21 +167,27 @@ def try_decode_hex_fefefefe(value: object) -> Tuple[bool, Optional[int]]:
         return False, None
 
     text = text.strip()
-    if len(text) < 10 or (len(text) % 2) != 0:
+    if len(text) < 20 or (len(text) % 2) != 0:
         return False, None
-    if not text[:8].lower() == "fefefefe":
+    if text[:8].lower() != "fefefefe":
         return False, None
 
     try:
-        # Validate full hex string (or prefix + valid hex) cleanly.
-        decoded_prefix = bytes.fromhex(text[:16] if len(text) >= 16 else text)
-        # Ensure remaining characters are valid hex digits too.
-        int(text, 16)
+        decoded_prefix = bytes.fromhex(text[:20])
+        bytes.fromhex(text)
     except ValueError:
         return False, None
 
     key_idx = parse_bt_key_index(decoded_prefix)
     return True, key_idx
+
+
+def build_sqlite_ro_uri(db_path: Path) -> str:
+    """Build a valid cross-platform SQLite RFC 3986 / 8089 read-only URI (handles C:/, spaces, Unicode, ?/#)."""
+    resolved = db_path.resolve()
+    base_uri = resolved.as_uri()
+    sep = "&" if "?" in base_uri else "?"
+    return f"{base_uri}{sep}mode=ro&immutable=1"
 
 
 def audit_db_file(
@@ -215,8 +222,7 @@ def audit_db_file(
 
     stats.valid_sqlite3 += 1
 
-    # Open strictly read-only & immutable so SQLite never creates -wal/-shm files.
-    uri = f"file:{quote(str(db_path.resolve()))}?mode=ro&immutable=1"
+    uri = build_sqlite_ro_uri(db_path)
     conn: Optional[sqlite3.Connection] = None
     try:
         conn = sqlite3.connect(uri, uri=True)
@@ -297,9 +303,16 @@ def audit_resources(resources_dir: Path, db_sample_rows: int = 5) -> AuditReport
             rel = str(fpath.relative_to(resources_dir)).replace("\\", "/")
             lower = fname.lower()
 
-            if lower.endswith(".pvr.ccz"):
+            if lower == ".db":
+                ext = ".db"
+            elif lower.endswith(".pvr.ccz"):
                 report.pvr_ccz.total += 1
-                header = read_header(fpath, 16)
+                try:
+                    header = read_header(fpath, 16)
+                except OSError as exc:
+                    report.pvr_ccz.unexpected_header += 1
+                    report.warnings.append(f"Unreadable .pvr.ccz {rel}: {exc}")
+                    continue
                 if header.startswith(BT_ENCRYPT_MAGIC):
                     report.pvr_ccz.bt_encrypted += 1
                     record_key(ccz_keys, parse_bt_key_index(header), rel)
@@ -308,12 +321,30 @@ def audit_resources(resources_dir: Path, db_sample_rows: int = 5) -> AuditReport
                 else:
                     report.pvr_ccz.unexpected_header += 1
                 continue
+            else:
+                ext = os.path.splitext(lower)[1]
 
-            ext = os.path.splitext(lower)[1]
+            if ext == ".db":
+                audit_db_file(
+                    fpath, rel, db_sample_rows, report.db, db_keys, report.out_of_range_key_indices
+                )
+                continue
+
+            if ext not in (".lua", ".plistb", ".xmlb", ".pb", ".png", ".jpg", ".jpeg", ".pkm", ".ktx", ".etc", ".pvr"):
+                continue
+
+            if ext in (".pkm", ".ktx", ".etc", ".pvr"):
+                mobile_tex_counter[ext] += 1
+                continue
+
+            try:
+                header = read_header(fpath, 64 if ext == ".lua" else 16)
+            except OSError as exc:
+                report.warnings.append(f"Unreadable asset {rel}: {exc}")
+                continue
 
             if ext == ".lua":
                 report.lua.total += 1
-                header = read_header(fpath, 64)
                 if not header:
                     report.lua.empty_or_unknown += 1
                 elif header.startswith(BT_ENCRYPT_MAGIC):
@@ -343,7 +374,6 @@ def audit_resources(resources_dir: Path, db_sample_rows: int = 5) -> AuditReport
                     ".pb": (report.pb, pb_keys),
                 }[ext]
                 target.total += 1
-                header = read_header(fpath, 16)
                 if not header:
                     target.empty += 1
                 elif header.startswith(BT_ENCRYPT_MAGIC):
@@ -354,7 +384,6 @@ def audit_resources(resources_dir: Path, db_sample_rows: int = 5) -> AuditReport
 
             elif ext == ".png":
                 report.png.total += 1
-                header = read_header(fpath, 16)
                 if header.startswith(BT_ENCRYPT_MAGIC):
                     report.png.bt_encrypted += 1
                     record_key(png_keys, parse_bt_key_index(header), rel)
@@ -365,7 +394,6 @@ def audit_resources(resources_dir: Path, db_sample_rows: int = 5) -> AuditReport
 
             elif ext in (".jpg", ".jpeg"):
                 report.jpg.total += 1
-                header = read_header(fpath, 16)
                 if header.startswith(BT_ENCRYPT_MAGIC):
                     report.jpg.bt_encrypted += 1
                     record_key(jpg_keys, parse_bt_key_index(header), rel)
@@ -373,14 +401,6 @@ def audit_resources(resources_dir: Path, db_sample_rows: int = 5) -> AuditReport
                     report.jpg.plaintext_valid += 1
                 else:
                     report.jpg.invalid_or_mismatched += 1
-
-            elif ext == ".db":
-                audit_db_file(
-                    fpath, rel, db_sample_rows, report.db, db_keys, report.out_of_range_key_indices
-                )
-
-            elif ext in (".pkm", ".ktx", ".etc", ".pvr"):
-                mobile_tex_counter[ext] += 1
 
     report.lua.bt_key_indices = dict(sorted(lua_keys.items()))
     report.plistb.bt_key_indices = dict(sorted(plistb_keys.items()))
@@ -392,15 +412,14 @@ def audit_resources(resources_dir: Path, db_sample_rows: int = 5) -> AuditReport
     report.db.last_col_bt_key_indices = dict(sorted(db_keys.items()))
     report.mobile_compressed_textures = dict(sorted(mobile_tex_counter.items()))
 
-    # Evaluate Win32 launch readiness blockers & warnings.
     if report.total_files_scanned == 0:
         report.blockers.append("Resources directory is empty (0 files scanned).")
     if report.lua.total == 0:
         report.blockers.append("No .lua scripts found in Resources/.")
     if report.lua.luajit_bytecode > 0:
-        report.blockers.append(
-            f"{report.lua.luajit_bytecode} LuaJIT bytecode file(s) detected; "
-            "stock Cocos2d-x 2.2.6 Lua 5.1 VM cannot execute LuaJIT bytecode without LuaJIT."
+        report.warnings.append(
+            f"{report.lua.luajit_bytecode} LuaJIT 2.0.1 bytecode file(s) detected; "
+            "ensure the client links LuaJIT 2.0.1 x86 (lua51.dll) rather than PUC-Rio Lua 5.1."
         )
     if report.lua.lua_other_bytecode > 0:
         report.blockers.append(
@@ -409,7 +428,7 @@ def audit_resources(resources_dir: Path, db_sample_rows: int = 5) -> AuditReport
     if report.lua.lua51_bytecode > 0:
         report.warnings.append(
             f"{report.lua.lua51_bytecode} Lua 5.1 bytecode file(s) detected; "
-            "verify 32-bit ARM vs. Win32 x86 pointer/size_t header compatibility."
+            "verify 32-bit pointer/size_t header compatibility."
         )
     if report.db.invalid_magic > 0 or report.db.open_or_query_errors > 0:
         report.blockers.append(
@@ -434,7 +453,7 @@ def audit_resources(resources_dir: Path, db_sample_rows: int = 5) -> AuditReport
         summary = ", ".join(f"{k}:{v}" for k, v in report.mobile_compressed_textures.items())
         report.warnings.append(
             f"Mobile-compressed textures detected ({summary}); Win32 OpenGL 2.1 will "
-            "fall back to RGBA8888 software decode (4x-8x RAM/VRAM overhead)."
+            "use software RGBA8888 decode."
         )
 
     if report.blockers:
@@ -463,7 +482,6 @@ def print_concise_report(report: AuditReport, verbose: bool = False) -> None:
     print("-" * 76)
     print(f"{'Category':<12} {'Total':>7}  Breakdown")
     print("-" * 76)
-
     print(
         f"{'.lua':<12} {report.lua.total:>7}  "
         f"plain={report.lua.plaintext}, bt_enc={report.lua.bt_encrypted}, "
@@ -498,7 +516,7 @@ def print_concise_report(report: AuditReport, verbose: bool = False) -> None:
         f"{'.db':<12} {report.db.total:>7}  "
         f"sqlite3={report.db.valid_sqlite3}, invalid={report.db.invalid_magic}, "
         f"err={report.db.open_or_query_errors}, "
-        f"last_col_hex_FE={report.db.dbs_with_hex_fefefefe_last_col}, "
+        f"last_col_FE={report.db.dbs_with_hex_fefefefe_last_col}, "
         f"last_col_plain={report.db.dbs_plaintext_last_col_only}"
     )
     print("-" * 76)
@@ -554,7 +572,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--db-sample-rows",
         type=int,
         default=5,
-        help="Rows to sample per SQLite table when checking last-column hex+0xFEFEFEFE (0 = all rows, default: 5).",
+        help="Rows to sample per SQLite table when checking last-column 0xFEFEFEFE (0 = all rows, default: 5).",
     )
     parser.add_argument(
         "--json",

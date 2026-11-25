@@ -1,8 +1,19 @@
 #pragma once
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -291,7 +302,16 @@ private:
     static bool loadFromBrokerFile(const std::string& path,
                                    AuthSession& outSession,
                                    std::string& outError) {
-        std::ifstream ifs(path);
+#ifdef _WIN32
+        int wlen = ::MultiByteToWideChar(CP_UTF8, 0, path.data(), static_cast<int>(path.size()), nullptr, 0);
+        std::wstring wpath(wlen > 0 ? static_cast<size_t>(wlen) : 0u, L'\0');
+        if (wlen > 0) {
+            ::MultiByteToWideChar(CP_UTF8, 0, path.data(), static_cast<int>(path.size()), wpath.data(), wlen);
+        }
+        std::ifstream ifs(std::filesystem::path(wpath), std::ios::binary);
+#else
+        std::ifstream ifs(path, std::ios::binary);
+#endif
         if (!ifs.is_open()) {
             outError = "Failed to open broker token file: " + path;
             return false;

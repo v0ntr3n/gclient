@@ -530,8 +530,9 @@ const std::array<CapabilityShimEntry, 26> kCapabilityShimTable = {{
 // Platform singleton & lifecycle
 // ---------------------------------------------------------------------------
 Platform* Platform::getInstance() {
-    static Platform instance;
-    return &instance;
+    // Intentional immortal singleton so detached libcurl threads never touch destroyed mutexes at exit.
+    static Platform* instance = new Platform();
+    return instance;
 }
 
 static std::shared_ptr<IAuthProvider> createDefaultAuthProvider() {
@@ -1522,7 +1523,7 @@ static void configureSharedCurlTls(CURL* curl) {
 }
 
 static CURLSH* getSharedCookieHandle() {
-    static std::mutex cookieMutex;
+    static std::mutex* cookieMutex = new std::mutex();
     static CURLSH* share = []() -> CURLSH* {
         CURLSH* sh = curl_share_init();
         if (sh) {
@@ -1535,7 +1536,7 @@ static CURLSH* getSharedCookieHandle() {
                 +[](CURL*, curl_lock_data, void* userptr) {
                     static_cast<std::mutex*>(userptr)->unlock();
                 });
-            curl_share_setopt(sh, CURLSHOPT_USERDATA, &cookieMutex);
+            curl_share_setopt(sh, CURLSHOPT_USERDATA, cookieMutex);
         }
         return sh;
     }();
@@ -1943,7 +1944,14 @@ void Platform::openUrl(const std::string& url) {
 #ifdef _WIN32
     if (!url.empty() &&
         (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0)) {
-        ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        const int req = ::MultiByteToWideChar(
+            CP_UTF8, 0, url.data(), static_cast<int>(url.size()), nullptr, 0);
+        if (req > 0) {
+            std::wstring wideUrl(static_cast<size_t>(req), L'\0');
+            ::MultiByteToWideChar(
+                CP_UTF8, 0, url.data(), static_cast<int>(url.size()), wideUrl.data(), req);
+            ::ShellExecuteW(nullptr, L"open", wideUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
     }
 #endif
 }

@@ -5,17 +5,33 @@
 
 #ifndef _WIN32
 #include <cerrno>
-#include <sys/select.h>
+#include <poll.h>
 #endif
 
 namespace gclient::net {
 
 namespace {
 
+constexpr size_t kMaxQueuedEventBytes = 64u * 1024u * 1024u;
+
 #ifdef _WIN32
 constexpr int kNetworkTimeoutError = WSAETIMEDOUT;
+using NativePollFd = WSAPOLLFD;
+int runSocketPoll(std::vector<NativePollFd>& fds, int timeoutMs) {
+    if (fds.empty()) {
+        return 0;
+    }
+    return ::WSAPoll(fds.data(), static_cast<ULONG>(fds.size()), timeoutMs);
+}
 #else
 constexpr int kNetworkTimeoutError = ETIMEDOUT;
+using NativePollFd = struct pollfd;
+int runSocketPoll(std::vector<NativePollFd>& fds, int timeoutMs) {
+    if (fds.empty()) {
+        return 0;
+    }
+    return ::poll(fds.data(), static_cast<nfds_t>(fds.size()), timeoutMs);
+}
 #endif
 
 } // namespace
@@ -79,15 +95,19 @@ void CNetwork::shutdown() {
     }
 
     {
+        std::lock_guard<std::mutex> pollGuard(pollIterationMutex_);
+        polledConnections_.clear();
+    }
+    {
         std::lock_guard<std::mutex> lock(eventMutex_);
         eventQueue_.clear();
+        queuedEventBytes_ = 0;
     }
     {
         std::lock_guard<std::mutex> lock(pendingOpsMutex_);
         pendingAdd_.clear();
         pendingRemove_.clear();
     }
-    polledConnections_.clear();
 
 #if defined(GCLIENT_USE_COCOS2DX)
     std::vector<CConnection*> toRelease;
@@ -125,12 +145,24 @@ void CNetwork::onConnectionDestroyed(CConnection* conn) {
     if (conn == nullptr) {
         return;
     }
+    // Acquire pollIterationMutex_ FIRST so pollLoop() is guaranteed not to be touching `conn`,
+    // and remove `conn` directly from polledConnections_ and pendingRemove_ (NEVER push a dying
+    // CConnection* into pendingRemove_, which previously caused UAF on pollThread_!).
+    std::lock_guard<std::mutex> pollGuard(pollIterationMutex_);
+    polledConnections_.erase(
+        std::remove(polledConnections_.begin(), polledConnections_.end(), conn),
+        polledConnections_.end());
     {
         std::lock_guard<std::mutex> lock(ownedMutex_);
         liveSet_.erase(conn);
     }
     {
         std::lock_guard<std::mutex> lock(eventMutex_);
+        for (const auto& ev : eventQueue_) {
+            if (ev.connection == conn && queuedEventBytes_ >= ev.data.size()) {
+                queuedEventBytes_ -= ev.data.size();
+            }
+        }
         eventQueue_.erase(
             std::remove_if(eventQueue_.begin(), eventQueue_.end(),
                            [conn](const PendingEvent& ev) { return ev.connection == conn; }),
@@ -139,21 +171,35 @@ void CNetwork::onConnectionDestroyed(CConnection* conn) {
     {
         std::lock_guard<std::mutex> lock(pendingOpsMutex_);
         pendingAdd_.erase(std::remove(pendingAdd_.begin(), pendingAdd_.end(), conn), pendingAdd_.end());
-        pendingRemove_.push_back(conn);
+        pendingRemove_.erase(
+            std::remove_if(pendingRemove_.begin(), pendingRemove_.end(),
+                           [conn](const auto& item) { return item.first == conn; }),
+            pendingRemove_.end());
     }
 }
 
 CConnection* CNetwork::newConnection() {
     startPollThread();
 #if defined(GCLIENT_USE_COCOS2DX)
-    // `new CConnection()` starts with m_uReference == 1 (held by ownedConnections_).
-    // Calling retain() + autorelease() matches Cocos2d-x factory conventions so Lua's
-    // optional `conn:retain()` / `conn:release()` never drops the refcount below 1
-    // while CNetwork's background pollThread_ is active.
     auto* raw = new CConnection();
     raw->network_ = this;
     {
         std::lock_guard<std::mutex> lock(ownedMutex_);
+        // Prune previously closed owned connections whose Lua/user refcount dropped back to 1
+        // so repeated reconnects over long sessions never leak closed CConnection objects.
+        for (auto it = ownedConnections_.begin(); it != ownedConnections_.end();) {
+            CConnection* c = *it;
+            if (c != nullptr &&
+                c->getState() == CConnection::State::Closed &&
+                liveSet_.find(c) == liveSet_.end() &&
+                c->retainCount() == 1u) {
+                c->network_ = nullptr;
+                c->release();
+                it = ownedConnections_.erase(it);
+            } else {
+                ++it;
+            }
+        }
         liveSet_.insert(raw);
         ownedConnections_.push_back(raw);
     }
@@ -177,6 +223,7 @@ void CNetwork::addConnection(CConnection* conn) {
     if (conn == nullptr) {
         return;
     }
+    conn->network_ = this;
     startPollThread();
     {
         std::lock_guard<std::mutex> lock(ownedMutex_);
@@ -185,9 +232,12 @@ void CNetwork::addConnection(CConnection* conn) {
     {
         std::lock_guard<std::mutex> lock(pendingOpsMutex_);
         pendingRemove_.erase(
-            std::remove(pendingRemove_.begin(), pendingRemove_.end(), conn),
+            std::remove_if(pendingRemove_.begin(), pendingRemove_.end(),
+                           [conn](const auto& item) { return item.first == conn; }),
             pendingRemove_.end());
-        pendingAdd_.push_back(conn);
+        if (std::find(pendingAdd_.begin(), pendingAdd_.end(), conn) == pendingAdd_.end()) {
+            pendingAdd_.push_back(conn);
+        }
     }
 }
 
@@ -195,9 +245,10 @@ void CNetwork::removeConnection(CConnection* conn) {
     if (conn == nullptr) {
         return;
     }
+    const uint64_t ep = conn->connectionEpoch();
     std::lock_guard<std::mutex> lock(pendingOpsMutex_);
     pendingAdd_.erase(std::remove(pendingAdd_.begin(), pendingAdd_.end(), conn), pendingAdd_.end());
-    pendingRemove_.push_back(conn);
+    pendingRemove_.emplace_back(conn, ep);
 }
 
 size_t CNetwork::activeConnectionCount() const {
@@ -215,19 +266,25 @@ void CNetwork::doAddConnection(CConnection* conn) {
     }
 }
 
-void CNetwork::doReleaseConnection(CConnection* conn) {
+void CNetwork::doReleaseConnection(CConnection* conn, uint64_t expectedEpoch) {
     if (conn == nullptr) {
         return;
     }
+    // If the main thread already called close() followed by a fresh connect() (incrementing epoch),
+    // do NOT clobber the newly reconnected socket!
+    if (expectedEpoch != 0 && conn->connectionEpoch() != expectedEpoch) {
+        return;
+    }
+
     polledConnections_.erase(
         std::remove(polledConnections_.begin(), polledConnections_.end(), conn),
         polledConnections_.end());
 
-    // Ensure underlying OS socket and queued send buffers are immediately cleaned up.
     conn->closeSocketHandle();
     {
         std::lock_guard<std::mutex> sendLock(conn->sendMutex_);
         conn->sendQueue_.clear();
+        conn->queuedSendBytes_ = 0;
         conn->frontSendOffset_ = 0;
     }
 
@@ -240,16 +297,20 @@ void CNetwork::doReleaseConnection(CConnection* conn) {
         }
     }
 
-    // If connection was already closed locally on the main thread (State::Closed),
-    // purge stale queued events and remove it from liveSet_ immediately.
-    // Otherwise (State::Closing from remote EOF / timeout / error), keep it in liveSet_
-    // until CNetwork::update() delivers queued Data + Closed events on the main thread.
     if (st == CConnection::State::Closed || st == CConnection::State::Disconnected) {
+        const uint64_t curEp = conn->connectionEpoch();
         {
             std::lock_guard<std::mutex> evLock(eventMutex_);
+            for (const auto& ev : eventQueue_) {
+                if (ev.connection == conn && ev.epoch == curEp && queuedEventBytes_ >= ev.data.size()) {
+                    queuedEventBytes_ -= ev.data.size();
+                }
+            }
             eventQueue_.erase(
                 std::remove_if(eventQueue_.begin(), eventQueue_.end(),
-                               [conn](const PendingEvent& ev) { return ev.connection == conn; }),
+                               [conn, curEp](const PendingEvent& ev) {
+                                   return ev.connection == conn && ev.epoch == curEp;
+                               }),
                 eventQueue_.end());
         }
         {
@@ -264,14 +325,32 @@ void CNetwork::doReleaseConnection(CConnection* conn) {
 
 void CNetwork::enqueueEvent(PendingEvent&& ev) {
     std::lock_guard<std::mutex> lock(eventMutex_);
+    if (ev.type == EventType::Data) {
+        if (ev.data.size() > kMaxQueuedEventBytes ||
+            queuedEventBytes_ > kMaxQueuedEventBytes - ev.data.size()) {
+            PendingEvent overflowClose{};
+            overflowClose.type = EventType::Closed;
+            overflowClose.connection = ev.connection;
+            overflowClose.epoch = ev.epoch;
+            overflowClose.wsaError = 0;
+            overflowClose.reason = "EVENT_QUEUE_OVERFLOW";
+            eventQueue_.push_back(std::move(overflowClose));
+            return;
+        }
+        queuedEventBytes_ += ev.data.size();
+    }
     eventQueue_.push_back(std::move(ev));
 }
 
 void CNetwork::pollLoop() {
+    std::vector<NativePollFd> pollFds;
+    std::vector<CConnection*> pollOwners;
+
     while (running_.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> pollGuard(pollIterationMutex_);
         {
             std::vector<CConnection*> adds;
-            std::vector<CConnection*> removes;
+            std::vector<std::pair<CConnection*, uint64_t>> removes;
             {
                 std::lock_guard<std::mutex> lock(pendingOpsMutex_);
                 adds.swap(pendingAdd_);
@@ -280,44 +359,39 @@ void CNetwork::pollLoop() {
             for (CConnection* c : adds) {
                 doAddConnection(c);
             }
-            for (CConnection* c : removes) {
-                doReleaseConnection(c);
+            for (const auto& item : removes) {
+                doReleaseConnection(item.first, item.second);
             }
         }
 
         if (polledConnections_.empty()) {
+            pollGuard.unlock();
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
 
         const auto now = std::chrono::steady_clock::now();
-
-        fd_set readSet;
-        fd_set writeSet;
-        fd_set exceptSet;
-        FD_ZERO(&readSet);
-        FD_ZERO(&writeSet);
-        FD_ZERO(&exceptSet);
-
-        SOCKET maxFd = 0;
-        size_t activeFdCount = 0;
-        std::vector<CConnection*> timedOut;
+        pollFds.clear();
+        pollOwners.clear();
+        std::vector<std::pair<CConnection*, uint64_t>> timedOut;
 
         for (CConnection* conn : polledConnections_) {
             const CConnection::State st = conn->getState();
             const SOCKET sock = conn->nativeHandle();
+            const uint64_t ep = conn->connectionEpoch();
             if (sock == INVALID_SOCKET || st == CConnection::State::Closed ||
                 st == CConnection::State::Closing || st == CConnection::State::Disconnected) {
-                timedOut.push_back(conn);
+                timedOut.emplace_back(conn, ep);
                 continue;
             }
 
             const char* timeoutReason = nullptr;
             if (conn->checkTimeouts(now, timeoutReason)) {
-                timedOut.push_back(conn);
+                timedOut.emplace_back(conn, ep);
                 enqueueEvent(PendingEvent{
                     EventType::Closed,
                     conn,
+                    ep,
                     {},
                     kNetworkTimeoutError,
                     timeoutReason
@@ -325,69 +399,71 @@ void CNetwork::pollLoop() {
                 continue;
             }
 
+            short events = 0;
             if (st == CConnection::State::Connecting) {
-                FD_SET(sock, &writeSet);
-                FD_SET(sock, &exceptSet);
+                events = POLLOUT;
             } else if (st == CConnection::State::Connected) {
-                FD_SET(sock, &readSet);
-                FD_SET(sock, &exceptSet);
+                events = POLLIN;
                 if (conn->hasPendingSendData()) {
-                    FD_SET(sock, &writeSet);
+                    events = static_cast<short>(events | POLLOUT);
                 }
             }
 
-            if (sock > maxFd) {
-                maxFd = sock;
+            if (events != 0) {
+                NativePollFd pfd{};
+                pfd.fd = sock;
+                pfd.events = events;
+                pfd.revents = 0;
+                pollFds.push_back(pfd);
+                pollOwners.push_back(conn);
             }
-            ++activeFdCount;
         }
 
-        for (CConnection* dead : timedOut) {
-            doReleaseConnection(dead);
+        for (const auto& dead : timedOut) {
+            doReleaseConnection(dead.first, dead.second);
         }
 
-        if (activeFdCount == 0) {
+        if (pollFds.empty()) {
+            pollGuard.unlock();
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
 
-        timeval tv{};
-        tv.tv_sec = 0;
-        tv.tv_usec = 5000;
-
-#ifdef _WIN32
-        const int nfds = 0;
-#else
-        const int nfds = static_cast<int>(maxFd + 1);
-#endif
-        const int ready = ::select(nfds, &readSet, &writeSet, &exceptSet, &tv);
-
+        const int ready = runSocketPoll(pollFds, 5);
         if (ready <= 0) {
             continue;
         }
 
-        std::vector<CConnection*> toRemove;
-        for (CConnection* conn : polledConnections_) {
+        std::vector<std::pair<CConnection*, uint64_t>> toRemove;
+        for (size_t i = 0; i < pollFds.size(); ++i) {
+            const short revents = pollFds[i].revents;
+            if (revents == 0) {
+                continue;
+            }
+            CConnection* conn = pollOwners[i];
             const SOCKET sock = conn->nativeHandle();
+            const uint64_t ep = conn->connectionEpoch();
             if (sock == INVALID_SOCKET) {
-                toRemove.push_back(conn);
+                toRemove.emplace_back(conn, ep);
                 continue;
             }
 
             const CConnection::State st = conn->getState();
-            const bool isReadable = FD_ISSET(sock, &readSet) != 0;
-            const bool isWritable = FD_ISSET(sock, &writeSet) != 0;
-            const bool isExcept   = FD_ISSET(sock, &exceptSet) != 0;
+            const bool isReadable = (revents & (POLLIN | POLLHUP)) != 0;
+            const bool isWritable = (revents & POLLOUT) != 0;
+            const bool isExcept   = (revents & (POLLERR | POLLNVAL)) != 0;
 
             if (st == CConnection::State::Connecting) {
-                if (isWritable || isExcept) {
-                    if (!conn->pollCompleteConnect()) {
-                        toRemove.push_back(conn);
+                if (isWritable || isExcept || (revents & POLLHUP) != 0) {
+                    int soError = 0;
+                    if (!conn->pollCompleteConnect(soError)) {
+                        toRemove.emplace_back(conn, ep);
                         enqueueEvent(PendingEvent{
                             EventType::Closed,
                             conn,
+                            ep,
                             {},
-                            CConnection::getLastSocketError(),
+                            soError,
                             "CONNECT_FAILED"
                         });
                     }
@@ -399,13 +475,24 @@ void CNetwork::pollLoop() {
                 continue;
             }
 
-            if (isExcept) {
-                toRemove.push_back(conn);
+            if (isExcept && !isReadable) {
+                int soErr = 0;
+#ifdef _WIN32
+                int optLen = sizeof(soErr);
+#else
+                socklen_t optLen = sizeof(soErr);
+#endif
+                ::getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &optLen);
+                if (soErr == 0) {
+                    soErr = CConnection::getLastSocketError();
+                }
+                toRemove.emplace_back(conn, ep);
                 enqueueEvent(PendingEvent{
                     EventType::Closed,
                     conn,
+                    ep,
                     {},
-                    CConnection::getLastSocketError(),
+                    soErr,
                     "SOCKET_EXCEPTION"
                 });
                 continue;
@@ -414,10 +501,11 @@ void CNetwork::pollLoop() {
             if (isWritable) {
                 int sendErr = 0;
                 if (!conn->pollFlushSendQueue(sendErr)) {
-                    toRemove.push_back(conn);
+                    toRemove.emplace_back(conn, ep);
                     enqueueEvent(PendingEvent{
                         EventType::Closed,
                         conn,
+                        ep,
                         {},
                         sendErr,
                         "SEND_ERROR"
@@ -434,16 +522,18 @@ void CNetwork::pollLoop() {
                     enqueueEvent(PendingEvent{
                         EventType::Data,
                         conn,
+                        ep,
                         std::move(chunk),
                         0,
                         nullptr
                     });
                 }
                 if (peerClosed || recvErr != 0) {
-                    toRemove.push_back(conn);
+                    toRemove.emplace_back(conn, ep);
                     enqueueEvent(PendingEvent{
                         EventType::Closed,
                         conn,
+                        ep,
                         {},
                         recvErr,
                         peerClosed ? "PEER_CLOSED" : "RECV_ERROR"
@@ -452,8 +542,8 @@ void CNetwork::pollLoop() {
             }
         }
 
-        for (CConnection* dead : toRemove) {
-            doReleaseConnection(dead);
+        for (const auto& dead : toRemove) {
+            doReleaseConnection(dead.first, dead.second);
         }
     }
 }
@@ -466,6 +556,7 @@ void CNetwork::update(float /*dt*/) {
             return;
         }
         drained.swap(eventQueue_);
+        queuedEventBytes_ = 0;
     }
 
     for (auto& ev : drained) {
@@ -495,9 +586,17 @@ void CNetwork::update(float /*dt*/) {
             }
         } releaseGuard{conn};
 
+        // Ignore stale events belonging to an older connection epoch before reconnect!
+        if (ev.epoch != 0 && conn->connectionEpoch() != ev.epoch) {
+            continue;
+        }
+
         if (ev.type == EventType::Data) {
             if (conn->getState() != CConnection::State::Closed) {
-                conn->appendIncomingData(ev.data.data(), ev.data.size());
+                if (!conn->appendIncomingData(ev.data.data(), ev.data.size())) {
+                    conn->close();
+                    continue;
+                }
                 conn->doRead();
             }
         } else if (ev.type == EventType::Closed) {

@@ -356,24 +356,44 @@ BootState stringToBootState(const std::string& s) {
 }
 
 uint64_t fnv1a64(const std::string& input) {
-    uint64_t hash = 14695981039346656037ull;
+    uint64_t hash = 14695981039346656037ULL;
     for (unsigned char c : input) {
-        hash ^= c;
-        hash *= 1099511628211ull;
+        hash ^= static_cast<uint64_t>(c);
+        hash *= 1099511628211ULL;
     }
     return hash;
 }
 
-} // namespace
+#ifdef _WIN32
+fs::path utf8ToFsPath(const std::string& utf8) {
+    if (utf8.empty()) return {};
+    int req = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    if (req <= 0) req = ::MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    if (req <= 0) return {};
+    std::wstring wide(static_cast<size_t>(req), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), req);
+    return fs::path(wide);
+}
+std::string fsPathToUtf8(const fs::path& p) {
+    const std::wstring wide = p.wstring();
+    if (wide.empty()) return {};
+    int req = ::WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+    if (req <= 0) return {};
+    std::string out(static_cast<size_t>(req), '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), out.data(), req, nullptr, nullptr);
+    return out;
+}
+#else
+fs::path utf8ToFsPath(const std::string& utf8) { return fs::path(utf8); }
+std::string fsPathToUtf8(const fs::path& p) { return p.string(); }
+#endif
 
-// ============================================================================
-// CrossProcessLock
-// ============================================================================
+} // namespace
 
 AtomicHotUpdater::CrossProcessLock::CrossProcessLock(const fs::path& patchRoot)
     : m_lockFilePath(patchRoot / "update.lock") {
     std::ostringstream oss;
-    oss << "Local\\GCLIENT_HotUpdate_" << std::hex << fnv1a64(patchRoot.string());
+    oss << "Local\\GCLIENT_HotUpdate_" << std::hex << fnv1a64(fsPathToUtf8(patchRoot));
     m_mutexName = oss.str();
 }
 
@@ -475,7 +495,7 @@ fs::path AtomicHotUpdater::previousManifestPath() const {
 }
 
 fs::path AtomicHotUpdater::releaseDirForVersion(const std::string& version) const {
-    return releasesRoot() / version;
+    return releasesRoot() / utf8ToFsPath(version);
 }
 
 bool AtomicHotUpdater::ensureDirectoryLayout(std::string& errorOut) const {
@@ -518,7 +538,7 @@ StartupHealthResult AtomicHotUpdater::initializeAndCheckStartupHealth() {
     // Verify the active overlay directory still exists on disk.
     std::error_code ec;
     const bool activeDirMissing = !state.activeOverlayDir.empty() &&
-                                  !fs::exists(fs::path(state.activeOverlayDir), ec);
+                                  !fs::exists(utf8ToFsPath(state.activeOverlayDir), ec);
 
     // Trigger automatic rollback if the previous launch failed to confirm or overlay vanished.
     const bool exceededBootFailures =
@@ -544,7 +564,7 @@ StartupHealthResult AtomicHotUpdater::initializeAndCheckStartupHealth() {
         } else {
             result.hasActiveOverlay = !reverted.activeOverlayDir.empty();
             result.activeVersion = reverted.activeVersion;
-            result.activeOverlayPath = reverted.activeOverlayDir;
+            result.activeOverlayPath = utf8ToFsPath(reverted.activeOverlayDir);
             result.diagnosticMessage = activeDirMissing
                 ? "Active overlay directory missing; rolled back from " + state.activeVersion
                 : "Startup verification failed " + std::to_string(state.consecutiveBootFailures) +
@@ -564,7 +584,7 @@ StartupHealthResult AtomicHotUpdater::initializeAndCheckStartupHealth() {
 
     result.hasActiveOverlay = !state.activeOverlayDir.empty();
     result.activeVersion = state.activeVersion;
-    result.activeOverlayPath = state.activeOverlayDir;
+    result.activeOverlayPath = utf8ToFsPath(state.activeOverlayDir);
     result.diagnosticMessage = "Overlay " + state.activeVersion + " active (" +
                                bootStateToString(state.bootState) + ").";
     return result;
@@ -584,7 +604,7 @@ UpdateResult AtomicHotUpdater::confirmStartupSuccess() {
     if (state.bootState == BootState::Confirmed && state.consecutiveBootFailures == 0) {
         res.status = UpdateStatus::Ok;
         res.activeVersion = state.activeVersion;
-        res.activeOverlayPath = state.activeOverlayDir;
+        res.activeOverlayPath = utf8ToFsPath(state.activeOverlayDir);
         res.message = "Active overlay already confirmed.";
         return res;
     }
@@ -601,7 +621,7 @@ UpdateResult AtomicHotUpdater::confirmStartupSuccess() {
 
     res.status = UpdateStatus::Ok;
     res.activeVersion = state.activeVersion;
-    res.activeOverlayPath = state.activeOverlayDir;
+    res.activeOverlayPath = utf8ToFsPath(state.activeOverlayDir);
     res.message = "Confirmed startup health for overlay " + state.activeVersion + ".";
     return res;
 }
@@ -693,7 +713,7 @@ UpdateResult AtomicHotUpdater::stagePatch(
         if (loadActiveStateLocked(cur) && cur.activeVersion == manifest.patchVersion) {
             res.status = UpdateStatus::AlreadyUpToDate;
             res.activeVersion = cur.activeVersion;
-            res.activeOverlayPath = cur.activeOverlayDir;
+            res.activeOverlayPath = utf8ToFsPath(cur.activeOverlayDir);
             res.message = "Patch " + manifest.patchVersion + " is already active.";
             return res;
         }
@@ -730,7 +750,7 @@ UpdateResult AtomicHotUpdater::stagePatch(
     const size_t totalFiles = manifest.files.size();
     for (size_t i = 0; i < totalFiles; ++i) {
         const auto& entry = manifest.files[i];
-        const fs::path destFile = stagingDir / fs::path(entry.relativePath);
+        const fs::path destFile = stagingDir / utf8ToFsPath(entry.relativePath);
 
         fs::create_directories(destFile.parent_path(), ec);
         if (ec) {
@@ -834,7 +854,7 @@ UpdateResult AtomicHotUpdater::commitStagedPatch(const std::string& patchVersion
 
     ActiveOverlayState prevState;
     const bool hadPrevState = loadActiveStateLocked(prevState);
-    const fs::path oldOverlayDir = hadPrevState ? fs::path(prevState.activeOverlayDir) : fs::path{};
+    const fs::path oldOverlayDir = hadPrevState ? utf8ToFsPath(prevState.activeOverlayDir) : fs::path{};
 
     // Step 1: Coordinate releasing all open SQLite .db and asset handles.
     if (m_hooks.prepareForSwap) {
@@ -877,7 +897,7 @@ UpdateResult AtomicHotUpdater::commitStagedPatch(const std::string& patchVersion
     // Step 4: Build new PendingVerification overlay pointer and swap atomically.
     ActiveOverlayState nextState;
     nextState.activeVersion = patchVersion;
-    nextState.activeOverlayDir = releaseDir.string();
+    nextState.activeOverlayDir = fsPathToUtf8(releaseDir);
     nextState.previousVersion = hadPrevState ? prevState.activeVersion : "";
     nextState.previousOverlayDir = hadPrevState ? prevState.activeOverlayDir : "";
     nextState.bootState = BootState::PendingVerification;
@@ -911,7 +931,7 @@ UpdateResult AtomicHotUpdater::commitStagedPatch(const std::string& patchVersion
             }
             res.status = UpdateStatus::ReloadFailedRolledBack;
             res.activeVersion = rollbackState.activeVersion;
-            res.activeOverlayPath = rollbackState.activeOverlayDir;
+            res.activeOverlayPath = utf8ToFsPath(rollbackState.activeOverlayDir);
             res.message = "Subsystem reload failed (" + reloadErr + "); rolled back to " +
                           (rollbackState.activeVersion.empty() ? "base Resources/" : rollbackState.activeVersion);
             return res;
@@ -981,12 +1001,12 @@ UpdateResult AtomicHotUpdater::rollbackToPrevious() {
 
     if (m_hooks.reloadAfterSwap) {
         std::string reloadErr;
-        m_hooks.reloadAfterSwap(fs::path(reverted.activeOverlayDir), reloadErr);
+        m_hooks.reloadAfterSwap(utf8ToFsPath(reverted.activeOverlayDir), reloadErr);
     }
 
     res.status = UpdateStatus::Ok;
     res.activeVersion = reverted.activeVersion;
-    res.activeOverlayPath = reverted.activeOverlayDir;
+    res.activeOverlayPath = utf8ToFsPath(reverted.activeOverlayDir);
     res.message = "Rolled back from " + curState.activeVersion + " to " +
                   (reverted.activeVersion.empty() ? "base Resources/" : reverted.activeVersion) + ".";
     return res;
@@ -1014,7 +1034,7 @@ size_t AtomicHotUpdater::pruneOldReleases(size_t keepCount) {
     if (fs::exists(releasesRoot(), ec)) {
         for (const auto& entry : fs::directory_iterator(releasesRoot(), ec)) {
             if (!entry.is_directory(ec)) continue;
-            const std::string ver = entry.path().filename().string();
+            const std::string ver = fsPathToUtf8(entry.path().filename());
             if (hasState && (ver == curState.activeVersion || ver == curState.previousVersion)) {
                 continue;
             }
@@ -1043,15 +1063,31 @@ std::optional<ActiveOverlayState> AtomicHotUpdater::getActiveState() const {
 std::optional<fs::path> AtomicHotUpdater::getActiveOverlayPath() const {
     auto state = getActiveState();
     if (!state || state->activeOverlayDir.empty()) return std::nullopt;
-    return fs::path(state->activeOverlayDir);
+    return utf8ToFsPath(state->activeOverlayDir);
 }
 
 bool AtomicHotUpdater::loadActiveStateLocked(ActiveOverlayState& outState) const {
-    std::ifstream ifs(activeManifestPath(), std::ios::in | std::ios::binary);
-    if (!ifs.is_open()) return false;
-    std::ostringstream oss;
-    oss << ifs.rdbuf();
-    return parseOverlayStateJson(oss.str(), outState);
+    {
+        std::ifstream ifs(activeManifestPath(), std::ios::in | std::ios::binary);
+        if (ifs.is_open()) {
+            std::ostringstream oss;
+            oss << ifs.rdbuf();
+            if (parseOverlayStateJson(oss.str(), outState)) {
+                return true;
+            }
+        }
+    }
+    // Torn/corrupt active_manifest.json recovery: fall back to previous_manifest.json backup!
+    std::ifstream prevIfs(previousManifestPath(), std::ios::in | std::ios::binary);
+    if (!prevIfs.is_open()) return false;
+    std::ostringstream prevOss;
+    prevOss << prevIfs.rdbuf();
+    if (!parseOverlayStateJson(prevOss.str(), outState)) {
+        return false;
+    }
+    std::string healErr;
+    writeFileAtomically(activeManifestPath(), serializeOverlayStateJson(outState), healErr);
+    return true;
 }
 
 bool AtomicHotUpdater::writeFileAtomically(
@@ -1064,7 +1100,7 @@ bool AtomicHotUpdater::writeFileAtomically(
     // Temp file MUST reside on the same NTFS volume/directory as targetPath so
     // MoveFileExW executes an atomic directory-entry rename.
     const fs::path tmpPath = targetPath.parent_path() /
-                             (targetPath.filename().string() + "." + generateStagingNonce() + ".tmp");
+                             (fsPathToUtf8(targetPath.filename()) + "." + generateStagingNonce() + ".tmp");
 
 #ifdef _WIN32
     HANDLE hFile = CreateFileW(
@@ -1259,7 +1295,7 @@ bool AtomicHotUpdater::computeFileHash(
     std::string& errorOut) {
     std::ifstream ifs(filePath, std::ios::in | std::ios::binary);
     if (!ifs.is_open()) {
-        errorOut = "Cannot open file for hashing: " + filePath.string();
+        errorOut = "Cannot open file for hashing: " + fsPathToUtf8(filePath);
         return false;
     }
 
@@ -1341,7 +1377,7 @@ bool AtomicHotUpdater::isSafeRelativePath(const std::string& relativePath) {
     if (relativePath[0] == '/' || relativePath[0] == '\\') return false;
     if (relativePath.find(':') != std::string::npos) return false; // Block Win32 drive letters / ADS
 
-    fs::path p(relativePath);
+    fs::path p = utf8ToFsPath(relativePath);
     if (p.is_absolute()) return false;
     for (const auto& part : p) {
         if (part == "..") return false;

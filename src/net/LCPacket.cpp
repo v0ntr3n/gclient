@@ -4,12 +4,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace gclient::net {
 
 namespace {
 
-// Self-contained RFC 1321 MD5 implementation (zero external OpenSSL dependency on Win32).
 struct Md5Context {
     uint32_t state[4];
     uint64_t bitCount;
@@ -126,7 +126,7 @@ void md5Update(Md5Context& ctx, const uint8_t* data, size_t len) {
         }
     }
 
-    while (i + 64u <= len) {
+    while (len - i >= 64u) {
         md5Transform(ctx, data + i);
         i += 64u;
     }
@@ -159,6 +159,9 @@ std::array<uint8_t, 16> md5Final(Md5Context& ctx) {
 } // namespace
 
 uint32_t LCPacket::readBigEndianU32(const uint8_t* data) {
+    if (data == nullptr) {
+        return 0u;
+    }
     return (static_cast<uint32_t>(data[0]) << 24) |
            (static_cast<uint32_t>(data[1]) << 16) |
            (static_cast<uint32_t>(data[2]) << 8) |
@@ -166,6 +169,9 @@ uint32_t LCPacket::readBigEndianU32(const uint8_t* data) {
 }
 
 void LCPacket::writeBigEndianU32(uint8_t* out, uint32_t value) {
+    if (out == nullptr) {
+        return;
+    }
     out[0] = static_cast<uint8_t>((value >> 24) & 0xFFu);
     out[1] = static_cast<uint8_t>((value >> 16) & 0xFFu);
     out[2] = static_cast<uint8_t>((value >> 8) & 0xFFu);
@@ -174,6 +180,9 @@ void LCPacket::writeBigEndianU32(uint8_t* out, uint32_t value) {
 
 bool LCPacket::zlibCompress(const uint8_t* input, size_t inputSize, std::string& output) {
     if (input == nullptr && inputSize > 0) {
+        return false;
+    }
+    if (inputSize > static_cast<size_t>((std::numeric_limits<uLong>::max)() - 64u)) {
         return false;
     }
 
@@ -200,22 +209,24 @@ bool LCPacket::zlibCompress(const uint8_t* input, size_t inputSize, std::string&
 
 bool LCPacket::zlibDecompress(const uint8_t* input, size_t inputSize, std::string& output,
                               size_t maxOutputSize) {
+    output.clear();
     if (input == nullptr || inputSize == 0) {
-        output.clear();
-        return inputSize == 0;
+        // A valid zlib/gzip stream is at least 2 bytes; empty compressed payloads are malformed.
+        return false;
+    }
+    if (inputSize > static_cast<size_t>((std::numeric_limits<uInt>::max)())) {
+        return false;
     }
 
     z_stream strm{};
     strm.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(input));
     strm.avail_in = static_cast<uInt>(inputSize);
 
-    // 15 + 32 enables automatic zlib/gzip header detection.
     int rc = inflateInit2(&strm, 15 + 32);
     if (rc != Z_OK) {
         return false;
     }
 
-    output.clear();
     uint8_t chunk[16384];
     do {
         strm.next_out = chunk;
@@ -227,7 +238,8 @@ bool LCPacket::zlibDecompress(const uint8_t* input, size_t inputSize, std::strin
             return false;
         }
         const size_t produced = sizeof(chunk) - strm.avail_out;
-        if (output.size() + produced > maxOutputSize) {
+        // Subtraction check prevents 32-bit size_t addition wrap-around on Win32 x86!
+        if (produced > maxOutputSize || output.size() > maxOutputSize - produced) {
             inflateEnd(&strm);
             output.clear();
             return false;
@@ -241,26 +253,28 @@ bool LCPacket::zlibDecompress(const uint8_t* input, size_t inputSize, std::strin
 
 std::array<uint8_t, LCPacket::kHeaderMd5Size> LCPacket::computeBabelTimeMd5(
     const uint8_t* body, size_t bodySize) {
-    // Matches `GameUtil::makeLCPacket` @ 0x2b4b04:
-    //   buf[0..8]   = "BabelTime"
-    //   buf[9 + i]  = body[i + 1] ^ body[i]       for 0 <= i < bodySize - 1
-    //   buf[9 + N-1]= body[N - 1] ^ (N & 0xFF)    for i == bodySize - 1
-    static constexpr char kSalt[9] = {'B', 'a', 'b', 'e', 'l', 'T', 'i', 'm', 'e'};
-
-    std::vector<uint8_t> hashInput(9 + bodySize);
-    std::memcpy(hashInput.data(), kSalt, 9);
-
-    if (body != nullptr && bodySize > 0) {
-        for (size_t i = 0; i + 1 < bodySize; ++i) {
-            hashInput[9 + i] = static_cast<uint8_t>(body[i + 1] ^ body[i]);
-        }
-        hashInput[9 + bodySize - 1] =
-            static_cast<uint8_t>(body[bodySize - 1] ^ static_cast<uint8_t>(bodySize & 0xFFu));
-    }
+    static constexpr uint8_t kSalt[9] = {'B', 'a', 'b', 'e', 'l', 'T', 'i', 'm', 'e'};
 
     Md5Context ctx{};
     md5Init(ctx);
-    md5Update(ctx, hashInput.data(), hashInput.size());
+    md5Update(ctx, kSalt, sizeof(kSalt));
+
+    if (body != nullptr && bodySize > 0) {
+        uint8_t chunk[4096];
+        size_t i = 0;
+        while (i + 1 < bodySize) {
+            const size_t batch = (std::min)(sizeof(chunk), (bodySize - 1u) - i);
+            for (size_t k = 0; k < batch; ++k) {
+                chunk[k] = static_cast<uint8_t>(body[i + k + 1] ^ body[i + k]);
+            }
+            md5Update(ctx, chunk, batch);
+            i += batch;
+        }
+        const uint8_t tailByte =
+            static_cast<uint8_t>(body[bodySize - 1] ^ static_cast<uint8_t>(bodySize & 0xFFu));
+        md5Update(ctx, &tailByte, 1u);
+    }
+
     return md5Final(ctx);
 }
 
@@ -268,7 +282,17 @@ std::string LCPacket::makeLCPacket(const std::string& rawPayload, bool compressP
     return makeLCPacket(rawPayload.data(), rawPayload.size(), compressPayload);
 }
 
+std::string LCPacket::makeLCPacket(const char* rawCString, bool compressPayload) {
+    if (rawCString == nullptr) {
+        return makeLCPacket(static_cast<const void*>(nullptr), 0u, compressPayload);
+    }
+    return makeLCPacket(static_cast<const void*>(rawCString), std::strlen(rawCString), compressPayload);
+}
+
 std::string LCPacket::makeLCPacket(const void* data, size_t size, bool compressPayload) {
+    if (data == nullptr && size > 0) {
+        return {};
+    }
     const auto* rawBytes = static_cast<const uint8_t*>(data);
 
     std::string body;
@@ -280,6 +304,10 @@ std::string LCPacket::makeLCPacket(const void* data, size_t size, bool compressP
         body.assign(reinterpret_cast<const char*>(rawBytes), size);
     }
 
+    if (body.size() > static_cast<size_t>((std::numeric_limits<uint32_t>::max)() - kTotalHeaderSize)) {
+        return {};
+    }
+
     const uint32_t bodyLen = static_cast<uint32_t>(body.size());
     const auto md5Digest = computeBabelTimeMd5(
         reinterpret_cast<const uint8_t*>(body.data()), body.size());
@@ -287,19 +315,13 @@ std::string LCPacket::makeLCPacket(const void* data, size_t size, bool compressP
     std::string packet(kTotalHeaderSize + body.size(), '\0');
     auto* out = reinterpret_cast<uint8_t*>(packet.data());
 
-    // [0..3] Big-endian body length
     writeBigEndianU32(out, bodyLen);
-
-    // [4..7] Protocol flags: {1, 1, 1, 1} matches libcocos2dlua.so GameUtil::makeLCPacket
     out[4] = compressPayload ? 1u : 0u;
     out[5] = 1u;
     out[6] = 1u;
     out[7] = 1u;
-
-    // [8..23] Raw 16-byte BabelTime MD5 digest
     std::memcpy(out + 8, md5Digest.data(), kHeaderMd5Size);
 
-    // [24..] Payload bytes
     if (!body.empty()) {
         std::memcpy(out + kTotalHeaderSize, body.data(), body.size());
     }
@@ -329,7 +351,9 @@ bool LCPacket::isFramedLCPacket(const void* data, size_t size) {
 }
 
 bool LCPacket::parseLCPacket(const void* packetData, size_t packetSize,
-                             DecodedPacket& outPacket, bool decompress) {
+                             DecodedPacket& outPacket, bool decompress,
+                             bool requireValidMd5) {
+    outPacket = DecodedPacket{};
     if (packetData == nullptr || packetSize < kTotalHeaderSize) {
         return false;
     }
@@ -344,11 +368,19 @@ bool LCPacket::parseLCPacket(const void* packetData, size_t packetSize,
     std::memcpy(outPacket.flags.data(), bytes + 4, kHeaderFlagsSize);
     std::memcpy(outPacket.md5.data(), bytes + 8, kHeaderMd5Size);
 
+    if ((outPacket.flags[0] != 0u && outPacket.flags[0] != 1u) ||
+        outPacket.flags[1] != 1u || outPacket.flags[2] != 1u || outPacket.flags[3] != 1u) {
+        return false;
+    }
+
     const uint8_t* bodyPtr = bytes + kTotalHeaderSize;
     const auto expectedMd5 = computeBabelTimeMd5(bodyPtr, bodyLen);
     outPacket.md5Valid = (expectedMd5 == outPacket.md5);
+    if (requireValidMd5 && !outPacket.md5Valid) {
+        return false;
+    }
 
-    const bool isCompressed = (outPacket.flags[0] != 0);
+    const bool isCompressed = (outPacket.flags[0] != 0u);
     if (decompress && isCompressed) {
         if (!zlibDecompress(bodyPtr, bodyLen, outPacket.payload)) {
             return false;

@@ -28,6 +28,7 @@ namespace gclient::net {
 namespace {
 
 constexpr uint32_t kMaxFrameBodyLength = 64u * 1024u * 1024u;
+constexpr size_t kMaxBufferedBytes = 64u * 1024u * 1024u;
 constexpr int kMaxFrameHeaderSize = 65536;
 
 #ifdef _WIN32
@@ -62,7 +63,7 @@ void logMessage(const char* msg) {
 } // namespace
 
 // ============================================================================
-// WinsockSession (RAII WSAStartup / WSACleanup)
+// WinsockSession
 // ============================================================================
 
 std::mutex WinsockSession::s_mutex;
@@ -208,6 +209,67 @@ bool CConnection::isWouldBlockError(int err) noexcept {
 #endif
 }
 
+bool CConnection::tryStartNextEndpointLocked(int& outLastErr, bool& outConnectedImmediately) {
+    outLastErr = 0;
+    outConnectedImmediately = false;
+
+    while (!fallbackEndpoints_.empty()) {
+        const ResolvedEndpoint ep = fallbackEndpoints_.front();
+        fallbackEndpoints_.pop_front();
+
+        SOCKET sock = ::socket(ep.family, ep.socktype, ep.protocol);
+        if (sock == INVALID_SOCKET) {
+            outLastErr = getLastSocketError();
+            continue;
+        }
+
+#ifdef _WIN32
+        u_long nonBlocking = 1;
+        if (::ioctlsocket(sock, FIONBIO, &nonBlocking) == SOCKET_ERROR) {
+            outLastErr = getLastSocketError();
+            ::closesocket(sock);
+            continue;
+        }
+#else
+        const int flags = ::fcntl(sock, F_GETFL, 0);
+        if (flags < 0 || ::fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+            outLastErr = getLastSocketError();
+            ::close(sock);
+            continue;
+        }
+#endif
+
+        int nodelay = 1;
+        ::setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+                     reinterpret_cast<const char*>(&nodelay),
+                     static_cast<socklen_t>(sizeof(nodelay)));
+
+        const int rc = ::connect(
+            sock,
+            reinterpret_cast<const sockaddr*>(&ep.addr),
+            static_cast<socklen_t>(ep.addrLen));
+        if (rc == 0) {
+            socket_.store(sock, std::memory_order_release);
+            outConnectedImmediately = true;
+            return true;
+        }
+
+        outLastErr = getLastSocketError();
+        if (isWouldBlockError(outLastErr)) {
+            socket_.store(sock, std::memory_order_release);
+            outConnectedImmediately = false;
+            return true;
+        }
+
+#ifdef _WIN32
+        ::closesocket(sock);
+#else
+        ::close(sock);
+#endif
+    }
+    return false;
+}
+
 bool CConnection::connect(const char* host, unsigned int port) {
     if (socket_.load(std::memory_order_acquire) != INVALID_SOCKET) {
         logMessage("socket already exists, you should use a new connection");
@@ -240,72 +302,46 @@ bool CConnection::connect(const char* host, unsigned int port) {
         return false;
     }
 
-    SOCKET sock = INVALID_SOCKET;
     int lastErr = 0;
     bool connectedImmediately = false;
-
-    for (addrinfo* rp = addrList; rp != nullptr; rp = rp->ai_next) {
-        sock = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sock == INVALID_SOCKET) {
-            lastErr = getLastSocketError();
-            continue;
+    {
+        std::lock_guard<std::mutex> epLock(connectEndpointsMutex_);
+        fallbackEndpoints_.clear();
+        targetPort_ = port;
+        for (addrinfo* rp = addrList; rp != nullptr; rp = rp->ai_next) {
+            if (rp->ai_addr == nullptr || rp->ai_addrlen == 0 ||
+                static_cast<size_t>(rp->ai_addrlen) > sizeof(sockaddr_storage)) {
+                continue;
+            }
+            ResolvedEndpoint ep{};
+            ep.family = rp->ai_family;
+            ep.socktype = rp->ai_socktype;
+            ep.protocol = rp->ai_protocol;
+            ep.addrLen = static_cast<size_t>(rp->ai_addrlen);
+            std::memcpy(&ep.addr, rp->ai_addr, ep.addrLen);
+            fallbackEndpoints_.push_back(ep);
         }
+        ::freeaddrinfo(addrList);
 
-#ifdef _WIN32
-        u_long nonBlocking = 1;
-        if (::ioctlsocket(sock, FIONBIO, &nonBlocking) == SOCKET_ERROR) {
-            lastErr = getLastSocketError();
-            ::closesocket(sock);
-            sock = INVALID_SOCKET;
-            continue;
+        if (!tryStartNextEndpointLocked(lastErr, connectedImmediately)) {
+            trace_.record("CONNECT_ERROR", lastErr, 0, port);
+            return false;
         }
-#else
-        const int flags = ::fcntl(sock, F_GETFL, 0);
-        if (flags < 0 || ::fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
-            lastErr = getLastSocketError();
-            ::close(sock);
-            sock = INVALID_SOCKET;
-            continue;
-        }
-#endif
-
-        int nodelay = 1;
-        ::setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
-                     reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
-
-        const int rc = ::connect(sock, rp->ai_addr, static_cast<int>(rp->ai_addrlen));
-        if (rc == 0) {
-            connectedImmediately = true;
-            break;
-        }
-
-        lastErr = getLastSocketError();
-        if (isWouldBlockError(lastErr)) {
-            connectedImmediately = false;
-            break;
-        }
-
-#ifdef _WIN32
-        ::closesocket(sock);
-#else
-        ::close(sock);
-#endif
-        sock = INVALID_SOCKET;
     }
 
-    ::freeaddrinfo(addrList);
-
-    if (sock == INVALID_SOCKET) {
-        trace_.record("CONNECT_ERROR", lastErr, 0, port);
-        return false;
-    }
-
-    socket_.store(sock, std::memory_order_release);
+    epoch_.fetch_add(1u, std::memory_order_acq_rel);
     closeNotified_ = false;
     expectedBodyLength_ = 0;
+    hasPendingHeader_ = false;
     currentHeader_.assign(static_cast<size_t>(headerSize_), 0);
     recvBuffer_.clear();
     recvReadOffset_ = 0;
+    {
+        std::lock_guard<std::mutex> sendLock(sendMutex_);
+        sendQueue_.clear();
+        queuedSendBytes_ = 0;
+        frontSendOffset_ = 0;
+    }
 
     const int64_t nowMs = nowSteadyMs();
     connectStartMs_.store(nowMs, std::memory_order_release);
@@ -331,6 +367,13 @@ bool CConnection::send(const std::string& data, bool wrapLCPacket) {
     return send(data.data(), data.size(), wrapLCPacket);
 }
 
+bool CConnection::send(const char* cstr, bool wrapLCPacket) {
+    if (cstr == nullptr) {
+        return false;
+    }
+    return send(static_cast<const void*>(cstr), std::strlen(cstr), wrapLCPacket);
+}
+
 bool CConnection::send(const void* data, size_t length, bool wrapLCPacket) {
     const State st = getState();
     if (socket_.load(std::memory_order_acquire) == INVALID_SOCKET ||
@@ -338,12 +381,13 @@ bool CConnection::send(const void* data, size_t length, bool wrapLCPacket) {
         trace_.record("SEND_DISCONNECTED", 0, static_cast<uint32_t>(length), wrapLCPacket ? 1u : 0u);
         return false;
     }
+    if (data == nullptr && length > 0) {
+        return false;
+    }
 
     std::string wireBytes;
     bool wrappedNow = false;
     if (wrapLCPacket) {
-        // Idempotency guard: if Lua already called GameUtil:makeLCPacket(raw) before conn:send(pkt),
-        // avoid double-compressing and double-framing an already valid LCPacket.
         if (LCPacket::isFramedLCPacket(data, length)) {
             wireBytes.assign(static_cast<const char*>(data), length);
         } else {
@@ -365,6 +409,12 @@ bool CConnection::send(const void* data, size_t length, bool wrapLCPacket) {
     const uint32_t wireLen = static_cast<uint32_t>(wireBytes.size());
     {
         std::lock_guard<std::mutex> lock(sendMutex_);
+        if (wireBytes.size() > kMaxBufferedBytes ||
+            queuedSendBytes_ > kMaxBufferedBytes - wireBytes.size()) {
+            trace_.record("SEND_QUEUE_FULL", 0, wireLen, 0);
+            return false;
+        }
+        queuedSendBytes_ += wireBytes.size();
         sendQueue_.push_back(std::move(wireBytes));
     }
 
@@ -382,8 +432,13 @@ void CConnection::close() {
     trace_.record("CLOSE_REQUESTED", 0, 0, 0);
 
     {
+        std::lock_guard<std::mutex> epLock(connectEndpointsMutex_);
+        fallbackEndpoints_.clear();
+    }
+    {
         std::lock_guard<std::mutex> lock(sendMutex_);
         sendQueue_.clear();
+        queuedSendBytes_ = 0;
         frontSendOffset_ = 0;
     }
 
@@ -414,8 +469,7 @@ void CConnection::setHeaderSize(int headerSize) {
         return;
     }
     headerSize_ = headerSize;
-    // Do NOT overwrite or resize currentHeader_ while a packet body is mid-frame!
-    if (expectedBodyLength_ == 0) {
+    if (!hasPendingHeader_ && expectedBodyLength_ == 0) {
         currentHeader_.assign(static_cast<size_t>(headerSize_), 0);
     }
 }
@@ -453,15 +507,28 @@ void CConnection::setCloseCallback(CloseCallback cb) {
     closeCallback_ = std::move(cb);
 }
 
-void CConnection::appendIncomingData(const char* data, size_t length) {
+bool CConnection::appendIncomingData(const char* data, size_t length) {
     if (data == nullptr || length == 0) {
-        return;
+        return true;
+    }
+    const size_t activeUnread = recvBuffer_.size() - recvReadOffset_;
+    if (length > kMaxBufferedBytes || activeUnread > kMaxBufferedBytes - length) {
+        trace_.record("RECV_BUFFER_OVERFLOW", 0, static_cast<uint32_t>(length), 0);
+        return false;
+    }
+    if (recvReadOffset_ > 0 && recvBuffer_.size() + length > kMaxBufferedBytes) {
+        recvBuffer_.erase(
+            recvBuffer_.begin(),
+            recvBuffer_.begin() + static_cast<std::ptrdiff_t>(recvReadOffset_));
+        recvReadOffset_ = 0;
     }
     recvBuffer_.insert(recvBuffer_.end(), data, data + length);
     lastActivityMs_.store(nowSteadyMs(), std::memory_order_release);
+    return true;
 }
 
-uint32_t CConnection::getBodyLength(const char* headerPtr) {
+uint32_t CConnection::getBodyLength(const char* headerPtr, bool& outZeroBodyOk) {
+    outZeroBodyOk = false;
     if (headerPtr == nullptr || headerSize_ <= 0) {
         return 0u;
     }
@@ -475,41 +542,58 @@ uint32_t CConnection::getBodyLength(const char* headerPtr) {
     }
 #if defined(GCLIENT_USE_COCOS2DX)
     else if (headLuaHandler_ > 0) {
-        auto* engine = cocos2d::CCLuaEngine::defaultEngine();
-        if (engine != nullptr) {
-            auto* stack = engine->getLuaStack();
-            stack->pushString(headerPtr, headerSize_);
-            const int ret = stack->executeFunctionByHandler(headLuaHandler_, 1);
-            bodyLen = ret > 0 ? static_cast<uint32_t>(ret) : 0u;
-            resolved = true;
+        if (auto* mgr = cocos2d::CCScriptEngineManager::sharedManager()) {
+            if (auto* engine = dynamic_cast<cocos2d::CCLuaEngine*>(mgr->getScriptEngine())) {
+                auto* stack = engine->getLuaStack();
+                stack->pushString(headerPtr, headerSize_);
+                const int ret = stack->executeFunctionByHandler(headLuaHandler_, 1);
+                if (ret < 0) {
+                    return kMaxFrameBodyLength + 1u;
+                }
+                bodyLen = static_cast<uint32_t>(ret);
+                outZeroBodyOk = (ret == 0);
+                resolved = true;
+            }
         }
     }
 #endif
 
     if (!resolved && headerSize_ >= 4) {
         bodyLen = LCPacket::readBigEndianU32(reinterpret_cast<const uint8_t*>(headerPtr));
+        outZeroBodyOk = (headerSize_ == static_cast<int>(LCPacket::kTotalHeaderSize) && bodyLen == 0u);
     }
 
-    if (bodyLen == 0u || bodyLen > kMaxFrameBodyLength) {
-        return 0u;
+    if (bodyLen > kMaxFrameBodyLength) {
+        return kMaxFrameBodyLength + 1u;
     }
     return bodyLen;
 }
 
 void CConnection::doRead() {
     ScopedRetain selfGuard(this);
+    if (inDoRead_) {
+        return;
+    }
     if (getState() == State::Closed) {
         recvBuffer_.clear();
         recvReadOffset_ = 0;
+        hasPendingHeader_ = false;
+        expectedBodyLength_ = 0;
         return;
     }
 
-    size_t cursor = recvReadOffset_;
+    struct ReentrancyGuard {
+        bool& flag;
+        explicit ReentrancyGuard(bool& f) : flag(f) { flag = true; }
+        ~ReentrancyGuard() { flag = false; }
+    } guard(inDoRead_);
 
-    while (cursor <= recvBuffer_.size()) {
-        const size_t available = recvBuffer_.size() - cursor;
+    const uint64_t startEpoch = connectionEpoch();
 
-        if (expectedBodyLength_ == 0) {
+    while (recvReadOffset_ <= recvBuffer_.size()) {
+        const size_t available = recvBuffer_.size() - recvReadOffset_;
+
+        if (!hasPendingHeader_) {
             if (headerSize_ <= 0) {
                 break;
             }
@@ -518,65 +602,77 @@ void CConnection::doRead() {
                 break;
             }
 
-            const uint32_t bodyLen = getBodyLength(recvBuffer_.data() + cursor);
-            if (getState() == State::Closed) {
-                recvBuffer_.clear();
-                recvReadOffset_ = 0;
+            std::vector<char> headerCopy(
+                recvBuffer_.data() + recvReadOffset_,
+                recvBuffer_.data() + recvReadOffset_ + frameHeaderSize);
+
+            bool zeroBodyOk = false;
+            const uint32_t bodyLen = getBodyLength(headerCopy.data(), zeroBodyOk);
+            if (getState() == State::Closed || connectionEpoch() != startEpoch) {
+                if (getState() == State::Closed) {
+                    recvBuffer_.clear();
+                    recvReadOffset_ = 0;
+                    hasPendingHeader_ = false;
+                    expectedBodyLength_ = 0;
+                }
                 return;
             }
 
-            if (bodyLen == 0 || bodyLen > kMaxFrameBodyLength) {
+            if ((bodyLen == 0u && !zeroBodyOk) || bodyLen > kMaxFrameBodyLength) {
                 logMessage("lua error occured for HeadScript, close socket now");
                 trace_.record("HEAD_SCRIPT_ERROR", 0, bodyLen, static_cast<uint32_t>(frameHeaderSize));
                 close();
                 return;
             }
 
-            // Recompute header size and recvBuffer_.data() + cursor after getBodyLength(),
-            // because headLuaHandler_ / headCallback_ may have closed or resized recvBuffer_.
-            const size_t updatedHeaderSize = static_cast<size_t>(headerSize_);
-            if (cursor + updatedHeaderSize > recvBuffer_.size()) {
+            if (recvBuffer_.size() - recvReadOffset_ < frameHeaderSize) {
                 break;
             }
-            const char* freshHeaderPtr = recvBuffer_.data() + cursor;
-            currentHeader_.assign(freshHeaderPtr, freshHeaderPtr + updatedHeaderSize);
-            cursor += updatedHeaderSize;
+            currentHeader_ = std::move(headerCopy);
+            recvReadOffset_ += frameHeaderSize;
             expectedBodyLength_ = bodyLen;
+            hasPendingHeader_ = true;
         }
 
-        if (cursor > recvBuffer_.size()) {
+        if (recvReadOffset_ > recvBuffer_.size()) {
             break;
         }
-        const size_t bodyAvailable = recvBuffer_.size() - cursor;
+        const size_t bodyAvailable = recvBuffer_.size() - recvReadOffset_;
         if (bodyAvailable < static_cast<size_t>(expectedBodyLength_)) {
             break;
         }
 
-        const char* bodyPtr = recvBuffer_.data() + cursor;
+        // Copy body slice and commit recvReadOffset_ BEFORE invoking user/Lua callbacks so
+        // reentrant close(), connect(), or buffer growth never causes UAF or double-dispatch!
         const uint32_t bodyLen = expectedBodyLength_;
-        cursor += static_cast<size_t>(bodyLen);
+        std::string bodyCopy(recvBuffer_.data() + recvReadOffset_, static_cast<size_t>(bodyLen));
+        recvReadOffset_ += static_cast<size_t>(bodyLen);
         expectedBodyLength_ = 0;
+        hasPendingHeader_ = false;
 
         trace_.record("PACKET_DISPATCH", 0, bodyLen, static_cast<uint32_t>(currentHeader_.size()));
-        doPacketBody(bodyPtr, static_cast<size_t>(bodyLen));
+        doPacketBody(bodyCopy.data(), bodyCopy.size());
 
-        if (getState() == State::Closed) {
-            recvBuffer_.clear();
-            recvReadOffset_ = 0;
+        if (getState() == State::Closed || connectionEpoch() != startEpoch) {
+            if (getState() == State::Closed) {
+                recvBuffer_.clear();
+                recvReadOffset_ = 0;
+                hasPendingHeader_ = false;
+                expectedBodyLength_ = 0;
+            }
             return;
         }
     }
 
-    if (cursor > 0) {
-        if (cursor >= recvBuffer_.size()) {
+    if (recvReadOffset_ > 0) {
+        if (recvReadOffset_ >= recvBuffer_.size()) {
             recvBuffer_.clear();
             recvReadOffset_ = 0;
-        } else if (cursor >= 4096 || cursor * 2 >= recvBuffer_.size()) {
-            recvBuffer_.erase(recvBuffer_.begin(),
-                              recvBuffer_.begin() + static_cast<std::ptrdiff_t>(cursor));
+        } else if (recvReadOffset_ >= 4096 || recvReadOffset_ * 2 >= recvBuffer_.size()) {
+            recvBuffer_.erase(
+                recvBuffer_.begin(),
+                recvBuffer_.begin() + static_cast<std::ptrdiff_t>(recvReadOffset_));
             recvReadOffset_ = 0;
-        } else {
-            recvReadOffset_ = cursor;
         }
     }
 }
@@ -590,12 +686,13 @@ void CConnection::doPacketBody(const char* body, size_t bodyLength) {
 
 #if defined(GCLIENT_USE_COCOS2DX)
     if (bodyLuaHandler_ > 0) {
-        auto* engine = cocos2d::CCLuaEngine::defaultEngine();
-        if (engine != nullptr) {
-            auto* stack = engine->getLuaStack();
-            stack->pushString(body, static_cast<int>(bodyLength));
-            stack->pushString(currentHeader_.data(), static_cast<int>(currentHeader_.size()));
-            stack->executeFunctionByHandler(bodyLuaHandler_, 2);
+        if (auto* mgr = cocos2d::CCScriptEngineManager::sharedManager()) {
+            if (auto* engine = dynamic_cast<cocos2d::CCLuaEngine*>(mgr->getScriptEngine())) {
+                auto* stack = engine->getLuaStack();
+                stack->pushString(body, static_cast<int>(bodyLength));
+                stack->pushString(currentHeader_.data(), static_cast<int>(currentHeader_.size()));
+                stack->executeFunctionByHandler(bodyLuaHandler_, 2);
+            }
         }
     }
 #else
@@ -604,7 +701,8 @@ void CConnection::doPacketBody(const char* body, size_t bodyLength) {
 #endif
 }
 
-bool CConnection::pollCompleteConnect() {
+bool CConnection::pollCompleteConnect(int& outSoError) {
+    outSoError = 0;
     const SOCKET sock = socket_.load(std::memory_order_acquire);
     if (sock == INVALID_SOCKET || getState() != State::Connecting) {
         return false;
@@ -622,14 +720,44 @@ bool CConnection::pollCompleteConnect() {
     }
 
     if (soError != 0) {
-        trace_.record("CONNECT_FAILED", soError, 0, 0);
+        // Dual-stack fallback: if IPv6 (e.g. ::1) refused connection, seamlessly try IPv4 (127.0.0.1)!
+        closeSocketHandle();
+        int fallbackErr = soError;
+        bool connectedNow = false;
+        bool startedFallback = false;
+        {
+            std::lock_guard<std::mutex> epLock(connectEndpointsMutex_);
+            if (!fallbackEndpoints_.empty()) {
+                startedFallback = tryStartNextEndpointLocked(fallbackErr, connectedNow);
+            }
+        }
+        if (startedFallback) {
+            const int64_t nowMs = nowSteadyMs();
+            connectStartMs_.store(nowMs, std::memory_order_release);
+            lastActivityMs_.store(nowMs, std::memory_order_release);
+            if (connectedNow) {
+                state_.store(State::Connected, std::memory_order_release);
+                trace_.record("CONNECT_OK_FALLBACK", 0, 0, targetPort_);
+            } else {
+                state_.store(State::Connecting, std::memory_order_release);
+                trace_.record("CONNECT_FALLBACK_PENDING", fallbackErr, 0, targetPort_);
+            }
+            return true;
+        }
+
+        outSoError = soError;
+        trace_.record("CONNECT_FAILED", soError, 0, targetPort_);
         state_.store(State::Closing, std::memory_order_release);
         return false;
     }
 
+    {
+        std::lock_guard<std::mutex> epLock(connectEndpointsMutex_);
+        fallbackEndpoints_.clear();
+    }
     state_.store(State::Connected, std::memory_order_release);
     lastActivityMs_.store(nowSteadyMs(), std::memory_order_release);
-    trace_.record("CONNECT_OK", 0, 0, 0);
+    trace_.record("CONNECT_OK", 0, 0, targetPort_);
     return true;
 }
 
@@ -645,7 +773,7 @@ bool CConnection::pollReadSocket(std::string& outChunk, bool& outPeerClosed, int
 
     char buf[8192];
     for (;;) {
-        const int n = static_cast<int>(::recv(sock, buf, sizeof(buf), 0));
+        const int n = static_cast<int>(::recv(sock, buf, static_cast<int>(sizeof(buf)), 0));
         if (n > 0) {
             outChunk.append(buf, static_cast<size_t>(n));
             lastActivityMs_.store(nowSteadyMs(), std::memory_order_release);
@@ -699,10 +827,17 @@ bool CConnection::pollFlushSendQueue(int& outError) {
             continue;
         }
 
+        const size_t chunkToSend = (std::min)(remaining, static_cast<size_t>(262144u));
         const int sent = static_cast<int>(
-            ::send(sock, front.data() + frontSendOffset_, static_cast<int>(remaining), sendFlags));
+            ::send(sock, front.data() + frontSendOffset_, static_cast<int>(chunkToSend), sendFlags));
         if (sent > 0) {
-            frontSendOffset_ += static_cast<size_t>(sent);
+            const size_t sentSz = static_cast<size_t>(sent);
+            frontSendOffset_ += sentSz;
+            if (queuedSendBytes_ >= sentSz) {
+                queuedSendBytes_ -= sentSz;
+            } else {
+                queuedSendBytes_ = 0;
+            }
             totalSent += static_cast<uint32_t>(sent);
             lastActivityMs_.store(nowSteadyMs(), std::memory_order_release);
             if (frontSendOffset_ >= front.size()) {
@@ -766,6 +901,7 @@ void CConnection::notifyClosedOnMainThread(int wsaError, const char* reason) {
     state_.store(State::Closed, std::memory_order_release);
     closeSocketHandle();
     expectedBodyLength_ = 0;
+    hasPendingHeader_ = false;
     recvReadOffset_ = 0;
     std::vector<char>().swap(recvBuffer_);
     trace_.record(reason != nullptr ? reason : "CLOSED", wsaError, 0, 0);
@@ -777,10 +913,13 @@ void CConnection::notifyClosedOnMainThread(int wsaError, const char* reason) {
 
 #if defined(GCLIENT_USE_COCOS2DX)
     if (closeLuaHandler_ > 0) {
-        auto* engine = cocos2d::CCLuaEngine::defaultEngine();
-        if (engine != nullptr) {
-            auto* stack = engine->getLuaStack();
-            stack->executeFunctionByHandler(closeLuaHandler_, 0);
+        // Check CCScriptEngineManager rather than CCLuaEngine::defaultEngine() so late
+        // shutdown never resurrects a brand-new Lua VM after purgeSharedManager()!
+        if (auto* mgr = cocos2d::CCScriptEngineManager::sharedManager()) {
+            if (auto* engine = dynamic_cast<cocos2d::CCLuaEngine*>(mgr->getScriptEngine())) {
+                auto* stack = engine->getLuaStack();
+                stack->executeFunctionByHandler(closeLuaHandler_, 0);
+            }
         }
     }
 #endif

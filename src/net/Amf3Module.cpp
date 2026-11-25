@@ -213,8 +213,11 @@ struct Amf3Encoder {
             const int keyType = lua_type(L, -2);
             if (keyType == LUA_TNUMBER) {
                 const double kd = lua_tonumber(L, -2);
-                const size_t ki = static_cast<size_t>(kd);
-                if (!(kd >= 1.0 && static_cast<double>(ki) == kd && ki <= denseCount)) {
+                const bool validDenseIdx =
+                    std::isfinite(kd) && kd >= 1.0 &&
+                    kd <= static_cast<double>(denseCount) &&
+                    std::floor(kd) == kd;
+                if (!validDenseIdx) {
                     hasNonDenseKeys = true;
                 }
             } else {
@@ -292,8 +295,9 @@ struct Amf3Encoder {
                 bool isDenseKey = false;
                 if (keyType == LUA_TNUMBER) {
                     const double kd = lua_tonumber(L, -2);
-                    const size_t ki = static_cast<size_t>(kd);
-                    if (kd >= 1.0 && static_cast<double>(ki) == kd && ki <= denseCount) {
+                    if (std::isfinite(kd) && kd >= 1.0 &&
+                        kd <= static_cast<double>(denseCount) &&
+                        std::floor(kd) == kd) {
                         isDenseKey = true;
                     }
                 }
@@ -550,7 +554,13 @@ struct Amf3Decoder {
         }
 
         const uint32_t denseCount = header >> 1;
-        const int preAlloc = denseCount > 65536u ? 65536 : static_cast<int>(denseCount);
+        const size_t remWire = (pos <= length) ? (length - pos) : 0u;
+        if (static_cast<size_t>(denseCount) > remWire) {
+            setError("amf3.decode: truncated dense array (count=%u, remaining=%u)",
+                     static_cast<unsigned>(denseCount), static_cast<unsigned>(remWire));
+            return false;
+        }
+        const int preAlloc = denseCount > 4096u ? 4096 : static_cast<int>(denseCount);
         lua_createtable(L, preAlloc, 0);
         registerTopObjectRef();
 
@@ -611,6 +621,11 @@ struct Amf3Decoder {
             traits.dynamic = ((header & 0x08u) != 0u);
             const uint32_t sealedCount = header >> 4;
             if (!readUtf8Vr(traits.className)) {
+                return false;
+            }
+            const size_t remWire = (pos <= length) ? (length - pos) : 0u;
+            if (static_cast<size_t>(sealedCount) > remWire) {
+                setError("amf3.decode: truncated object traits (sealedCount=%u)", static_cast<unsigned>(sealedCount));
                 return false;
             }
             traits.sealedMembers.reserve(sealedCount > 1024u ? 1024u : sealedCount);
@@ -760,7 +775,7 @@ int amf3_encode(lua_State* L) {
 
     char errBuf[256] = {};
     bool ok = false;
-    {
+    try {
         Amf3Encoder encoder;
         encoder.L = L;
         encoder.out.reserve(128);
@@ -770,6 +785,8 @@ int amf3_encode(lua_State* L) {
         } else {
             std::memcpy(errBuf, encoder.errorBuf, sizeof(errBuf));
         }
+    } catch (const std::bad_alloc&) {
+        return luaL_error(L, "amf3.encode: out of memory");
     }
     if (!ok) {
         return luaL_error(L, "%s", errBuf);
@@ -794,7 +811,7 @@ int amf3_decode(lua_State* L) {
     char errBuf[256] = {};
     bool ok = false;
     size_t finalPos = 0;
-    {
+    try {
         Amf3Decoder decoder;
         decoder.L = L;
         decoder.data = reinterpret_cast<const uint8_t*>(str);
@@ -807,6 +824,8 @@ int amf3_decode(lua_State* L) {
         if (!ok) {
             std::memcpy(errBuf, decoder.errorBuf, sizeof(errBuf));
         }
+    } catch (const std::bad_alloc&) {
+        return luaL_error(L, "amf3.decode: out of memory");
     }
     if (!ok) {
         return luaL_error(L, "%s", errBuf);

@@ -27,9 +27,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <exception>
 #include <filesystem>
 #include <mutex>
@@ -674,7 +676,7 @@ bool writeMinidumpInternal(EXCEPTION_POINTERS* exPtrs, wchar_t* outPath, std::si
     SYSTEMTIME st{};
     ::GetLocalTime(&st);
 
-    wchar_t dumpPath[MAX_PATH] = {};
+    wchar_t dumpPath[1024] = {};
     ::_snwprintf_s(
         dumpPath,
         _countof(dumpPath),
@@ -879,16 +881,34 @@ LONG WINAPI unhandledExceptionFilter(EXCEPTION_POINTERS* exPtrs) {
 #endif
     }
 
-    // 5. Walk up to 48 native stack frames on a COPY of CONTEXT.
-    crashWriteLine(hLog, "Native Call Stack (max %d frames):", kMaxNativeStackFrames);
-    sehWalkNativeStack(hLog, ctx);
+    // 5. Write .dmp minidump FIRST before symbol initialization or stack walking can touch
+    //    potentially contended CRT/DbgHelp heap locks or guard pages!
+    if (hLog != INVALID_HANDLE_VALUE) {
+        ::FlushFileBuffers(hLog);
+    }
+    g_crashDumpPathWide[0] = L'\0';
+    const bool dumped = writeMinidumpInternal(exPtrs, g_crashDumpPathWide, _countof(g_crashDumpPathWide));
+    wideToUtf8Fixed(g_crashDumpPathWide, g_crashDumpPathUtf8, sizeof(g_crashDumpPathUtf8));
 
-    // 6. Walk up to 32 active Lua call frames inside POD SEH helper ("Sln").
-    crashWriteLine(hLog, "Active Lua Call Stack (max %d frames):", kMaxLuaStackFrames);
-    lua_State* L = s.luaState.load(std::memory_order_acquire);
-    sehDumpLuaCallFrames(hLog, L);
+    if (code != EXCEPTION_STACK_OVERFLOW) {
+        // 6. Walk up to 48 native stack frames on a COPY of CONTEXT.
+        crashWriteLine(hLog, "Native Call Stack (max %d frames):", kMaxNativeStackFrames);
+        sehWalkNativeStack(hLog, ctx);
 
-    // 7. Compact loaded modules list (base..end size name).
+        // 7. Walk Lua frames ONLY if the crash occurred on the main Lua-owning thread
+        //    (walking lua_State* from a crashing worker thread races the live main thread!).
+        crashWriteLine(hLog, "Active Lua Call Stack (max %d frames):", kMaxLuaStackFrames);
+        if (crashTid == mainTid) {
+            lua_State* L = s.luaState.load(std::memory_order_acquire);
+            sehDumpLuaCallFrames(hLog, L);
+        } else {
+            crashWriteLine(hLog, "  <skipped Lua stack walk on worker thread to avoid VM data race>");
+        }
+    } else {
+        crashWriteLine(hLog, "Native/Lua stack walk skipped due to EXCEPTION_STACK_OVERFLOW guard-page safety.");
+    }
+
+    // 8. Compact loaded modules list (base..end size name).
     crashWriteLine(
         hLog,
         "Loaded Modules (%lu):",
@@ -906,16 +926,6 @@ LONG WINAPI unhandledExceptionFilter(EXCEPTION_POINTERS* exPtrs) {
             static_cast<unsigned long>(m.size),
             m.name);
     }
-
-    // CRITICAL: Flush diagnostic crash log to disk BEFORE invoking MiniDumpWriteDump!
-    if (hLog != INVALID_HANDLE_VALUE) {
-        ::FlushFileBuffers(hLog);
-    }
-
-    // 8. Write .dmp minidump and append its path to the log.
-    g_crashDumpPathWide[0] = L'\0';
-    const bool dumped = writeMinidumpInternal(exPtrs, g_crashDumpPathWide, _countof(g_crashDumpPathWide));
-    wideToUtf8Fixed(g_crashDumpPathWide, g_crashDumpPathUtf8, sizeof(g_crashDumpPathUtf8));
 
     crashWriteLine(
         hLog,
@@ -1246,6 +1256,9 @@ void CrashAndTelemetry::log(LogLevel level, const char* category, const char* fm
 }
 
 void CrashAndTelemetry::logV(LogLevel level, const char* category, const char* fmt, va_list args) {
+    if (fmt == nullptr) {
+        fmt = "";
+    }
     char timestamp[80] = {};
     formatTimestamp(timestamp, sizeof(timestamp));
 
@@ -1304,6 +1317,12 @@ void CrashAndTelemetry::flushLogs() {
 }
 
 void CrashAndTelemetry::recordFrame(float dtSeconds) {
+    // Reject NaN/Inf/negative frame deltas so std::sort strict weak ordering can NEVER fault!
+    if (!std::isfinite(dtSeconds) || dtSeconds < 0.0f) {
+        dtSeconds = 0.0f;
+    } else if (dtSeconds > 60.0f) {
+        dtSeconds = 60.0f;
+    }
     DiagnosticsState& s = state();
     const double dtMs = static_cast<double>(dtSeconds) * 1000.0;
 

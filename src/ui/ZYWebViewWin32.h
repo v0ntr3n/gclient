@@ -5,15 +5,14 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <Windows.h>
 #endif
 
 namespace gclient::ui {
 
-// Native Win32 replacement for org.go3k.utilities.ZYWebView.
-// Hosts an embedded Microsoft Edge WebView2 child view ONLY when GCLIENT_ENABLE_WEBVIEW2 is defined
-// and WebView2Loader is linked; otherwise falls back cleanly to opening URLs in the default
-// Windows browser WITHOUT creating an opaque child HWND over the OpenGL viewport.
 class ZYWebViewWin32 {
 public:
     static ZYWebViewWin32* getInstance();
@@ -22,17 +21,13 @@ public:
     void setParentWindow(HWND hwnd);
 #endif
 
-    // Mirrors ZYWebView.displayWebView(x, y, width, height)
     void displayWebView(int x, int y, int width, int height);
-
-    // Mirrors ZYWebView.updateURL(url)
     void updateURL(const std::string& url);
-
-    // Mirrors ZYWebView.removeWebView()
     void removeWebView();
-
-    // Reposition active overlay when the Win32 game window resizes
     void onParentResized(int clientWidth, int clientHeight);
+    void onParentDestroyed();
+    void shutdown();
+
     bool isVisible() const { return m_visible; }
 
     bool hasNativeHostWindow() const {

@@ -261,11 +261,15 @@ std::string BTUtil::getLuaOrigPackagePath() {
 }
 
 std::string BTUtil::insertToSearchPathBegin(const std::string& path) {
+    std::string norm = path;
+    std::replace(norm.begin(), norm.end(), '\\', '/');
     auto* fu = CCFileUtils::sharedFileUtils();
-    std::vector<std::string> paths = fu->getSearchPaths();
-    paths.insert(paths.begin(), path);
-    fu->setSearchPaths(paths);
-    return path;
+    if (fu) {
+        std::vector<std::string> paths = fu->getSearchPaths();
+        paths.insert(paths.begin(), norm);
+        fu->setSearchPaths(paths);
+    }
+    return norm;
 }
 
 // Matches 0x346928: splits on '?', splits query on '&', sorts params lexicographically,
@@ -286,8 +290,18 @@ std::string BTUtil::sortUrlString(const std::string& url) {
 }
 
 void BTUtil::exitNow() {
-    CCDirector::sharedDirector()->end();
-    std::exit(0);
+    // Request clean Cocos2d-x / Win32 message-loop exit rather than std::exit(0),
+    // which would skip wWinMain stack unwinding, AppDelegate::shutdown(), and race worker threads!
+    if (auto* director = CCDirector::sharedDirector()) {
+        director->end();
+    }
+#ifdef _WIN32
+    if (auto* eglView = CCEGLView::sharedOpenGLView()) {
+        if (HWND hwnd = eglView->getHWnd(); hwnd != nullptr && ::IsWindow(hwnd)) {
+            ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+    }
+#endif
 }
 
 void BTUtil::TimeStart() {

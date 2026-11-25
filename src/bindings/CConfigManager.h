@@ -42,9 +42,8 @@ private:
 
 class CConfigurationManager {
 public:
-    // Bounded SQLite page cache limits (negative values specify KiB).
     static constexpr int kMainCacheSizeKiB = -2048;
-    static constexpr int kAttachedCacheSizeKiB = -512;  // 512 KiB cap per opened DB
+    static constexpr int kAttachedCacheSizeKiB = -512;
 
     static CConfigurationManager* sharedConfigurationManager(bool reload = false);
 
@@ -53,13 +52,13 @@ public:
 
     bool init();
     bool reload();
+    void closeAllDbs();
     CTable* getTable(const std::string& dbFile, const std::string& tableName);
     std::string getDbFile(const std::string& dbFile);
     std::size_t openDbCount() const { return m_dbs.size(); }
 
 private:
     sqlite3* openOrGetDb(const std::string& normalizedPath);
-    void closeAllDbs();
 
     std::map<std::string, sqlite3*> m_dbs;
     std::map<std::string, CTable*>  m_tables;

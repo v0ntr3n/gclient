@@ -703,8 +703,9 @@ bool showNativeWin32LoginDialog(AccountAuthProvider* provider,
 #endif
 
 std::mutex& workerThreadLifecycleMutex() {
-    static std::mutex s_workerMutex;
-    return s_workerMutex;
+    // Immortal heap allocation prevents static-destruction-order crash when ~Platform() runs at exit.
+    static std::mutex* s_workerMutex = new std::mutex();
+    return *s_workerMutex;
 }
 
 } // namespace
@@ -1131,12 +1132,30 @@ void AccountAuthProvider::saveCachedSession(const AuthSession& session) const {
     if (p.has_parent_path()) {
         fs::create_directories(p.parent_path(), ec);
     }
-    std::ofstream ofs(p, std::ios::binary | std::ios::trunc);
-    if (!ofs.is_open()) return;
-    ofs << "{\"pid\":\"" << escapeJson(session.pid)
-        << "\",\"token\":\"" << escapeJson(session.token)
-        << "\",\"username\":\"" << escapeJson(session.username) << "\"}\n";
-    ofs.flush();
+    const fs::path tmpPath = p.parent_path() / (fsPathToUtf8(p.filename()) + ".tmp");
+    {
+        std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!ofs.is_open()) return;
+        ofs << "{\"pid\":\"" << escapeJson(session.pid)
+            << "\",\"token\":\"" << escapeJson(session.token)
+            << "\",\"username\":\"" << escapeJson(session.username) << "\"}\n";
+        ofs.flush();
+        if (!ofs.good()) {
+            ofs.close();
+            fs::remove(tmpPath, ec);
+            return;
+        }
+    }
+#ifdef _WIN32
+    if (!::MoveFileExW(tmpPath.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        fs::remove(tmpPath, ec);
+    }
+#else
+    fs::rename(tmpPath, p, ec);
+    if (ec) {
+        fs::remove(tmpPath, ec);
+    }
+#endif
 }
 
 void AccountAuthProvider::clearCachedSession() const {

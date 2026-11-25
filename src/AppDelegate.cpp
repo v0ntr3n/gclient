@@ -1,7 +1,7 @@
 // ============================================================================
 // Game Client Win32 Port — AppDelegate Implementation
 // Reconstructed from libcocos2dlua.so AppDelegate::applicationDidFinishLaunching
-// (0x2a25d8) and adapted for unmodified Cocos2d-x 2.2.6 Win32 overlay architecture.
+// (0x2a25d8) and hardened with an explicit atomic Win32 lifecycle state machine.
 // ============================================================================
 
 #ifdef _WIN32
@@ -18,7 +18,9 @@
 #include "AppDelegate.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
@@ -36,22 +38,82 @@
 #include "assets/BTAssetDecryptor.h"
 #include "assets/BtDecryptHook.h"
 #include "bindings/BTUtil.h"
+#include "bindings/CConfigManager.h"
 #include "bindings/LuaBindingsRegistry.h"
 #include "bindings/LuaHelpers.h"
+#include "bindings/LuaHttpAndCrypto.h"
 #include "net/CNetwork.h"
 #include "platform/BTPlatform.h"
+#include "ui/Win32DesktopBridge.h"
 #include "ui/ZYWebViewWin32.h"
+#include "update/AtomicHotUpdater.h"
 
 namespace gclient {
 
 namespace {
 
+std::mutex g_writableDirMutex;
 std::string g_configuredWritableDir;
-bool g_validateAssetsOnly = false;
+std::atomic<bool> g_validateAssetsOnly{false};
+std::atomic<AppDelegate*> g_activeAppInstance{nullptr};
 
 constexpr float kDesignWidth = 1136.0f;
 constexpr float kDesignHeight = 640.0f;
 constexpr double kTargetAnimationInterval = 0.0333333333; // 30 FPS
+
+std::string getConfiguredWritableDirSnapshot() {
+    std::lock_guard<std::mutex> lock(g_writableDirMutex);
+    return g_configuredWritableDir;
+}
+
+void setConfiguredWritableDirSnapshot(std::string dir) {
+    std::lock_guard<std::mutex> lock(g_writableDirMutex);
+    g_configuredWritableDir = std::move(dir);
+}
+
+#ifdef _WIN32
+std::wstring utf8ToWidePath(const std::string& utf8) {
+    if (utf8.empty()) {
+        return {};
+    }
+    int req = ::MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    if (req <= 0) {
+        req = ::MultiByteToWideChar(
+            CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    }
+    if (req <= 0) {
+        return {};
+    }
+    std::wstring wide(static_cast<std::size_t>(req), L'\0');
+    ::MultiByteToWideChar(
+        CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), req);
+    return wide;
+}
+
+std::string wideToUtf8Path(const std::wstring& wide) {
+    if (wide.empty()) {
+        return {};
+    }
+    const int req = ::WideCharToMultiByte(
+        CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+    if (req <= 0) {
+        return {};
+    }
+    std::string out(static_cast<std::size_t>(req), '\0');
+    ::WideCharToMultiByte(
+        CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), out.data(), req, nullptr, nullptr);
+    return out;
+}
+
+std::filesystem::path toSafeFsPath(const std::string& utf8) {
+    return std::filesystem::path(utf8ToWidePath(utf8));
+}
+#else
+std::filesystem::path toSafeFsPath(const std::string& utf8) {
+    return std::filesystem::path(utf8);
+}
+#endif
 
 template <typename T, typename = void>
 struct HasClearLuaStateNoArg : std::false_type {};
@@ -70,11 +132,32 @@ struct HasGetFrameSize : std::false_type {};
 template <typename T>
 struct HasGetFrameSize<T, std::void_t<decltype(std::declval<T*>()->getFrameSize())>> : std::true_type {};
 
+template <typename T, typename = void>
+struct HasGetHWnd : std::false_type {};
+template <typename T>
+struct HasGetHWnd<T, std::void_t<decltype(std::declval<T*>()->getHWnd())>> : std::true_type {};
+
 template <typename T>
 bool isEglViewZeroOrMinimized(T* eglView) {
     if (!eglView) {
         return true;
     }
+#ifdef _WIN32
+    if constexpr (HasGetHWnd<T>::value) {
+        HWND hwnd = eglView->getHWnd();
+        if (hwnd != nullptr) {
+            if (!::IsWindow(hwnd) || ::IsIconic(hwnd)) {
+                return true;
+            }
+            RECT rc{};
+            if (::GetClientRect(hwnd, &rc)) {
+                if ((rc.right - rc.left) < 1 || (rc.bottom - rc.top) < 1) {
+                    return true;
+                }
+            }
+        }
+    }
+#endif
     if constexpr (HasGetFrameSize<T>::value) {
         const cocos2d::CCSize frameSz = eglView->getFrameSize();
         if (frameSz.width < 1.0f || frameSz.height < 1.0f ||
@@ -96,7 +179,13 @@ void ensureNonZeroEglFrameSize(T* eglView, int fallbackW, int fallbackH) {
             !std::isfinite(frameSz.width) || !std::isfinite(frameSz.height)) {
             const float safeW = static_cast<float>(fallbackW > 0 ? fallbackW : 1136);
             const float safeH = static_cast<float>(fallbackH > 0 ? fallbackH : 640);
-            eglView->setFrameSize(safeW, safeH);
+            // Qualify CCEGLViewProtocol::setFrameSize so we never invoke Win32 MoveWindow
+            // on an iconic window or trigger recursive synchronous WM_SIZE messages!
+            if constexpr (std::is_base_of_v<cocos2d::CCEGLViewProtocol, T>) {
+                eglView->cocos2d::CCEGLViewProtocol::setFrameSize(safeW, safeH);
+            } else {
+                eglView->setFrameSize(safeW, safeH);
+            }
         }
     }
 }
@@ -151,32 +240,18 @@ private:
 };
 
 AlertDialogGate& sharedAlertDialogGate() {
-    static AlertDialogGate s_gate;
-    return s_gate;
+    static AlertDialogGate* s_gate = new AlertDialogGate();
+    return *s_gate;
 }
 
 #ifdef _WIN32
-std::wstring utf8ToWideAlert(const std::string& utf8) {
-    if (utf8.empty()) {
-        return {};
-    }
-    const int req = ::MultiByteToWideChar(
-        CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
-    if (req <= 0) {
-        return {};
-    }
-    std::wstring wide(static_cast<std::size_t>(req), L'\0');
-    ::MultiByteToWideChar(
-        CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), req);
-    return wide;
-}
-
 void showAsyncWin32Alert(std::string title, std::string message) {
     std::thread([t = std::move(title), m = std::move(message)]() {
-        static std::mutex s_dialogMutex;
-        std::lock_guard<std::mutex> lock(s_dialogMutex);
-        const std::wstring wideTitle = utf8ToWideAlert(t.empty() ? "Game Client" : t);
-        const std::wstring wideMsg = utf8ToWideAlert(m);
+        // Immortal heap mutex avoids static-destruction-order UB if process exits while popup is open.
+        static std::mutex* s_dialogMutex = new std::mutex();
+        std::lock_guard<std::mutex> lock(*s_dialogMutex);
+        const std::wstring wideTitle = utf8ToWidePath(t.empty() ? "Game Client" : t);
+        const std::wstring wideMsg = utf8ToWidePath(m);
         ::MessageBoxW(
             nullptr,
             wideMsg.c_str(),
@@ -236,6 +311,9 @@ void maybeShowWin32AlertPopup(const std::string& titleStr, const std::string& ms
 class AppDelegate::FrameTicker final : public cocos2d::CCObject {
 public:
     void onTick(float dt) {
+        if (!AppDelegate::isLifecycleReady()) {
+            return;
+        }
         if (bt::Platform* platform = bt::Platform::getInstance()) {
             platform->tickLoop();
         }
@@ -287,7 +365,7 @@ static int gclientLuaLoader(lua_State* L) {
     const std::string relFile = modName + ".lua";
 
     unsigned long sz = 0;
-    unsigned char* buf = cocos2d::CCFileUtils::sharedFileUtils()->getFileData(relFile.c_str(), "rb", &sz);
+    unsigned char* buf = gclient::assets::LoadAndDecryptFileData(relFile, &sz);
     if (!buf || sz == 0) {
         delete[] buf;
         lua_pushfstring(L, "\n\t[gclientLuaLoader] cannot find '%s'", relFile.c_str());
@@ -316,19 +394,65 @@ static int gclientLuaLoader(lua_State* L) {
 // ----------------------------------------------------------------------------
 // AppDelegate lifecycle
 // ----------------------------------------------------------------------------
+bool AppDelegate::isLifecycleReady() noexcept {
+    AppDelegate* inst = g_activeAppInstance.load(std::memory_order_acquire);
+    return inst != nullptr && inst->isReady();
+}
+
 AppDelegate::AppDelegate(const AppConfig& config)
     : m_config(config)
 {
-    g_validateAssetsOnly = m_config.validateAssetsOnly;
+    g_validateAssetsOnly.store(m_config.validateAssetsOnly, std::memory_order_release);
+    g_activeAppInstance.store(this, std::memory_order_release);
 }
 
 AppDelegate::~AppDelegate() {
+    shutdown();
+    AppDelegate* expected = this;
+    g_activeAppInstance.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+}
+
+void AppDelegate::shutdown() {
+    teardownSubsystems(LifecycleState::Terminated);
+}
+
+void AppDelegate::teardownSubsystems(LifecycleState terminalState) {
+    LifecycleState cur = m_lifecycleState.load(std::memory_order_acquire);
+    if (cur == LifecycleState::Terminated || cur == LifecycleState::ShuttingDown) {
+        if (terminalState == LifecycleState::Terminated) {
+            m_lifecycleState.store(LifecycleState::Terminated, std::memory_order_release);
+        }
+        return;
+    }
+    m_lifecycleState.store(LifecycleState::ShuttingDown, std::memory_order_release);
+
+#ifdef _WIN32
+    gclient::ui::Win32DesktopBridge::instance().detach();
+#endif
+    if (auto* webView = gclient::ui::ZYWebViewWin32::getInstance()) {
+        webView->shutdown();
+    }
+
     unscheduleNativeLoops();
+
+    if (bt::Platform* platform = bt::Platform::getInstance()) {
+        platform->setWebViewBridgeHandler(nullptr);
+        platform->setLogHandler(nullptr);
+    }
+
+    gclient::bindings::shutdownLuaHttpClient();
+    gclient::net::CNetwork::destroySharedNetwork();
+    if (auto* cfgMgr = CConfigurationManager::sharedConfigurationManager(false)) {
+        cfgMgr->closeAllDbs();
+    }
+
     // Clear CrashAndTelemetry's cached lua_State* BEFORE Lua engine teardown so
     // background/telemetry collectors never touch a closed lua_State*!
     clearTelemetryLuaStateBeforeTeardown();
     cocos2d::CCScriptEngineManager::purgeSharedManager();
     CocosDenshion::SimpleAudioEngine::end();
+
+    m_lifecycleState.store(terminalState, std::memory_order_release);
 }
 
 void AppDelegate::configureFileUtils() {
@@ -336,11 +460,7 @@ void AppDelegate::configureFileUtils() {
 
     if (!m_config.writableDir.empty()) {
         std::error_code ec;
-#ifdef _WIN32
-        std::filesystem::create_directories(utf8ToWideAlert(m_config.writableDir), ec);
-#else
-        std::filesystem::create_directories(m_config.writableDir, ec);
-#endif
+        std::filesystem::create_directories(toSafeFsPath(m_config.writableDir), ec);
     }
 
     auto normPath = [](std::string p) {
@@ -354,26 +474,45 @@ void AppDelegate::configureFileUtils() {
     if (!m_config.writableDir.empty()) {
         std::string w = normPath(m_config.writableDir);
         if (!w.empty() && w.back() != '/') w.push_back('/');
-        g_configuredWritableDir = w;
+        setConfiguredWritableDirSnapshot(w);
 #ifdef _WIN32
-        ::SetEnvironmentVariableW(L"GCLIENT_WRITABLE_DIR", utf8ToWideAlert(w).c_str());
+        ::SetEnvironmentVariableW(L"GCLIENT_WRITABLE_DIR", utf8ToWidePath(w).c_str());
 #endif
         appendSearchLayer(searchPaths, seenPaths, w + "Resources");
     }
+
+    // Check AtomicHotUpdater active overlay health before wiring hotfix search paths.
     if (!m_config.hotfixDir.empty()) {
+        update::HotUpdaterConfig hotCfg;
+        hotCfg.patchRootDir = toSafeFsPath(m_config.hotfixDir);
+        if (!m_config.baseAssetsDir.empty()) {
+            hotCfg.baseResourcesDir = toSafeFsPath(m_config.baseAssetsDir);
+        } else if (!m_config.resourcesDir.empty()) {
+            hotCfg.baseResourcesDir = toSafeFsPath(m_config.resourcesDir);
+        }
+        update::AtomicHotUpdater updater(hotCfg);
+        const auto health = updater.initializeAndCheckStartupHealth();
+        if (health.hasActiveOverlay && !health.activeOverlayPath.empty()) {
+#ifdef _WIN32
+            appendSearchLayer(searchPaths, seenPaths, wideToUtf8Path(health.activeOverlayPath.wstring()));
+#else
+            appendSearchLayer(searchPaths, seenPaths, health.activeOverlayPath.string());
+#endif
+        }
         appendSearchLayer(searchPaths, seenPaths, m_config.hotfixDir);
     }
+
     if (!m_config.resourcesDir.empty()) {
         const std::string normRes = normPath(m_config.resourcesDir);
 #ifdef _WIN32
-        ::SetEnvironmentVariableW(L"GCLIENT_RESOURCES_DIR", utf8ToWideAlert(normRes).c_str());
+        ::SetEnvironmentVariableW(L"GCLIENT_RESOURCES_DIR", utf8ToWidePath(normRes).c_str());
 #endif
         appendSearchLayer(searchPaths, seenPaths, normRes);
     }
     if (!m_config.baseAssetsDir.empty()) {
         const std::string normBase = normPath(m_config.baseAssetsDir);
 #ifdef _WIN32
-        ::SetEnvironmentVariableW(L"GCLIENT_BASE_ASSETS_DIR", utf8ToWideAlert(normBase).c_str());
+        ::SetEnvironmentVariableW(L"GCLIENT_BASE_ASSETS_DIR", utf8ToWidePath(normBase).c_str());
 #endif
         appendSearchLayer(searchPaths, seenPaths, normBase);
     }
@@ -392,6 +531,9 @@ void AppDelegate::configureFileUtils() {
         });
         platform->setWebViewBridgeHandler(
             [](const std::string& action, int x, int y, int width, int height, const std::string& url) {
+                if (!AppDelegate::isLifecycleReady()) {
+                    return;
+                }
                 auto* webView = gclient::ui::ZYWebViewWin32::getInstance();
                 if (!webView) return;
                 if (action == "displayWebView") {
@@ -472,10 +614,6 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
     lua_pushcfunction(L, logInfoFn);
     lua_setglobal(L, "__GCLIENT_LOG_INFO__");
 
-    // Avoid duplicate print/release_print/CCLuaLog mirroring when CrashAndTelemetry::installLuaHooks
-    // already installed __GCLIENT_NATIVE_PRINT__ mirrors: preserve initial CrashAndTelemetry-mirrored
-    // closures without double-wrapping, and guard reassigned print handlers with `_in_print` so
-    // nested calls (`CCLuaLog(...) -> print(...)`) log at most once per call!
     static constexpr const char* kLuaBootstrapShim =
         "do "
         "local _gmt = getmetatable(_G) or {} "
@@ -634,7 +772,7 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
         lua_pop(L, 1);
     }
 
-    g_validateAssetsOnly = m_config.validateAssetsOnly;
+    g_validateAssetsOnly.store(m_config.validateAssetsOnly, std::memory_order_release);
     const lua_CFunction ccMessageBoxFn = [](lua_State* L) -> int {
         const char* msg = lua_tostring(L, 1);
         const char* title = lua_tostring(L, 2);
@@ -652,7 +790,7 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
         const std::string dedupKey = titleStr + "\n" + msgStr;
         const bool showAlert = sharedAlertDialogGate().shouldDisplayPopup(
             dedupKey,
-            g_validateAssetsOnly,
+            g_validateAssetsOnly.load(std::memory_order_acquire),
             isEnvFlagEnabled("GCLIENT_SUPPRESS_MESSAGEBOX"),
             isEnvFlagEnabled("GCLIENT_HEADLESS"));
         maybeShowWin32AlertPopup(titleStr, msgStr, showAlert);
@@ -672,9 +810,11 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
             const char* target = lua_tostring(L, 2);
             if (self && target) {
                 std::string targetStr(target);
+                std::replace(targetStr.begin(), targetStr.end(), '\\', '/');
                 auto paths = self->getSearchPaths();
                 paths.erase(
-                    std::remove_if(paths.begin(), paths.end(), [&](const std::string& p) {
+                    std::remove_if(paths.begin(), paths.end(), [&](std::string p) {
+                        std::replace(p.begin(), p.end(), '\\', '/');
                         return p == targetStr || (!targetStr.empty() && p == targetStr + "/");
                     }),
                     paths.end());
@@ -688,8 +828,9 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
         lua_getfield(L, -1, "getWritablePath");
         if (lua_isfunction(L, -1)) {
             const lua_CFunction getWritablePathClosure = [](lua_State* L) -> int {
-                if (!g_configuredWritableDir.empty()) {
-                    lua_pushlstring(L, g_configuredWritableDir.data(), g_configuredWritableDir.size());
+                const std::string configuredWritable = getConfiguredWritableDirSnapshot();
+                if (!configuredWritable.empty()) {
+                    lua_pushlstring(L, configuredWritable.data(), configuredWritable.size());
                     return 1;
                 }
                 lua_pushvalue(L, lua_upvalueindex(1));
@@ -763,7 +904,7 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
                         if (cand.back() != '/' && cand.back() != '\\') cand.push_back('/');
                         cand += rel;
                         std::error_code ec;
-                        if (std::filesystem::is_directory(cand, ec)) {
+                        if (std::filesystem::is_directory(toSafeFsPath(cand), ec)) {
                             std::replace(cand.begin(), cand.end(), '\\', '/');
                             lua_pushlstring(L, cand.data(), cand.size());
                             return 1;
@@ -860,7 +1001,8 @@ bool AppDelegate::runAssetValidation() {
     cocos2d::CCFileUtils* fileUtils = cocos2d::CCFileUtils::sharedFileUtils();
     const std::string mainScriptPath = fileUtils->fullPathForFilename("scripts/main.lua");
 
-    if (mainScriptPath.empty() || !fs::exists(mainScriptPath)) {
+    std::error_code ec;
+    if (mainScriptPath.empty() || !fs::exists(toSafeFsPath(mainScriptPath), ec)) {
         diagnostics::CrashAndTelemetry::log(
             diagnostics::LogLevel::Error,
             "AssetValidation",
@@ -870,7 +1012,7 @@ bool AppDelegate::runAssetValidation() {
     }
 
     unsigned long dataSize = 0;
-    unsigned char* data = fileUtils->getFileData(mainScriptPath.c_str(), "rb", &dataSize);
+    unsigned char* data = gclient::assets::LoadAndDecryptFileData(mainScriptPath, &dataSize);
     if (data == nullptr || dataSize == 0) {
         diagnostics::CrashAndTelemetry::log(
             diagnostics::LogLevel::Error,
@@ -891,39 +1033,92 @@ bool AppDelegate::runAssetValidation() {
     return true;
 }
 
+void AppDelegate::reconcileInitialWindowLifecycleState(cocos2d::CCDirector* director,
+                                                       cocos2d::CCEGLView* eglView) {
+    const bool earlyBg = m_pendingBackground.exchange(false, std::memory_order_acq_rel);
+    (void)m_pendingForeground.exchange(false, std::memory_order_acq_rel);
+
+    if (earlyBg || isEglViewZeroOrMinimized(eglView)) {
+        m_isInBackground.store(true, std::memory_order_release);
+        if (director) {
+            director->stopAnimation();
+        }
+        if (auto* audio = CocosDenshion::SimpleAudioEngine::sharedEngine()) {
+            audio->pauseBackgroundMusic();
+            audio->pauseAllEffects();
+        }
+        diagnostics::CrashAndTelemetry::flushLogs();
+    } else {
+        m_isInBackground.store(false, std::memory_order_release);
+        if (director && eglView) {
+            const cocos2d::CCSize winSz = director->getWinSize();
+            if (!std::isfinite(winSz.width) || !std::isfinite(winSz.height) ||
+                winSz.width < 1.0f || winSz.height < 1.0f) {
+                eglView->setDesignResolutionSize(kDesignWidth, kDesignHeight, kResolutionFixedWidth);
+            }
+        }
+    }
+}
+
 bool AppDelegate::applicationDidFinishLaunching() {
-    // 1. Initialize CCDirector & CCEGLView with 1136x640 design resolution and 30 FPS cap.
+    LifecycleState expectedState = LifecycleState::Uninitialized;
+    if (!m_lifecycleState.compare_exchange_strong(
+            expectedState, LifecycleState::Initializing, std::memory_order_acq_rel)) {
+        return expectedState == LifecycleState::Ready;
+    }
+
     cocos2d::CCDirector* pDirector = cocos2d::CCDirector::sharedDirector();
     cocos2d::CCEGLView* pEGLView = cocos2d::CCEGLView::sharedOpenGLView();
+    if (!pDirector || !pEGLView) {
+        diagnostics::CrashAndTelemetry::log(
+            diagnostics::LogLevel::Fatal,
+            "AppDelegate",
+            "CCDirector or CCEGLView is null during applicationDidFinishLaunching()");
+        diagnostics::CrashAndTelemetry::flushLogs();
+        teardownSubsystems(LifecycleState::Failed);
+        return false;
+    }
+
+    // 1. Configure CCFileUtils search paths, hotfix overlay, writable path isolation, and bt_decrypt hook
+    //    FIRST before any texture, font, or stats label can be loaded by CCDirector!
+    configureFileUtils();
+
+    // 2. Bind OpenGL view to CCDirector and configure 1136x640 design resolution and 30 FPS cap.
     pDirector->setOpenGLView(pEGLView);
-
-    // Guard against 0x0 frame size (e.g., launched minimized) BEFORE kResolutionFixedWidth
-    // computes designHeight = frameHeight / (frameWidth / 1136), which otherwise yields NaN!
     ensureNonZeroEglFrameSize(pEGLView, m_config.windowWidth, m_config.windowHeight);
-
-    // ResolutionPolicy(4) in Cocos2d-x 2.2.6 == kResolutionFixedWidth.
     pEGLView->setDesignResolutionSize(kDesignWidth, kDesignHeight, kResolutionFixedWidth);
     pDirector->setAnimationInterval(kTargetAnimationInterval);
-
-    // 2. Configure CCFileUtils search paths, writable path isolation, and bt_decrypt hook.
-    configureFileUtils();
+    pDirector->setDisplayStats(true);
 
     // 3. Handle headless --validate-assets mode if requested on CLI.
     if (m_config.validateAssetsOnly) {
         m_assetValidationOk = runAssetValidation();
         pDirector->end();
+        teardownSubsystems(m_assetValidationOk ? LifecycleState::Terminated : LifecycleState::Failed);
         return false;
     }
 
-    // 4. Honor --mute CLI flag before Lua scripts initialize audio.
+    // 4. Honor --mute CLI flag and sync Win32DesktopBridge before Lua scripts initialize audio.
+    gclient::ui::Win32DesktopBridge::instance().setInitialMuted(m_config.muteAudio);
     if (m_config.muteAudio) {
-        auto* audio = CocosDenshion::SimpleAudioEngine::sharedEngine();
-        audio->setBackgroundMusicVolume(0.0f);
-        audio->setEffectsVolume(0.0f);
+        if (auto* audio = CocosDenshion::SimpleAudioEngine::sharedEngine()) {
+            audio->setBackgroundMusicVolume(0.0f);
+            audio->setEffectsVolume(0.0f);
+        }
     }
 
     // 5. Initialize Lua engine and attach global debug.traceback() error hook.
     cocos2d::CCLuaEngine* pEngine = cocos2d::CCLuaEngine::defaultEngine();
+    if (!pEngine || !pEngine->getLuaStack() || !pEngine->getLuaStack()->getLuaState()) {
+        diagnostics::CrashAndTelemetry::log(
+            diagnostics::LogLevel::Fatal,
+            "AppDelegate",
+            "Failed to initialize CCLuaEngine / lua_State");
+        diagnostics::CrashAndTelemetry::flushLogs();
+        pDirector->end();
+        teardownSubsystems(LifecycleState::Failed);
+        return false;
+    }
     cocos2d::CCScriptEngineManager::sharedManager()->setScriptEngine(pEngine);
 
     lua_State* L = pEngine->getLuaStack()->getLuaState();
@@ -944,17 +1139,29 @@ bool AppDelegate::applicationDidFinishLaunching() {
     const int status = pEngine->executeString("require \"scripts/main\"");
 #ifdef _WIN32
     if (status == 0) {
-        char autoScript[4096] = {};
-        const DWORD len = ::GetEnvironmentVariableA("GCLIENT_AUTOTEST_SCRIPT", autoScript, sizeof(autoScript));
-        if (len > 0 && len < sizeof(autoScript)) {
+        wchar_t wideAutoScript[4096] = {};
+        const DWORD len = ::GetEnvironmentVariableW(
+            L"GCLIENT_AUTOTEST_SCRIPT", wideAutoScript, static_cast<DWORD>(_countof(wideAutoScript)));
+        if (len > 0 && len < _countof(wideAutoScript)) {
+            const std::string autoScriptUtf8 = wideToUtf8Path(std::wstring(wideAutoScript, len));
             diagnostics::CrashAndTelemetry::log(
-                diagnostics::LogLevel::Info, "AutoTest", "Loading autotest script: %s", autoScript);
-            if (luaL_dofile(L, autoScript) != 0) {
-                const char* err = lua_tostring(L, -1);
+                diagnostics::LogLevel::Info, "AutoTest", "Loading autotest script: %s", autoScriptUtf8.c_str());
+            unsigned long scriptBytes = 0;
+            unsigned char* scriptBuf = gclient::assets::LoadAndDecryptFileData(autoScriptUtf8, &scriptBytes);
+            if (scriptBuf && scriptBytes > 0) {
+                const std::string chunkName = "@" + autoScriptUtf8;
+                if (luaL_loadbuffer(L, reinterpret_cast<const char*>(scriptBuf), scriptBytes, chunkName.c_str()) != 0 ||
+                    lua_pcall(L, 0, 0, 0) != 0) {
+                    const char* err = lua_tostring(L, -1);
+                    diagnostics::CrashAndTelemetry::log(
+                        diagnostics::LogLevel::Error, "AutoTest", "Script error: %s", err ? err : "(null)");
+                    lua_pop(L, 1);
+                }
+            } else {
                 diagnostics::CrashAndTelemetry::log(
-                    diagnostics::LogLevel::Error, "AutoTest", "Script error: %s", err ? err : "(null)");
-                lua_pop(L, 1);
+                    diagnostics::LogLevel::Error, "AutoTest", "Cannot read autotest script: %s", autoScriptUtf8.c_str());
             }
+            delete[] scriptBuf;
         }
     }
 #endif
@@ -999,36 +1206,95 @@ bool AppDelegate::applicationDidFinishLaunching() {
             "Lua bootstrap failed (status=%d) while executing require \"scripts/main\"",
             status);
         diagnostics::CrashAndTelemetry::flushLogs();
+        pDirector->end();
+        teardownSubsystems(LifecycleState::Failed);
         return false;
     }
 
+    // 9. Mark application Ready ONLY after all initialization succeeded, then reconcile any
+    //    foreground/background transitions captured during native window creation or boot.
+    m_lifecycleState.store(LifecycleState::Ready, std::memory_order_release);
+    if (!m_config.hotfixDir.empty()) {
+        update::HotUpdaterConfig hotCfg;
+        hotCfg.patchRootDir = toSafeFsPath(m_config.hotfixDir);
+        if (!m_config.baseAssetsDir.empty()) {
+            hotCfg.baseResourcesDir = toSafeFsPath(m_config.baseAssetsDir);
+        } else if (!m_config.resourcesDir.empty()) {
+            hotCfg.baseResourcesDir = toSafeFsPath(m_config.resourcesDir);
+        }
+        update::AtomicHotUpdater updater(hotCfg);
+        const auto confirmRes = updater.confirmStartupSuccess();
+        if (!confirmRes.ok()) {
+            diagnostics::CrashAndTelemetry::log(
+                diagnostics::LogLevel::Warn,
+                "AppDelegate",
+                "Hotfix startup confirmation warning: %s",
+                confirmRes.message.c_str());
+        }
+    }
+    reconcileInitialWindowLifecycleState(pDirector, pEGLView);
     return true;
 }
 
 void AppDelegate::applicationDidEnterBackground() {
-    cocos2d::CCDirector::sharedDirector()->stopAnimation();
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->pauseBackgroundMusic();
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->pauseAllEffects();
+    if (m_lifecycleState.load(std::memory_order_acquire) != LifecycleState::Ready) {
+        // Defer background state until applicationDidFinishLaunching() completes.
+        m_pendingBackground.store(true, std::memory_order_release);
+        m_pendingForeground.store(false, std::memory_order_release);
+        return;
+    }
+
+    if (m_isInBackground.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    if (auto* director = cocos2d::CCDirector::sharedDirector()) {
+        director->stopAnimation();
+    }
+    if (auto* audio = CocosDenshion::SimpleAudioEngine::sharedEngine()) {
+        audio->pauseBackgroundMusic();
+        audio->pauseAllEffects();
+    }
     diagnostics::CrashAndTelemetry::flushLogs();
 }
 
 void AppDelegate::applicationWillEnterForeground() {
-    cocos2d::CCDirector* director = cocos2d::CCDirector::sharedDirector();
-    cocos2d::CCEGLView* eglView = cocos2d::CCEGLView::sharedOpenGLView();
-    if (isEglViewZeroOrMinimized(eglView)) {
-        // Window is still minimized (0x0 client surface); defer GL animation resume
-        // until restored to a valid non-zero client size.
+    // Guard against synchronous Win32 WM_SIZE(SIZE_RESTORED) fired inside CCEGLView::setFrameSize
+    // BEFORE applicationDidFinishLaunching() has bound the GL context, stats texture, or Lua VM
+    // (root cause of 0xC0000094 EXCEPTION_INT_DIVIDE_BY_ZERO in CCLabelAtlas::updateAtlasValues).
+    if (m_lifecycleState.load(std::memory_order_acquire) != LifecycleState::Ready) {
+        m_pendingForeground.store(true, std::memory_order_release);
+        m_pendingBackground.store(false, std::memory_order_release);
         return;
     }
+
+    cocos2d::CCDirector* director = cocos2d::CCDirector::sharedDirector();
+    cocos2d::CCEGLView* eglView = cocos2d::CCEGLView::sharedOpenGLView();
+    if (!director || isEglViewZeroOrMinimized(eglView)) {
+        // Window is still minimized/iconic (0x0 client surface); keep m_isInBackground latched
+        // until a non-zero restore/maximize arrives.
+        m_pendingForeground.store(true, std::memory_order_release);
+        return;
+    }
+
+    m_pendingForeground.store(false, std::memory_order_release);
     const cocos2d::CCSize winSz = director->getWinSize();
     if (!std::isfinite(winSz.width) || !std::isfinite(winSz.height) ||
         winSz.width < 1.0f || winSz.height < 1.0f) {
         eglView->setDesignResolutionSize(kDesignWidth, kDesignHeight, kResolutionFixedWidth);
     }
+
+    const bool wasInBackground = m_isInBackground.exchange(false, std::memory_order_acq_rel);
+    if (!wasInBackground) {
+        return;
+    }
+
     director->startAnimation();
-    if (!m_config.muteAudio) {
-        CocosDenshion::SimpleAudioEngine::sharedEngine()->resumeBackgroundMusic();
-        CocosDenshion::SimpleAudioEngine::sharedEngine()->resumeAllEffects();
+    if (!m_config.muteAudio && !gclient::ui::Win32DesktopBridge::instance().isMuted()) {
+        if (auto* audio = CocosDenshion::SimpleAudioEngine::sharedEngine()) {
+            audio->resumeBackgroundMusic();
+            audio->resumeAllEffects();
+        }
     }
 }
 

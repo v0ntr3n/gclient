@@ -35,9 +35,9 @@
 extern "C" {
 #include "lua.h"
 #include "lauxlib.h"
-#include "tolua++.h"
-#include "tolua_fix.h"
 }
+#include "tolua++.h"
+#include "tolua_fix.h" 
 
 USING_NS_CC;
 
@@ -584,8 +584,16 @@ public:
         cookieFile_ = cookieFile ? cookieFile : "";
     }
 
+    static void ensureCurlProcessInit() {
+        static std::once_flag s_curlInitOnce;
+        std::call_once(s_curlInitOnce, []() {
+            curl_global_init(CURL_GLOBAL_DEFAULT);
+        });
+    }
+
     void send(WinHttpRequest* req) {
         if (!req) return;
+        ensureCurlProcessInit();
         // Single main-thread retain keeps `req` alive through all queued HeaderChunk,
         // BodyChunk, and ResponseDone events without any off-thread CCObject refcount races!
         req->retain();
@@ -1291,6 +1299,10 @@ void registerLuaHttpAndCrypto(lua_State* tolua_S) {
     tolua_function(tolua_S, "getDigest", lua_CCCrypto_getDigest);
     tolua_function(tolua_S, "hex2bin", lua_CCCrypto_hex2bin);
     tolua_endmodule(tolua_S);
+}
+
+void shutdownLuaHttpClient() {
+    WinHttpClient::destroyInstance();
 }
 
 } // namespace bindings

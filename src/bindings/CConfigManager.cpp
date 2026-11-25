@@ -306,10 +306,17 @@ bool CTable::rebind(sqlite3* db, const std::string& dbPath) {
 std::string CTable::buildReadOnlyUri(const std::string& path) {
     std::string uri = "file:";
     uri.reserve(path.size() + 32);
-    if (path.size() >= 2 && path[1] == ':') {
+    size_t startIdx = 0;
+    if (path.size() >= 2 &&
+        ((path[0] == '\\' && path[1] == '\\') || (path[0] == '/' && path[1] == '/'))) {
+        // Windows UNC path \\server\share\... -> file://server/share/...
+        uri += "//";
+        startIdx = 2;
+    } else if (path.size() >= 2 && path[1] == ':') {
         uri += "///";
     }
-    for (char c : path) {
+    for (size_t i = startIdx; i < path.size(); ++i) {
+        const char c = path[i];
         if (c == '\\') {
             uri.push_back('/');
         } else if (c == '%') {
@@ -565,12 +572,22 @@ bool CConfigurationManager::init() {
 
 void CConfigurationManager::closeAllDbs() {
     std::lock_guard<std::recursive_mutex> lock(g_configSqliteMutex);
+    for (CTable* tbl : m_ownedTables) {
+        if (tbl) {
+            tbl->finalizeStatements();
+        }
+    }
     for (auto& kv : m_dbs) {
         if (kv.second) {
+            while (sqlite3_stmt* leftover = sqlite3_next_stmt(kv.second, nullptr)) {
+                g_busyStatements.erase(leftover);
+                sqlite3_finalize(leftover);
+            }
             const int rc = sqlite3_close(kv.second);
             if (rc != SQLITE_OK) {
-                logConfigSqliteError("sqlite3_close failed for '%s' (rc=%d): %s",
-                                     kv.first.c_str(), rc, sqlite3_errmsg(kv.second));
+                logConfigSqliteError("sqlite3_close busy for '%s' (rc=%d), falling back to sqlite3_close_v2",
+                                     kv.first.c_str(), rc);
+                sqlite3_close_v2(kv.second);
             }
         }
     }

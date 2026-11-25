@@ -19,6 +19,7 @@
 #include <stdlib.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -68,9 +69,14 @@ std::wstring utf8ToWide(const std::string& utf8) {
     if (utf8.empty()) {
         return {};
     }
-    const int required = ::MultiByteToWideChar(
-        CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()),
+    int required = ::MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), static_cast<int>(utf8.size()),
         nullptr, 0);
+    if (required <= 0) {
+        required = ::MultiByteToWideChar(
+            CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()),
+            nullptr, 0);
+    }
     if (required <= 0) {
         return {};
     }
@@ -81,8 +87,39 @@ std::wstring utf8ToWide(const std::string& utf8) {
     return wide;
 }
 
+bool isHeadlessOrNonInteractive(const gclient::AppConfig& cfg) {
+    if (cfg.validateAssetsOnly) {
+        return true;
+    }
+    const wchar_t* flags[] = {
+        L"GCLIENT_HEADLESS",
+        L"GCLIENT_SUPPRESS_MESSAGEBOX",
+        L"CI",
+        L"GITHUB_ACTIONS"
+    };
+    for (const wchar_t* name : flags) {
+        wchar_t buf[16] = {};
+        const DWORD len = ::GetEnvironmentVariableW(name, buf, _countof(buf));
+        if (len > 0 && len < _countof(buf)) {
+            if (_wcsicmp(buf, L"1") == 0 || _wcsicmp(buf, L"true") == 0 || _wcsicmp(buf, L"yes") == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void reportFatalStartupMessage(const gclient::AppConfig& cfg, const wchar_t* message) {
+    ::OutputDebugStringW(message);
+    ::OutputDebugStringW(L"\n");
+    if (!isHeadlessOrNonInteractive(cfg)) {
+        ::MessageBoxW(nullptr, message, L"Game Client Startup Error", MB_OK | MB_ICONERROR);
+    } else {
+        std::fwprintf(stderr, L"[GCLIENT][FATAL] %ls\n", message);
+    }
+}
+
 void enableDpiAwareness() {
-    // Prefer Per-Monitor V2 on Windows 10 1703+; fall back to SetProcessDPIAware.
     HMODULE user32 = ::GetModuleHandleW(L"user32.dll");
     if (user32 != nullptr) {
         using SetDpiCtxFn = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
@@ -220,7 +257,6 @@ std::vector<fs::path> collectSearchRoots(const fs::path& exeDir) {
 }
 
 std::string autoDiscoverBaseAssetsDir(const fs::path& exeDir) {
-    // 1. Honor explicit environment variables: GCLIENT_BASE_ASSETS_DIR first, then GCLIENT_ASSETS_DIR.
     const std::pair<const wchar_t*, const char*> envVars[] = {
         { L"GCLIENT_BASE_ASSETS_DIR", "GCLIENT_BASE_ASSETS_DIR" },
         { L"GCLIENT_ASSETS_DIR",      "GCLIENT_ASSETS_DIR" },
@@ -234,9 +270,6 @@ std::string autoDiscoverBaseAssetsDir(const fs::path& exeDir) {
 
     const std::vector<fs::path> roots = collectSearchRoots(exeDir);
 
-    // 2. Pass 1: Search candidate base-asset directories across all roots and depths (0..7)
-    //    for platform/config.json or platform/game_config.json FIRST so Resources/scripts/main.lua
-    //    never shadows base_assets/.
     for (const fs::path& root : roots) {
         fs::path cur = root;
         for (int depth = 0; depth <= 7 && !cur.empty(); ++depth) {
@@ -259,7 +292,6 @@ std::string autoDiscoverBaseAssetsDir(const fs::path& exeDir) {
         }
     }
 
-    // Allow merged single-folder Resources/ layouts ONLY when Resources/ holds platform/*.json.
     for (const fs::path& root : roots) {
         fs::path cur = root;
         for (int depth = 0; depth <= 7 && !cur.empty(); ++depth) {
@@ -275,8 +307,6 @@ std::string autoDiscoverBaseAssetsDir(const fs::path& exeDir) {
         }
     }
 
-    // 3. Pass 2: Fall back to hasValidGameAssets (scripts/main.lua) on base-asset candidates ONLY
-    //    if no directory with platform/*.json exists anywhere (never matching Resources/ here).
     for (const fs::path& root : roots) {
         fs::path cur = root;
         for (int depth = 0; depth <= 7 && !cur.empty(); ++depth) {
@@ -376,13 +406,13 @@ gclient::AppConfig parseCommandLine() {
         std::string val;
 
         if (takeValue(i, arg, "--resources-dir", val)) {
-            cfg.resourcesDir = val;
+            cfg.resourcesDir = normalizeDiscoveredPath(fs::path(utf8ToWide(val)));
             explicitResourcesDir = true;
         } else if (takeValue(i, arg, "--base-assets-dir", val)) {
-            cfg.baseAssetsDir = val;
+            cfg.baseAssetsDir = normalizeDiscoveredPath(fs::path(utf8ToWide(val)));
             explicitBaseAssetsDir = true;
         } else if (takeValue(i, arg, "--profile-dir", val)) {
-            cfg.profileDir = val;
+            cfg.profileDir = normalizeDiscoveredPath(fs::path(utf8ToWide(val)));
         } else if (takeValue(i, arg, "--width", val)) {
             parsePositiveInt(val, 320, 7680, cfg.windowWidth);
         } else if (takeValue(i, arg, "--height", val)) {
@@ -491,7 +521,7 @@ bool tryLockSlotDirectory(const fs::path& slotDir, HANDLE& outLockHandle) {
     HANDLE h = ::CreateFileW(
         lockFile.c_str(),
         GENERIC_READ | GENERIC_WRITE,
-        0, // Exclusive share mode: released automatically by the OS if the process exits or crashes.
+        0,
         nullptr,
         OPEN_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
@@ -512,7 +542,6 @@ bool prepareIsolatedStorage(gclient::AppConfig& cfg) {
     fs::path uuidFile;
 
     if (!cfg.profileDir.empty()) {
-        // Explicit --profile-dir on CLI: isolate session, UUID, and writable state inside it.
         profileRoot = fs::path(utf8ToWide(cfg.profileDir));
         sessionFile = profileRoot / L"account_session.json";
         uuidFile    = profileRoot / L"device_uuid.txt";
@@ -522,14 +551,10 @@ bool prepareIsolatedStorage(gclient::AppConfig& cfg) {
         sessionFile = profileRoot / L"account_session.json";
         uuidFile    = profileRoot / L"device_uuid.txt";
     } else if (cfg.validateAssetsOnly) {
-        // Headless --validate-assets check: never block a live game window's slot lock.
         profileRoot = baseRoot / L"instances" / (L"pid_" + std::to_wstring(pid));
         sessionFile = baseRoot / L"account_session.json";
         uuidFile    = baseRoot / L"device_uuid.txt";
     } else {
-        // Acquire persistent slot 1 ("profiles/default") for normal single-window play so
-        // saved Platform tokens, last-selected server, SDK cookies, and writable caches persist
-        // across restarts; concurrent windows automatically claim "profiles/instance_2..64".
         const fs::path primarySlot = baseRoot / L"profiles" / L"default";
         if (tryLockSlotDirectory(primarySlot, g_profileLockHandle)) {
             profileRoot = primarySlot;
@@ -562,6 +587,16 @@ bool prepareIsolatedStorage(gclient::AppConfig& cfg) {
         ec.clear();
         profileRoot = fs::absolute(profileRoot, ec);
     }
+    sessionFile = fs::weakly_canonical(sessionFile, ec);
+    if (ec) {
+        ec.clear();
+        sessionFile = fs::absolute(sessionFile, ec);
+    }
+    uuidFile = fs::weakly_canonical(uuidFile, ec);
+    if (ec) {
+        ec.clear();
+        uuidFile = fs::absolute(uuidFile, ec);
+    }
 
     const fs::path writableDir = profileRoot / L"writable";
     const fs::path hotfixDir   = writableDir / L"hotfix";
@@ -583,7 +618,6 @@ bool prepareIsolatedStorage(gclient::AppConfig& cfg) {
     cfg.logsDir     = wideToUtf8(logsDir.wstring());
     cfg.dumpsDir    = wideToUtf8(dumpsDir.wstring());
 
-    // Expose resolved profile, writable, session, and device UUID paths via wide UTF-16 env vars.
     ::SetEnvironmentVariableW(L"GCLIENT_PROFILE_DIR", profileRoot.c_str());
     ::SetEnvironmentVariableW(L"GCLIENT_WRITABLE_DIR", writableDir.c_str());
     if (!sessionFile.empty() && !hasNonEmptyEnvVarW(L"GCLIENT_SESSION_FILE")) {
@@ -621,11 +655,9 @@ int WINAPI wWinMain(
     // 3. Provision lock-isolated persistent profile & writable storage directories.
     if (!prepareIsolatedStorage(config)) {
         releaseProfileSlotLock();
-        ::MessageBoxW(
-            nullptr,
-            L"Failed to create isolated profile/writable directories for Game Client.",
-            L"Game Client Startup Error",
-            MB_OK | MB_ICONERROR);
+        reportFatalStartupMessage(
+            config,
+            L"Failed to create isolated profile/writable directories for Game Client.");
         return EXIT_FAILURE;
     }
 
@@ -650,11 +682,29 @@ int WINAPI wWinMain(
         config.profileDir.c_str());
 
     // 5. Instantiate AppDelegate BEFORE CCEGLView::setFrameSize so WM_SIZE during window creation
-    // finds a valid CCApplication::sharedApplication() instance.
+    // finds a valid CCApplication::sharedApplication() instance guarded by LifecycleState::Uninitialized.
     gclient::AppDelegate app(config);
+    gclient::ui::Win32DesktopBridge::instance().setInitialMuted(config.muteAudio);
 
-    // 6. Create Cocos2d-x Win32 EGL view, attach Win32DesktopBridge, and launch AppDelegate.
+    // 6. Create Cocos2d-x Win32 EGL view, verify WGL/HWND readiness, attach Win32DesktopBridge, and run.
     cocos2d::CCEGLView* eglView = cocos2d::CCEGLView::sharedOpenGLView();
+    if (eglView == nullptr || eglView->getHWnd() == nullptr || !eglView->isOpenGLReady()) {
+        gclient::diagnostics::CrashAndTelemetry::log(
+            gclient::diagnostics::LogLevel::Fatal,
+            "Main",
+            "Failed to create Win32 OpenGL 2.0 view (eglView=%p, hwnd=%p, glReady=%d)",
+            static_cast<void*>(eglView),
+            eglView ? static_cast<void*>(eglView->getHWnd()) : nullptr,
+            (eglView && eglView->isOpenGLReady()) ? 1 : 0);
+        app.shutdown();
+        gclient::diagnostics::CrashAndTelemetry::shutdown();
+        releaseProfileSlotLock();
+        reportFatalStartupMessage(
+            config,
+            L"Failed to initialize Win32 OpenGL context. Ensure a supported display adapter/driver is active.");
+        return EXIT_FAILURE;
+    }
+
     eglView->setViewName("Game Client");
     eglView->setFrameSize(
         static_cast<float>(config.windowWidth),
@@ -665,13 +715,14 @@ int WINAPI wWinMain(
 
     int exitCode = cocos2d::CCApplication::sharedApplication()->run();
 
-#ifdef _WIN32
-    gclient::ui::Win32DesktopBridge::instance().detach();
-#endif
-
     if (config.validateAssetsOnly) {
         exitCode = app.assetValidationSucceeded() ? EXIT_SUCCESS : EXIT_FAILURE;
+    } else if (app.lifecycleState() == gclient::AppDelegate::LifecycleState::Failed) {
+        exitCode = EXIT_FAILURE;
     }
+
+    // 7. Run ordered AppDelegate subsystem teardown BEFORE shutting down telemetry or releasing slot lock!
+    app.shutdown();
 
     gclient::diagnostics::CrashAndTelemetry::log(
         gclient::diagnostics::LogLevel::Info,

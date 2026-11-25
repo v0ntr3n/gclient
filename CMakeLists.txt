@@ -1,13 +1,22 @@
 cmake_minimum_required(VERSION 3.20)
 
+if(POLICY CMP0091)
+    cmake_policy(SET CMP0091 NEW)
+endif()
+
+# Enforce consistent dynamic CRT (/MD in Release, /MDd in Debug) across all CMake targets
+# BEFORE project() creates compiler probes or subtargets.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL" CACHE STRING
+    "MSVC CRT selection (/MD for Release, /MDd for Debug)" FORCE)
+
 project(gclient-win32
-    VERSION 1.0.0
-    DESCRIPTION "Game Client Native Win32 x86 Port (Cocos2d-x 2.2.6 + Lua)"
+    VERSION 1.1.0
+    DESCRIPTION "Game Client Native Win32 x86 Port (Visual Studio 2022 v143 + Cocos2d-x 2.2.6 + LuaJIT 2.0.1)"
     LANGUAGES C CXX
 )
 
 # ==============================================================================
-# 1. Toolchain & Architecture Enforcement (MSVC Win32 x86 + /LARGEADDRESSAWARE)
+# 1. Toolchain, CRT & Architecture Enforcement (VS2022 v143 Win32 x86 + /MD)
 # ==============================================================================
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,22 +26,41 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 option(GCLIENT_ENFORCE_WIN32_X86 "Require 32-bit x86 target on MSVC" ON)
+option(GCLIENT_ENFORCE_MD_CRT "Reject static CRT triplets (-static) on Win32 DLL builds" ON)
 option(GCLIENT_ENABLE_LUAPROFILER "Register optional luaopen_luaprofiler binding" OFF)
-option(GCLIENT_BUILD_TESTS "Build unit and integration test targets" OFF)
+option(GCLIENT_BUILD_TESTS "Build unit and regression test targets (CTest)" OFF)
+option(GCLIENT_ENABLE_STATIC_ANALYSIS "Enable MSVC /analyze static analysis on first-party targets" OFF)
+option(GCLIENT_ENABLE_ASAN "Enable MSVC AddressSanitizer (/fsanitize=address) diagnostic build (NEVER ship in Release)" OFF)
+option(GCLIENT_SHIPPING_RELEASE "Enforce strict shipping Release hygiene (forbids ASan/Debug CRTs)" OFF)
+option(GCLIENT_REQUIRE_FRESH_LUAJIT "Require freshly compiled LuaJIT 2.0.1 v143 import library" OFF)
 option(GCLIENT_ASSUME_PATCHED_COCOS2DX
     "Define GCLIENT_CCFILEUTILS_HAS_SET_DECRYPT (expects tools/patch_cocos2dx.py applied)" ON)
 
 if(WIN32 AND MSVC)
     if(GCLIENT_ENFORCE_WIN32_X86 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
         message(FATAL_ERROR
-            "Game Client targets Win32 x86 (32-bit) for Cocos2d-x 2.2.6 compatibility. "
-            "Configure with '-A Win32' (or pass -DGCLIENT_ENFORCE_WIN32_X86=OFF to override)."
+            "Game Client targets Win32 x86 (32-bit) for Cocos2d-x 2.2.6 & LuaJIT 2.0.1 ABI compatibility. "
+            "Configure with '-G \"Visual Studio 17 2022\" -A Win32 -T v143'."
         )
+    endif()
+    if(MSVC_VERSION LESS 1930)
+        message(WARNING
+            "Detected MSVC_VERSION=${MSVC_VERSION} (< 1930). Visual Studio 2022 (MSVC v143, >= 1930) is the supported toolchain."
+        )
+    endif()
+    if(GCLIENT_ENFORCE_MD_CRT AND DEFINED VCPKG_TARGET_TRIPLET AND VCPKG_TARGET_TRIPLET MATCHES "-static")
+        message(FATAL_ERROR
+            "VCPKG_TARGET_TRIPLET='${VCPKG_TARGET_TRIPLET}' uses static CRT (/MT), which causes cross-DLL heap corruption "
+            "with libcocos2d.dll and lua51.dll. Use -DVCPKG_TARGET_TRIPLET=x86-windows."
+        )
+    endif()
+    if(GCLIENT_SHIPPING_RELEASE AND GCLIENT_ENABLE_ASAN)
+        message(FATAL_ERROR "GCLIENT_ENABLE_ASAN must NOT be enabled when GCLIENT_SHIPPING_RELEASE=ON.")
     endif()
 endif()
 
 # ==============================================================================
-# 2. External Cocos2d-x 2.2.6 (Patched via tools/patch_cocos2dx.py)
+# 2. External Cocos2d-x 2.2.6 & Rebuilt LuaJIT 2.0.1 (v143 /MD)
 # ==============================================================================
 if(DEFINED COCOS2DX_ROOT AND NOT DEFINED GCLIENT_COCOS2DX_ROOT)
     set(GCLIENT_COCOS2DX_ROOT "${COCOS2DX_ROOT}")
@@ -40,11 +68,31 @@ endif()
 set(GCLIENT_COCOS2DX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/cocos2d-x-2.2.6"
     CACHE PATH "Path to Cocos2d-x 2.2.6 source tree")
 
-set(GCLIENT_COCOS2DX_LIB_DIR "${GCLIENT_COCOS2DX_ROOT}/Debug.win32"
-    CACHE PATH "Path to prebuilt Cocos2d-x 2.2.6 Win32 import libraries (optional)")
+set(GCLIENT_COCOS2DX_LIB_DIR "${GCLIENT_COCOS2DX_ROOT}/Release.win32"
+    CACHE PATH "Path to compiled Cocos2d-x 2.2.6 Win32 import libraries")
+
+set(GCLIENT_LUAJIT_INCLUDE_DIR "${GCLIENT_COCOS2DX_ROOT}/scripting/lua/luajit/include"
+    CACHE PATH "Path to LuaJIT 2.0.1 C API headers")
+
+set(GCLIENT_LUAJIT_LIB_DIR "${GCLIENT_COCOS2DX_ROOT}/scripting/lua/luajit/win32"
+    CACHE PATH "Path to freshly compiled LuaJIT 2.0.1 v143 lua51.lib & lua51.dll")
 
 option(GCLIENT_COCOS2DX_BUILD_FROM_SOURCE
-    "Add Cocos2d-x 2.2.6 via add_subdirectory instead of linking prebuilt Win32 libs" OFF)
+    "Add Cocos2d-x 2.2.6 via add_subdirectory instead of linking MSBuild v143 Win32 libs" OFF)
+
+if(GCLIENT_REQUIRE_FRESH_LUAJIT AND NOT EXISTS "${GCLIENT_LUAJIT_LIB_DIR}/lua51.lib")
+    message(FATAL_ERROR
+        "GCLIENT_REQUIRE_FRESH_LUAJIT=ON, but '${GCLIENT_LUAJIT_LIB_DIR}/lua51.lib' does not exist. "
+        "Run tools/build_luajit_vs2022.ps1 first."
+    )
+endif()
+
+# Fall back to scripting/lua/lua headers ONLY if luajit/include does not exist in a partial local tree.
+if(EXISTS "${GCLIENT_LUAJIT_INCLUDE_DIR}/lua.h")
+    set(_GCLIENT_ACTIVE_LUA_INCLUDE_DIR "${GCLIENT_LUAJIT_INCLUDE_DIR}")
+else()
+    set(_GCLIENT_ACTIVE_LUA_INCLUDE_DIR "${GCLIENT_COCOS2DX_ROOT}/scripting/lua/lua")
+endif()
 
 if(NOT EXISTS "${GCLIENT_COCOS2DX_ROOT}")
     message(WARNING
@@ -62,7 +110,6 @@ elseif(EXISTS "${GCLIENT_COCOS2DX_ROOT}/cocos2dx/platform/CCFileUtils.h")
     unset(_gclient_ccfileutils_hdr)
 endif()
 
-# Overlay include directories placed BEFORE Cocos2d-x headers.
 set(GCLIENT_OVERLAY_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
@@ -80,17 +127,31 @@ set(GCLIENT_COCOS2DX_INCLUDE_DIRS
     "${GCLIENT_COCOS2DX_ROOT}/CocosDenshion/include"
     "${GCLIENT_COCOS2DX_ROOT}/extensions"
     "${GCLIENT_COCOS2DX_ROOT}/scripting/lua/cocos2dx_support"
-    "${GCLIENT_COCOS2DX_ROOT}/scripting/lua/lua"
+    "${_GCLIENT_ACTIVE_LUA_INCLUDE_DIR}"
     "${GCLIENT_COCOS2DX_ROOT}/scripting/lua/tolua"
     "${GCLIENT_COCOS2DX_ROOT}/external"
 )
 
+# ==============================================================================
+# 3. Third-Party Dependencies (vcpkg x86-windows v143 /MD)
+# ==============================================================================
+find_package(SQLite3 REQUIRED)
+find_package(Protobuf REQUIRED)
+find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
+find_package(GLEW QUIET)
+
 add_library(gclient_cocos2dx_interface INTERFACE)
 target_include_directories(gclient_cocos2dx_interface INTERFACE
     ${GCLIENT_OVERLAY_INCLUDE_DIRS}
+)
+target_include_directories(gclient_cocos2dx_interface SYSTEM INTERFACE
     ${GCLIENT_COCOS2DX_INCLUDE_DIRS}
 )
 target_compile_definitions(gclient_cocos2dx_interface INTERFACE
+    HAVE_STRUCT_TIMESPEC=1
+    _SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS=1
     $<$<BOOL:${GCLIENT_ASSUME_PATCHED_COCOS2DX}>:GCLIENT_CCFILEUTILS_HAS_SET_DECRYPT=1>
 )
 
@@ -101,32 +162,31 @@ if(GCLIENT_COCOS2DX_BUILD_FROM_SOURCE AND EXISTS "${GCLIENT_COCOS2DX_ROOT}/CMake
         CocosDenshion
         extensions
         lua
-        glew32
+        $<$<TARGET_EXISTS:GLEW::GLEW>:GLEW::GLEW>
+        $<$<NOT:$<TARGET_EXISTS:GLEW::GLEW>>:glew32>
     )
 else()
+    # Keep legacy third_party/win32/libraries OFF the linker search path whenever vcpkg GLEW::GLEW
+    # is present so VS2010/VS2012 .lib archives never shadow vcpkg v143 import libraries!
     target_link_directories(gclient_cocos2dx_interface INTERFACE
         "${GCLIENT_COCOS2DX_LIB_DIR}"
-        "${GCLIENT_COCOS2DX_ROOT}/scripting/lua/luajit/win32"
-        "${GCLIENT_COCOS2DX_ROOT}/cocos2dx/platform/third_party/win32/libraries"
+        "${GCLIENT_LUAJIT_LIB_DIR}"
     )
+    if(NOT TARGET GLEW::GLEW)
+        target_link_directories(gclient_cocos2dx_interface INTERFACE
+            "${GCLIENT_COCOS2DX_ROOT}/cocos2dx/platform/third_party/win32/libraries"
+        )
+    endif()
     target_link_libraries(gclient_cocos2dx_interface INTERFACE
         libcocos2d
         libCocosDenshion
         libExtensions
         liblua
         lua51
-        glew32
+        $<$<TARGET_EXISTS:GLEW::GLEW>:GLEW::GLEW>
+        $<$<NOT:$<TARGET_EXISTS:GLEW::GLEW>>:glew32>
     )
 endif()
-
-# ==============================================================================
-# 3. Third-Party Dependencies (vcpkg / CMake Package Registry)
-# ==============================================================================
-find_package(SQLite3 REQUIRED)
-find_package(Protobuf REQUIRED)
-find_package(CURL REQUIRED)
-find_package(OpenSSL REQUIRED)
-find_package(ZLIB REQUIRED)
 
 # Resolve protoc executable reliably across vcpkg and system installs
 if(TARGET protobuf::protoc)
@@ -174,11 +234,15 @@ foreach(proto_file IN LISTS GCLIENT_PROTO_FILES)
 endforeach()
 
 add_library(gclient_proto STATIC ${GCLIENT_PROTO_SRCS} ${GCLIENT_PROTO_HDRS})
-target_include_directories(gclient_proto PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/generated/proto")
+target_include_directories(gclient_proto SYSTEM PUBLIC "${GCLIENT_PROTO_GEN_DIR}")
 target_link_libraries(gclient_proto PUBLIC protobuf::libprotobuf)
 if(MSVC)
-    # Suppress third-party warnings inside generated protobuf code
-    target_compile_options(gclient_proto PRIVATE /W0)
+    target_compile_options(gclient_proto PRIVATE
+        /W0
+        /FS
+        /utf-8
+        $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/Zi /O2>
+    )
 endif()
 
 # ==============================================================================
@@ -191,6 +255,8 @@ target_compile_definitions(gclient_build_options INTERFACE
     _WINDOWS
     WIN32_LEAN_AND_MEAN
     _HAS_AUTO_PTR_ETC=1
+    _SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS=1
+    HAVE_STRUCT_TIMESPEC=1
     NOMINMAX
     UNICODE
     _UNICODE
@@ -207,24 +273,44 @@ if(MSVC)
     target_compile_options(gclient_build_options INTERFACE
         /W4
         /MP
+        /FS
         /utf-8
         /EHsc
         /permissive-
         /Zc:__cplusplus
-        $<$<CONFIG:Release>:/Zi /O2 /Oi /GL>
+        $<$<CONFIG:Release>:/Zi /O2 /Oi>
+        $<$<AND:$<CONFIG:Release>,$<NOT:$<BOOL:${GCLIENT_ENABLE_ASAN}>>>:/GL>
     )
-    target_link_options(gclient_build_options INTERFACE
-        /LARGEADDRESSAWARE
-        $<$<CONFIG:Release>:/DEBUG /LTCG /OPT:REF /OPT:ICF>
-    )
+    if(GCLIENT_ENABLE_STATIC_ANALYSIS)
+        target_compile_options(gclient_build_options INTERFACE
+            /analyze
+            /analyze:external-
+            /external:anglebrackets
+            /external:W0
+        )
+    endif()
+    if(GCLIENT_ENABLE_ASAN)
+        target_compile_options(gclient_build_options INTERFACE /fsanitize=address)
+        target_compile_definitions(gclient_build_options INTERFACE
+            _DISABLE_VECTOR_ANNOTATION=1
+            _DISABLE_STRING_ANNOTATION=1
+        )
+    endif()
 endif()
+
+function(gclient_apply_exe_link_options TARGET_NAME)
+    if(MSVC)
+        target_link_options(${TARGET_NAME} PRIVATE
+            /LARGEADDRESSAWARE
+            $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/DEBUG:FULL /OPT:REF /OPT:ICF /INCREMENTAL:NO>
+            $<$<AND:$<CONFIG:Release>,$<NOT:$<BOOL:${GCLIENT_ENABLE_ASAN}>>>:/LTCG>
+        )
+    endif()
+endfunction()
 
 # ==============================================================================
 # 6. Modular src/ Subsystems
-#    Modules: diagnostics, assets, net, bindings, platform, update, ui
 # ==============================================================================
-
-# --- 6a. Diagnostics Module (CrashAndTelemetry) ---
 add_library(gclient_diagnostics STATIC
     src/diagnostics/CrashAndTelemetry.h
     src/diagnostics/CrashAndTelemetry.cpp
@@ -235,11 +321,10 @@ target_link_libraries(gclient_diagnostics
         gclient_build_options
         gclient_cocos2dx_interface
     PRIVATE
-        dbghelp
-        psapi
+        $<$<PLATFORM_ID:Windows>:dbghelp>
+        $<$<PLATFORM_ID:Windows>:psapi>
 )
 
-# --- 6b. Helper for sibling overlay modules (assets, net, bindings, platform, update, ui) ---
 function(gclient_add_module MODULE_NAME SUBDIR)
     set(mod_dir "${CMAKE_CURRENT_SOURCE_DIR}/src/${SUBDIR}")
     if(EXISTS "${mod_dir}/CMakeLists.txt")
@@ -307,7 +392,7 @@ gclient_add_module(gclient_update   update)
 gclient_add_module(gclient_ui       ui)
 
 # ==============================================================================
-# 7. Main Win32 Executable Target
+# 7. Main Win32 Executable Target (GCLIENT.exe + GCLIENT.pdb)
 # ==============================================================================
 add_executable(gclient WIN32
     src/main.cpp
@@ -358,8 +443,128 @@ target_link_libraries(gclient PRIVATE
 )
 
 if(MSVC)
-    target_link_options(gclient PRIVATE
-        /SUBSYSTEM:WINDOWS
-        /LARGEADDRESSAWARE
+    target_link_options(gclient PRIVATE /SUBSYSTEM:WINDOWS)
+    gclient_apply_exe_link_options(gclient)
+endif()
+
+# Stage rebuilt LuaJIT 2.0.1 & Cocos2d-x engine DLLs/PDBs beside GCLIENT.exe after build
+if(WIN32)
+    add_custom_command(TARGET gclient POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E echo "[GCLIENT] Staging engine & LuaJIT 2.0.1 DLLs/PDBs into $<TARGET_FILE_DIR:gclient>"
+        COMMAND ${CMAKE_COMMAND}
+            "-DCOCOS_BIN_DIR=${GCLIENT_COCOS2DX_LIB_DIR}"
+            "-DLUAJIT_BIN_DIR=${GCLIENT_LUAJIT_LIB_DIR}"
+            "-DDEST_DIR=$<TARGET_FILE_DIR:gclient>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/stage_engine_runtime.cmake"
+        VERBATIM
     )
+endif()
+
+# ==============================================================================
+# 8. Automated Regression & LuaJIT ABI Test Suite (CTest)
+# ==============================================================================
+if(GCLIENT_BUILD_TESTS)
+    enable_testing()
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_win32_regression.cpp")
+        add_executable(gclient_win32_regression_tests
+            tests/test_win32_regression.cpp
+            src/assets/BtDecryptHook.cpp
+            src/net/LCPacket.cpp
+            src/net/CConnection.cpp
+            src/net/CNetwork.cpp
+            src/update/AtomicHotUpdater.cpp
+            src/diagnostics/CrashAndTelemetry.cpp
+        )
+        target_include_directories(gclient_win32_regression_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${_GCLIENT_ACTIVE_LUA_INCLUDE_DIR}"
+        )
+        target_link_directories(gclient_win32_regression_tests PRIVATE
+            "${GCLIENT_LUAJIT_LIB_DIR}"
+        )
+        target_compile_definitions(gclient_win32_regression_tests PRIVATE
+            GCLIENT_STANDALONE_BUILD=1
+            WIN32_LEAN_AND_MEAN
+            NOMINMAX
+            UNICODE
+            _UNICODE
+            _CRT_SECURE_NO_WARNINGS
+            _WINSOCK_DEPRECATED_NO_WARNINGS
+        )
+        target_link_libraries(gclient_win32_regression_tests PRIVATE
+            lua51
+            ZLIB::ZLIB
+            SQLite::SQLite3
+            $<$<PLATFORM_ID:Windows>:ws2_32>
+            $<$<PLATFORM_ID:Windows>:bcrypt>
+            $<$<PLATFORM_ID:Windows>:crypt32>
+            $<$<PLATFORM_ID:Windows>:dbghelp>
+            $<$<PLATFORM_ID:Windows>:psapi>
+            $<$<PLATFORM_ID:Windows>:user32>
+            $<$<PLATFORM_ID:Windows>:advapi32>
+            $<$<PLATFORM_ID:Windows>:shell32>
+        )
+        if(MSVC)
+            target_compile_options(gclient_win32_regression_tests PRIVATE /W4 /utf-8 /EHsc /permissive- /FS /Zi)
+            gclient_apply_exe_link_options(gclient_win32_regression_tests)
+        endif()
+        if(WIN32)
+            add_custom_command(TARGET gclient_win32_regression_tests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${GCLIENT_LUAJIT_LIB_DIR}/lua51.dll"
+                    "$<TARGET_FILE_DIR:gclient_win32_regression_tests>/lua51.dll"
+                VERBATIM
+            )
+        endif()
+        add_test(NAME gclient_win32_regression_tests COMMAND gclient_win32_regression_tests)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_luajit_abi.cpp")
+        add_executable(gclient_luajit_abi_tests
+            tests/test_luajit_abi.cpp
+            src/net/Amf3Module.cpp
+        )
+        target_include_directories(gclient_luajit_abi_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${_GCLIENT_ACTIVE_LUA_INCLUDE_DIR}"
+        )
+        target_link_directories(gclient_luajit_abi_tests PRIVATE
+            "${GCLIENT_LUAJIT_LIB_DIR}"
+        )
+        target_compile_definitions(gclient_luajit_abi_tests PRIVATE
+            WIN32_LEAN_AND_MEAN
+            NOMINMAX
+            UNICODE
+            _UNICODE
+            _CRT_SECURE_NO_WARNINGS
+        )
+        target_link_libraries(gclient_luajit_abi_tests PRIVATE
+            lua51
+            $<$<PLATFORM_ID:Windows>:psapi>
+            $<$<PLATFORM_ID:Windows>:kernel32>
+        )
+        if(MSVC)
+            target_compile_options(gclient_luajit_abi_tests PRIVATE /W4 /utf-8 /EHsc /permissive- /FS /Zi)
+            gclient_apply_exe_link_options(gclient_luajit_abi_tests)
+        endif()
+        if(WIN32)
+            add_custom_command(TARGET gclient_luajit_abi_tests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${GCLIENT_LUAJIT_LIB_DIR}/lua51.dll"
+                    "$<TARGET_FILE_DIR:gclient_luajit_abi_tests>/lua51.dll"
+                VERBATIM
+            )
+        endif()
+        add_test(NAME gclient_luajit_abi_tests COMMAND gclient_luajit_abi_tests)
+    endif()
+
+    if(Python3_Interpreter_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_patch_and_pe_validator.py")
+        add_test(
+            NAME gclient_python_patch_and_pe_tests
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_patch_and_pe_validator.py"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+    endif()
 endif()

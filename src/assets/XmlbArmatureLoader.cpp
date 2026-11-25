@@ -601,7 +601,7 @@ void ApplyProtoColor(cocos2d::extension::CCBaseData* dst, const ArmatureColor& c
 bool XmlbArmatureLoader::ValidateBitCacheBuffer(const uint8_t* bitCacheData,
                                                 size_t bitCacheSize,
                                                 const XmlbBitCacheLayout& layout) {
-    if (!bitCacheData || bitCacheSize < layout.skeletonStructSize) {
+    if (!bitCacheData || layout.skeletonStructSize < 6 || bitCacheSize < layout.skeletonStructSize) {
         return false;
     }
     if (bitCacheSize >= 4 && ReadLE32U(bitCacheData) == kBtDecryptMagic) {
@@ -1133,8 +1133,11 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
                     } else {
                         frameData->frameID = nextSequentialFrameId;
                     }
-                    nextSequentialFrameId =
-                        frameData->frameID + ((frameData->duration > 0) ? frameData->duration : 1);
+                    const int64_t nextSeq64 =
+                        static_cast<int64_t>(frameData->frameID) +
+                        static_cast<int64_t>((frameData->duration > 0) ? frameData->duration : 1);
+                    nextSequentialFrameId = static_cast<int>(
+                        nextSeq64 > 0x7FFFFFFFLL ? 0x7FFFFFFFLL : nextSeq64);
 
                     if (pbFrame.has_bd()) {
                         switch (static_cast<cocos2d::extension::CCBlendType>(pbFrame.bd())) {
@@ -1160,9 +1163,13 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
                         ApplyProtoColor(frameData, pbFrame.color());
                     }
 
-                    cumulativeDuration += frameData->duration;
-                    movBoneData->duration = static_cast<float>(
-                        (std::max)(cumulativeDuration, frameData->frameID + frameData->duration));
+                    const int64_t cum64 =
+                        static_cast<int64_t>(cumulativeDuration) + static_cast<int64_t>(frameData->duration);
+                    cumulativeDuration = static_cast<int>(cum64 > 0x7FFFFFFFLL ? 0x7FFFFFFFLL : cum64);
+                    const int64_t span64 =
+                        static_cast<int64_t>(frameData->frameID) + static_cast<int64_t>(frameData->duration);
+                    const int clampedSpan = static_cast<int>(span64 > 0x7FFFFFFFLL ? 0x7FFFFFFFLL : span64);
+                    movBoneData->duration = static_cast<float>((std::max)(cumulativeDuration, clampedSpan));
                     movBoneData->addFrameData(frameData);
                     frameData->release();
                 }
@@ -1208,8 +1215,17 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
             LoadResolvedSpriteSheet(pbTex.plistfile(), effectiveBase, nullptr, loadedSheets);
         }
 
-        if (manager->getTextureData(pbTex.name().c_str()) != nullptr) {
-            continue;
+        {
+            bool exists = false;
+            if (asyncLock) {
+                std::lock_guard<std::mutex> lock(g_armatureDataManagerMutex);
+                exists = (manager->getTextureData(pbTex.name().c_str()) != nullptr);
+            } else {
+                exists = (manager->getTextureData(pbTex.name().c_str()) != nullptr);
+            }
+            if (exists) {
+                continue;
+            }
         }
 
         auto* texData   = new cocos2d::extension::CCTextureData();
@@ -1518,10 +1534,17 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
         cursor += layout.textureDataStructSize;
 
         const std::string texName = ReadFixedCString(texHdr, 64);
-        if (manager->getTextureData(texName.c_str()) != nullptr) {
-            cocos2d::CCLog("[XmlbArmatureLoader] Duplicate texture data skipped: %s",
-                           texName.c_str());
-            continue;
+        {
+            bool exists = false;
+            if (asyncLock) {
+                std::lock_guard<std::mutex> lock(g_armatureDataManagerMutex);
+                exists = (manager->getTextureData(texName.c_str()) != nullptr);
+            } else {
+                exists = (manager->getTextureData(texName.c_str()) != nullptr);
+            }
+            if (exists) {
+                continue;
+            }
         }
 
         auto* texData   = new cocos2d::extension::CCTextureData();

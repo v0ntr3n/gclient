@@ -17,6 +17,17 @@ patch_cocos2dx.py — Idempotently patches stock Cocos2d-x 2.2.6 for Game Client
 import os
 import re
 import sys
+from pathlib import Path as _PatchPath
+
+
+def _read_text_closed(file_path: str) -> str:
+    with open(file_path, "r", encoding="utf-8", errors="replace") as _fh:
+        return _fh.read()
+
+
+def _write_text_closed(file_path: str, content: str) -> None:
+    with open(file_path, "w", encoding="utf-8", newline="\n") as _fh:
+        _fh.write(content)
 
 MARKER = "GCLIENT_BT_DECRYPT_HOOK"
 FILEDATA_GUARD_MARKER = "GCLIENT_GETFILEDATA_BINARY_UTF8_GUARD"
@@ -44,6 +55,11 @@ SPINE_GUARD_MARKER = "GCLIENT_SPINE_SKELETON_NDEBUG_GUARD"
 AUDIO_GUARD_MARKER = "GCLIENT_AUDIO_WIN32_GUARD"
 LUA_GUARD_MARKER = "GCLIENT_LUA_PUSH_GUARD"
 IMAGE_GUARD_MARKER = "GCLIENT_IMAGE_COMMON_GUARD"
+LABEL_ATLAS_GUARD_MARKER = "GCLIENT_CCLABELATLAS_DIV0_GUARD"
+ATLAS_LIFECYCLE_MARKER = "GCLIENT_ATLAS_LIFECYCLE_GUARD"
+DIRECTOR_LIFECYCLE_MARKER = "GCLIENT_DIRECTOR_LIFECYCLE_GUARD"
+WIN32_ISFILEEXIST_UTF8_MARKER = "GCLIENT_WIN32_ISFILEEXIST_UTF8"
+VS2022_VCXPROJ_MARKER = "GCLIENT_VS2022_V143_MD_MODERNIZED"
 
 
 def _mask_cpp_comments_and_strings(src: str) -> str:
@@ -230,7 +246,7 @@ def _prepend_to_method_body(txt: str, qualified_method: str, guard_code: str, ma
 
 
 def patch_header(path: str) -> None:
-    txt = open(path, "r", encoding="utf-8", errors="replace").read()
+    txt = _read_text_closed(path)
     orig_txt = txt
 
     if MARKER not in txt:
@@ -266,7 +282,7 @@ def patch_header(path: str) -> None:
         print(f"[skip] Already patched: {path}")
         return
 
-    open(path, "w", encoding="utf-8", newline="\n").write(txt)
+    _write_text_closed(path, txt)
     print(f"[ok] Patched header: {path}")
 
 
@@ -469,7 +485,7 @@ def patch_fileutils_decrypt(txt: str) -> str:
 
 
 def patch_cpp(path: str) -> None:
-    txt = open(path, "r", encoding="utf-8", errors="replace").read()
+    txt = _read_text_closed(path)
     orig_txt = txt
     is_base_fileutils = os.path.basename(path) == "CCFileUtils.cpp"
 
@@ -558,11 +574,43 @@ def patch_cpp(path: str) -> None:
             patched_body = _inject_after_open_brace(body, "GClientFileUtilsLockGuard _gclientLock; (void)_gclientLock; // " + THREADSAFE_MARKER)
             txt = txt[:b_start] + patched_body + txt[b_end:]
 
+    if not is_base_fileutils and WIN32_ISFILEEXIST_UTF8_MARKER not in txt:
+        utf8_exist_helper = (
+            "// " + WIN32_ISFILEEXIST_UTF8_MARKER + "\n"
+            "namespace {\n"
+            "static DWORD gclientGetFileAttributesUtf8(const char* pPath) {\n"
+            "    if (!pPath || !pPath[0]) return INVALID_FILE_ATTRIBUTES;\n"
+            "    int wlen = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pPath, -1, NULL, 0);\n"
+            "    if (wlen > 0) {\n"
+            "        std::wstring wide((size_t)wlen, L'\\0');\n"
+            "        if (::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pPath, -1, &wide[0], wlen) > 0) {\n"
+            "            DWORD attr = ::GetFileAttributesW(wide.c_str());\n"
+            "            if (attr != INVALID_FILE_ATTRIBUTES) return attr;\n"
+            "        }\n"
+            "    }\n"
+            "    return ::GetFileAttributesA(pPath);\n"
+            "}\n"
+            "}\n"
+        )
+        txt = _insert_before_ns_cc_begin(txt, utf8_exist_helper)
+        txt = re.sub(
+            r"\bGetFileAttributesA\s*\(",
+            "gclientGetFileAttributesUtf8(",
+            txt,
+        )
+
     if txt == orig_txt:
+        expected_markers = (
+            (MARKER, THREADSAFE_MARKER)
+            if is_base_fileutils
+            else (THREADSAFE_MARKER, WIN32_ISFILEEXIST_UTF8_MARKER)
+        )
+        if any(m not in txt for m in expected_markers):
+            raise RuntimeError(f"Fail-closed: expected anchors missing in {path}")
         print(f"[skip] Already patched: {path}")
         return
 
-    open(path, "w", encoding="utf-8", newline="\n").write(txt)
+    _write_text_closed(path, txt)
     print(f"[ok] Patched cpp: {path}")
 
 
@@ -1233,7 +1281,7 @@ def patch_texture_cache_multi_ext(cocos_root: str) -> None:
     if not os.path.exists(cache_cpp):
         return
 
-    txt = open(cache_cpp, "r", encoding="utf-8", errors="replace").read()
+    txt = _read_text_closed(cache_cpp)
     orig_txt = txt
 
     if TEXCACHE_MARKER not in txt:
@@ -1534,7 +1582,7 @@ def patch_texture_cache_multi_ext(cocos_root: str) -> None:
                 txt = txt[:b_start] + cb_body + txt[b_end:]
 
     if txt != orig_txt:
-        open(cache_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+        _write_text_closed(cache_cpp, txt)
         print(f"[ok] Patched CCTextureCache.cpp: {cache_cpp}")
     else:
         print(f"[skip] Already patched CCTextureCache.cpp: {cache_cpp}")
@@ -1546,7 +1594,7 @@ def patch_etc1_and_textures(cocos_root: str) -> None:
     # 1. CCTextureETC.h: declare ccDecodePKMWithAlpha inside NS_CC_BEGIN
     etc_h = os.path.join(tex_dir, "CCTextureETC.h")
     if os.path.exists(etc_h):
-        txt = open(etc_h, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(etc_h)
         if ETC1_MARKER not in txt:
             decl = (
                 "\n// " + ETC1_MARKER + "\n"
@@ -1563,7 +1611,7 @@ def patch_etc1_and_textures(cocos_root: str) -> None:
                 txt = txt.replace("class CCTextureETC", decl + "class CCTextureETC", 1)
             else:
                 raise RuntimeError(f"CCTextureETC class anchor not found in {etc_h}")
-            open(etc_h, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(etc_h, txt)
             print(f"[ok] Patched CCTextureETC.h: {etc_h}")
         else:
             print(f"[skip] Already patched CCTextureETC.h: {etc_h}")
@@ -1571,9 +1619,9 @@ def patch_etc1_and_textures(cocos_root: str) -> None:
     # 2. CCTextureETC.cpp: replace Android-only stub with cross-platform software ETC1 + _alpha decoder
     etc_cpp = os.path.join(tex_dir, "CCTextureETC.cpp")
     if os.path.exists(etc_cpp):
-        txt = open(etc_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(etc_cpp)
         if ETC1_MARKER not in txt:
-            open(etc_cpp, "w", encoding="utf-8", newline="\n").write(ETC1_TEXTURE_ETC_CPP)
+            _write_text_closed(etc_cpp, ETC1_TEXTURE_ETC_CPP)
             print(f"[ok] Patched CCTextureETC.cpp: {etc_cpp}")
         else:
             print(f"[skip] Already patched CCTextureETC.cpp: {etc_cpp}")
@@ -1581,7 +1629,7 @@ def patch_etc1_and_textures(cocos_root: str) -> None:
     # 3. CCTexture2D.cpp: decode .pkm + _alpha in CCTexture2D::initWithETCFile with premultiplied RGBA8888
     tex2d_cpp = os.path.join(tex_dir, "CCTexture2D.cpp")
     if os.path.exists(tex2d_cpp):
-        txt = open(tex2d_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(tex2d_cpp)
         orig_txt = txt
         if TEX2D_ETC_MARKER not in txt:
             if "CCTextureETC.h" not in txt:
@@ -1620,7 +1668,7 @@ def patch_etc1_and_textures(cocos_root: str) -> None:
                 txt = txt[:b_start] + new_body + txt[b_end:]
 
         if txt != orig_txt:
-            open(tex2d_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(tex2d_cpp, txt)
             print(f"[ok] Patched CCTexture2D.cpp: {tex2d_cpp}")
         else:
             print(f"[skip] Already patched CCTexture2D.cpp: {tex2d_cpp}")
@@ -1628,7 +1676,7 @@ def patch_etc1_and_textures(cocos_root: str) -> None:
     # 4. CCTextureCache.h: ensure addETCImage declaration is enabled on Win32 if platform-guarded
     cache_h = os.path.join(tex_dir, "CCTextureCache.h")
     if os.path.exists(cache_h):
-        txt = open(cache_h, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(cache_h)
         orig_txt = txt
         txt = re.sub(
             r"#if\s*\(\s*CC_TARGET_PLATFORM\s*==\s*CC_PLATFORM_ANDROID\s*\)\s*(\n[^\n]*\baddETCImage\b)",
@@ -1636,7 +1684,7 @@ def patch_etc1_and_textures(cocos_root: str) -> None:
             txt,
         )
         if txt != orig_txt:
-            open(cache_h, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(cache_h, txt)
             print(f"[ok] Patched CCTextureCache.h: {cache_h}")
 
     # 5. CCTextureCache.cpp: .pkm + multi-extension fallback in addImage/addETCImage + addImageAsync rescue
@@ -1646,7 +1694,7 @@ def patch_etc1_and_textures(cocos_root: str) -> None:
 def patch_pthread_header(path: str) -> None:
     if not os.path.exists(path):
         return
-    txt = open(path, "r", encoding="utf-8", errors="replace").read()
+    txt = _read_text_closed(path)
     if "GCLIENT_TIMESPEC_FIX" in txt:
         print(f"[skip] Already patched pthread.h: {path}")
         return
@@ -1660,76 +1708,101 @@ def patch_pthread_header(path: str) -> None:
         "#endif\n"
     )
     txt = txt.replace(anchor, fix + anchor, 1)
-    open(path, "w", encoding="utf-8", newline="\n").write(txt)
+    _write_text_closed(path, txt)
     print(f"[ok] Patched pthread.h: {path}")
 
 
 def patch_stdc_iob(path: str) -> None:
     if not os.path.exists(path):
         return
-    txt = open(path, "r", encoding="utf-8", errors="replace").read()
-    if "GCLIENT_LEGACY_STDIO_FIX" in txt:
+    txt = _read_text_closed(path)
+    if "GCLIENT_LEGACY_STDIO_FIX_V2" in txt:
         print(f"[skip] Already patched CCStdC.cpp: {path}")
         return
-    if "GCLIENT_IOB_FUNC_FIX" in txt:
-        txt = txt + "\n// GCLIENT_LEGACY_STDIO_FIX\n#if defined(_MSC_VER) && _MSC_VER >= 1900\n#pragma comment(lib, \"legacy_stdio_definitions.lib\")\n#endif\n"
-        open(path, "w", encoding="utf-8", newline="\n").write(txt)
-        print(f"[ok] Added legacy_stdio_definitions.lib to CCStdC.cpp: {path}")
-        return
+    # Remove any v1 shim before appending the 32-byte-stride-safe UCRT + __imp____iob_func shim.
+    idx = txt.find("// GCLIENT_IOB_FUNC_FIX")
+    if idx != -1:
+        txt = txt[:idx].rstrip() + "\n"
     shim = (
-        "\n// GCLIENT_IOB_FUNC_FIX: VS 2015+ UCRT shim for 2012 prebuilt libpng/libjpeg\n"
+        "\n// GCLIENT_IOB_FUNC_FIX: VS 2015-2022 UCRT shim for pre-UCRT static COFF archives\n"
         "// GCLIENT_LEGACY_STDIO_FIX\n"
+        "// GCLIENT_LEGACY_STDIO_FIX_V2\n"
         "#if defined(_MSC_VER) && _MSC_VER >= 1900\n"
         "#include <stdio.h>\n"
         "#pragma comment(lib, \"legacy_stdio_definitions.lib\")\n"
+        "// Pre-VS2015 MSVC FILE struct was 32 bytes; allocate 3 * 32 bytes so legacy static .obj\n"
+        "// indexing (&__iob_func()[1] / [2] at +32 / +64 bytes) never reads out-of-bounds.\n"
+        "struct GClientLegacyFileSlot { unsigned char raw[32]; };\n"
         "extern \"C\" FILE* __cdecl __iob_func(void) {\n"
-        "    static FILE iob[3];\n"
-        "    iob[0] = *stdin;\n"
-        "    iob[1] = *stdout;\n"
-        "    iob[2] = *stderr;\n"
-        "    return iob;\n"
+        "    static GClientLegacyFileSlot s_legacyIob[3] = {};\n"
+        "    return reinterpret_cast<FILE*>(&s_legacyIob[0]);\n"
         "}\n"
+        "#if defined(_M_IX86)\n"
+        "extern \"C\" { FILE* (__cdecl* __imp____iob_func)(void) = &__iob_func; }\n"
+        "#endif\n"
         "#endif\n"
     )
     txt = txt + shim
-    open(path, "w", encoding="utf-8", newline="\n").write(txt)
+    _write_text_closed(path, txt)
     print(f"[ok] Patched CCStdC.cpp: {path}")
 
 
 def patch_stdc_h(path: str) -> None:
     if not os.path.exists(path):
         return
-    txt = open(path, "r", encoding="utf-8", errors="replace").read()
+    txt = _read_text_closed(path).replace("\r\n", "\n")
     orig_txt = txt
     if "GCLIENT_SNPRINTF_FIX" in txt:
         print(f"[skip] Already patched CCStdC.h: {path}")
         return
-    txt = txt.replace(
-        "#ifndef snprintf\n#define snprintf _snprintf\n#endif",
+    sn_pat = re.compile(
+        r"#\s*(?:ifndef\s+snprintf|if\s+!defined\s*\(\s*snprintf\s*\)|if\s+_MSC_VER\s*<\s*1[89]00)\s*\n"
+        r"\s*#\s*define\s+snprintf\s+_snprintf\b[^\n]*\n"
+        r"\s*#\s*endif"
+    )
+    txt, n_sn = sn_pat.subn(
         "// GCLIENT_SNPRINTF_FIX\n#if !defined(snprintf) && (!defined(_MSC_VER) || _MSC_VER < 1900)\n#define snprintf _snprintf\n#endif",
-        1,
+        txt,
+        count=1,
     )
-    txt = txt.replace(
-        "#if !defined(isnan)\n    #define isnan   _isnan\n#endif",
+    vsn_pat = re.compile(
+        r"#\s*(?:ifndef\s+vsnprintf|if\s+!defined\s*\(\s*vsnprintf\s*\))\s*\n"
+        r"\s*#\s*define\s+vsnprintf\s+_vsnprintf\b[^\n]*\n"
+        r"\s*#\s*endif"
+    )
+    txt = vsn_pat.sub(
+        "#if !defined(vsnprintf) && (!defined(_MSC_VER) || _MSC_VER < 1900)\n#define vsnprintf _vsnprintf\n#endif",
+        txt,
+        count=1,
+    )
+    nan_pat = re.compile(
+        r"#\s*(?:ifndef\s+isnan|if\s+!defined\s*\(\s*isnan\s*\))\s*\n"
+        r"\s*#\s*define\s+isnan\s+_isnan\b[^\n]*\n"
+        r"\s*#\s*endif"
+    )
+    txt = nan_pat.sub(
         "#if !defined(isnan) && (!defined(_MSC_VER) || _MSC_VER < 1900)\n    #define isnan   _isnan\n#endif",
-        1,
+        txt,
+        count=1,
     )
+    if n_sn == 0 and re.search(r"^\s*#\s*define\s+snprintf\s+_snprintf\b", txt, re.MULTILINE):
+        raise RuntimeError(f"Fail-closed: unguarded '#define snprintf _snprintf' in {path}")
     if txt == orig_txt:
         print(f"[skip] Already patched CCStdC.h: {path}")
         return
-    open(path, "w", encoding="utf-8", newline="\n").write(txt)
+    _write_text_closed(path, txt)
     print(f"[ok] Patched CCStdC.h: {path}")
 
 
 def patch_chipmunk(path: str) -> None:
     if not os.path.exists(path):
         return
-    txt = open(path, "r", encoding="utf-8", errors="replace").read()
+    txt = _read_text_closed(path)
     old = 'XSTR(CP_VERSION_MAJOR)"."XSTR(CP_VERSION_MINOR)"."XSTR(CP_VERSION_RELEASE)'
     new = 'XSTR(CP_VERSION_MAJOR) "." XSTR(CP_VERSION_MINOR) "." XSTR(CP_VERSION_RELEASE)'
     if old in txt:
         txt = txt.replace(old, new, 1)
-        open(path, "w", encoding="utf-8", newline="\n").write(txt)
+        _write_text_closed(path, txt)
         print(f"[ok] Patched chipmunk.c: {path}")
     else:
         print(f"[skip] Already patched chipmunk.c: {path}")
@@ -1738,7 +1811,7 @@ def patch_chipmunk(path: str) -> None:
 def patch_image_common_and_legacy_dlls(cocos_root: str) -> None:
     img_h = os.path.join(cocos_root, "cocos2dx", "platform", "CCImageCommon_cpp.h")
     if os.path.exists(img_h):
-        txt = open(img_h, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(img_h)
         orig_txt = txt
 
         if "GCLIENT_NO_TIFF" not in txt:
@@ -1754,6 +1827,21 @@ def patch_image_common_and_legacy_dlls(cocos_root: str) -> None:
                 )
                 txt = txt[:start] + stub + txt[end:]
 
+        if "GCLIENT_JPEG_NO_STDERR" not in txt and "jpeg_std_error(&jerr.pub);" in txt:
+            txt = txt.replace(
+                "cinfo.err = jpeg_std_error(&jerr.pub);",
+                "cinfo.err = jpeg_std_error(&jerr.pub); // GCLIENT_JPEG_NO_STDERR\n"
+                "        cinfo.err->output_message = [](j_common_ptr) {};",
+                1,
+            )
+        if "GCLIENT_PNG_NO_STDERR" not in txt and "png_create_read_struct(PNG_LIBPNG_VER_STRING, 0, 0, 0)" in txt:
+            txt = txt.replace(
+                "png_create_read_struct(PNG_LIBPNG_VER_STRING, 0, 0, 0)",
+                "png_create_read_struct(PNG_LIBPNG_VER_STRING, 0, "
+                "[](png_structp png_ptr, png_const_charp) { longjmp(png_jmpbuf(png_ptr), 1); }, "
+                "[](png_structp, png_const_charp) {}) /* GCLIENT_PNG_NO_STDERR */",
+                1,
+            )
         if IMAGE_GUARD_MARKER not in txt:
             # 1. Fix _initWithJpgData JCS_RGB `else { break; }` bug so direct RGB JPEGs decode cleanly,
             #    while unsupported color spaces (e.g. CMYK) destroy decompress state and break safely.
@@ -1802,14 +1890,14 @@ def patch_image_common_and_legacy_dlls(cocos_root: str) -> None:
             txt = alloc_re.sub(_pad_img_alloc, txt)
 
         if txt != orig_txt:
-            open(img_h, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(img_h, txt)
             print(f"[ok] Patched CCImageCommon_cpp.h: {img_h}")
         else:
             print(f"[skip] Already patched CCImageCommon_cpp.h: {img_h}")
 
     webp_cpp = os.path.join(cocos_root, "cocos2dx", "platform", "CCImageCommonWebp.cpp")
     if os.path.exists(webp_cpp):
-        txt = open(webp_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(webp_cpp)
         if IMAGE_GUARD_MARKER not in txt and "m_pData = new unsigned char[" in txt:
             txt = re.sub(
                 r"([ \t]*)m_pData\s*=\s*new\s+unsigned\s+char\s*\[\s*([^\]]+?)\s*\]\s*;",
@@ -1820,20 +1908,20 @@ def patch_image_common_and_legacy_dlls(cocos_root: str) -> None:
                 r"\1}",
                 txt,
             )
-            open(webp_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(webp_cpp, txt)
             print(f"[ok] Patched CCImageCommonWebp.cpp: {webp_cpp}")
 
     c2d_proj = os.path.join(cocos_root, "cocos2dx", "proj.win32", "cocos2d.vcxproj")
     if os.path.exists(c2d_proj):
-        txt = open(c2d_proj, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(c2d_proj)
         if "libtiff.lib;" in txt:
             txt = txt.replace("libtiff.lib;", "")
-            open(c2d_proj, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(c2d_proj, txt)
             print(f"[ok] Removed libtiff.lib from {c2d_proj}")
 
     ws_cpp = os.path.join(cocos_root, "extensions", "network", "Websocket.cpp")
     if os.path.exists(ws_cpp):
-        txt = open(ws_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(ws_cpp)
         if "GCLIENT_NO_WEBSOCKET_V3" not in txt:
             stub = (
                 '// GCLIENT_NO_WEBSOCKET_V3: stubbed to avoid MSVCR100.dll-bound websockets.dll\n'
@@ -1852,15 +1940,15 @@ def patch_image_common_and_legacy_dlls(cocos_root: str) -> None:
                 'void WebSocket::onUIThreadReceiveMessage(WsMessage*) {}\n'
                 'NS_CC_EXT_END\n'
             )
-            open(ws_cpp, "w", encoding="utf-8", newline="\n").write(stub)
+            _write_text_closed(ws_cpp, stub)
             print(f"[ok] Stubbed WebSocket in {ws_cpp}")
 
     ext_proj = os.path.join(cocos_root, "extensions", "proj.win32", "libExtensions.vcxproj")
     if os.path.exists(ext_proj):
-        txt = open(ext_proj, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(ext_proj)
         if "websockets.lib;" in txt:
             txt = txt.replace("websockets.lib;", "")
-            open(ext_proj, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(ext_proj, txt)
             print(f"[ok] Removed websockets.lib from {ext_proj}")
 
 
@@ -1868,7 +1956,7 @@ def patch_lua_loader(cocos_root: str) -> None:
     loader_cpp = os.path.join(cocos_root, "scripting", "lua", "cocos2dx_support", "Cocos2dxLuaLoader.cpp")
     if not os.path.exists(loader_cpp):
         return
-    txt = open(loader_cpp, "r", encoding="utf-8", errors="replace").read()
+    txt = _read_text_closed(loader_cpp)
     orig_txt = txt
     if "GCLIENT_LUA_LOADER_FIX_V2" in txt:
         print(f"[skip] Already patched Cocos2dxLuaLoader.cpp: {loader_cpp}")
@@ -1916,14 +2004,14 @@ def patch_lua_loader(cocos_root: str) -> None:
     if txt == orig_txt:
         print(f"[skip] Already patched Cocos2dxLuaLoader.cpp: {loader_cpp}")
         return
-    open(loader_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+    _write_text_closed(loader_cpp, txt)
     print(f"[ok] Patched Cocos2dxLuaLoader.cpp: {loader_cpp}")
 
 
 def _replace_once_if_needed(path: str, replacements: list[tuple[str, str]]) -> None:
     if not os.path.exists(path):
         return
-    txt = open(path, "r", encoding="utf-8", errors="replace").read()
+    txt = _read_text_closed(path)
     changed = False
     for old, new in replacements:
         if new in txt:
@@ -1932,7 +2020,7 @@ def _replace_once_if_needed(path: str, replacements: list[tuple[str, str]]) -> N
             txt = txt.replace(old, new, 1)
             changed = True
     if changed:
-        open(path, "w", encoding="utf-8", newline="\n").write(txt)
+        _write_text_closed(path, txt)
         print(f"[ok] Patched: {path}")
     else:
         print(f"[skip] Already patched: {path}")
@@ -1942,7 +2030,7 @@ def patch_clipping_node(cocos_root: str) -> None:
     clip_cpp = os.path.join(cocos_root, "cocos2dx", "misc_nodes", "CCClippingNode.cpp")
     if not os.path.exists(clip_cpp):
         return
-    txt = open(clip_cpp, "r", encoding="utf-8", errors="replace").read()
+    txt = _read_text_closed(clip_cpp)
     if CLIPPING_MARKER in txt:
         print(f"[skip] Already patched CCClippingNode.cpp: {clip_cpp}")
         return
@@ -1972,7 +2060,7 @@ def patch_clipping_node(cocos_root: str) -> None:
             txt = txt[:b_start] + body + txt[b_end:]
 
     if txt != orig_txt:
-        open(clip_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+        _write_text_closed(clip_cpp, txt)
         print(f"[ok] Patched CCClippingNode.cpp: {clip_cpp}")
     else:
         print(f"[skip] Already patched CCClippingNode.cpp: {clip_cpp}")
@@ -1982,7 +2070,7 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
     # 1. UIWidget.cpp: route non-Widget CCNode* children in Widget::addChild to this->addNode(...)
     widget_cpp = os.path.join(cocos_root, "extensions", "CocoStudio", "GUI", "BaseClasses", "UIWidget.cpp")
     if os.path.exists(widget_cpp):
-        txt = open(widget_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(widget_cpp)
         orig_txt = txt
         if UIWIDGET_ADDCHILD_MARKER not in txt:
             for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::addChild")):
@@ -2086,7 +2174,7 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
                 txt = txt[:b_start] + body + txt[b_end:]
 
         if txt != orig_txt:
-            open(widget_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(widget_cpp, txt)
             print(f"[ok] Patched UIWidget.cpp addChild/addNode guards: {widget_cpp}")
         else:
             print(f"[skip] Already patched UIWidget.cpp addChild/addNode guards: {widget_cpp}")
@@ -2094,7 +2182,7 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
     # 2. UITouchGroup.cpp: invisible check + null/data check + dynamic_cast<Widget*> + std::vector retain snapshot UAF fix
     tg_cpp = os.path.join(cocos_root, "extensions", "CocoStudio", "GUI", "System", "UITouchGroup.cpp")
     if os.path.exists(tg_cpp):
-        txt = open(tg_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(tg_cpp)
         orig_txt = txt
         if UITOUCHGROUP_MARKER not in txt:
             if "#include <vector>" not in txt:
@@ -2183,7 +2271,7 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
                     txt = txt[:b_start] + new_th + txt[b_end:]
 
         if txt != orig_txt:
-            open(tg_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(tg_cpp, txt)
             print(f"[ok] Patched UITouchGroup.cpp: {tg_cpp}")
         else:
             print(f"[skip] Already patched UITouchGroup.cpp: {tg_cpp}")
@@ -2191,7 +2279,7 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
     # 3. UIHelper.cpp: null/children->data checks & dynamic_cast<Widget*> across seekWidget* helpers
     helper_cpp = os.path.join(cocos_root, "extensions", "CocoStudio", "GUI", "System", "UIHelper.cpp")
     if os.path.exists(helper_cpp):
-        txt = open(helper_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(helper_cpp)
         orig_txt = txt
         if UIHELPER_MARKER not in txt:
             txt = txt.replace(
@@ -2213,7 +2301,7 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
                 "if (name && layoutParameter && layoutParameter->getRelativeName() && strcmp(layoutParameter->getRelativeName(), name) == 0)",
             )
         if txt != orig_txt:
-            open(helper_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(helper_cpp, txt)
             print(f"[ok] Patched UIHelper.cpp: {helper_cpp}")
         else:
             print(f"[skip] Already patched UIHelper.cpp: {helper_cpp}")
@@ -2225,7 +2313,7 @@ def patch_spine_atlas_and_cocos2dx(cocos_root: str) -> None:
     # 1. Atlas.cpp: parse Spine 3.2 `size: W, H` tuple into page->width / page->height so UVs never NaN/Inf
     atlas_cpp = os.path.join(spine_dir, "Atlas.cpp")
     if os.path.exists(atlas_cpp):
-        txt = open(atlas_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(atlas_cpp)
         orig_txt = txt
         if ATLAS_SIZE_MARKER not in txt:
             legacy_size_block = (
@@ -2274,7 +2362,7 @@ def patch_spine_atlas_and_cocos2dx(cocos_root: str) -> None:
                 )
 
         if txt != orig_txt:
-            open(atlas_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(atlas_cpp, txt)
             print(f"[ok] Patched Atlas.cpp: {atlas_cpp}")
         else:
             print(f"[skip] Already patched Atlas.cpp: {atlas_cpp}")
@@ -2282,7 +2370,7 @@ def patch_spine_atlas_and_cocos2dx(cocos_root: str) -> None:
     # 2. spine-cocos2dx.cpp: multi-extension probing (.pvr.ccz, .pkm, .webp, .png), size population & binary null-term read
     sc_cpp = os.path.join(spine_dir, "spine-cocos2dx.cpp")
     if os.path.exists(sc_cpp):
-        txt = open(sc_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(sc_cpp)
         orig_txt = txt
         if SPINE_MULTIEXT_MARKER not in txt:
             if "<string>" not in txt:
@@ -2361,7 +2449,7 @@ def patch_spine_atlas_and_cocos2dx(cocos_root: str) -> None:
                 txt = txt[:b_start] + new_rf + txt[b_end:]
 
         if txt != orig_txt:
-            open(sc_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(sc_cpp, txt)
             print(f"[ok] Patched spine-cocos2dx.cpp: {sc_cpp}")
         else:
             print(f"[skip] Already patched spine-cocos2dx.cpp: {sc_cpp}")
@@ -2673,7 +2761,7 @@ def patch_spine_2x_mesh_and_ffd(cocos_root: str) -> None:
             "\t\tif (alpha < 1) {\n\t\t\tfor (i = 0; i < self->frameVerticesCount; ++i)\n\t\t\t\tvertices[i] += (frameVertices[i] - vertices[i]) * alpha;\n"
             "\t\t} else {\n\t\t\tmemcpy(vertices, frameVertices, self->frameVerticesCount * sizeof(float));\n\t\t}\n\t\treturn;\n\t}\n"
             "\tframeIndex = binarySearch(self->frames, self->framesLength, time, 1);\n\tframeTime = self->frames[frameIndex];\n"
-            "\tpercent = 1 - (time - frameTime) / (self->frames[frameIndex - 1] - frameTime);\n"
+            "\t{ float _denom = (frameIndex > 0) ? (self->frames[frameIndex - 1] - frameTime) : 0.0f; percent = (_denom != 0.0f) ? (1.0f - (time - frameTime) / _denom) : 0.0f; }\n"
             "\tpercent = CurveTimeline_getCurvePercent(SUPER(self), frameIndex - 1, percent < 0 ? 0 : (percent > 1 ? 1 : percent));\n"
             "\tprevVertices = self->frameVertices[frameIndex - 1];\n\tnextVertices = self->frameVertices[frameIndex];\n"
             "\tif (alpha < 1) {\n\t\tfor (i = 0; i < self->frameVerticesCount; ++i) {\n\t\t\tfloat prev = prevVertices[i];\n"
@@ -2838,10 +2926,10 @@ def patch_spine_2x_mesh_and_ffd(cocos_root: str) -> None:
         ],
     )
     if os.path.exists(ccskel_cpp):
-        txt = open(ccskel_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(ccskel_cpp)
         if SPINE_BBOX_MARKER not in txt:
             reg_hdr_p = os.path.join(spine_dir, "RegionAttachment.h")
-            reg_hdr_txt = open(reg_hdr_p, "r", encoding="utf-8", errors="replace").read() if os.path.exists(reg_hdr_p) else ""
+            reg_hdr_txt = _read_text_closed(reg_hdr_p) if os.path.exists(reg_hdr_p) else ""
             reg_compute_fn = (
                 "RegionAttachment_computeWorldVertices"
                 if "RegionAttachment_computeWorldVertices" in reg_hdr_txt and "RegionAttachment_computeVertices" not in reg_hdr_txt
@@ -2911,7 +2999,7 @@ def patch_spine_2x_mesh_and_ffd(cocos_root: str) -> None:
                     "}"
                 )
                 txt = txt[:b_start] + new_bbox + txt[b_end:]
-                open(ccskel_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+                _write_text_closed(ccskel_cpp, txt)
                 print(f"[ok] Patched CCSkeleton::boundingBox in: {ccskel_cpp}")
 
     # SkeletonJson.cpp: mesh/skinnedmesh, ffd + deform alias, and BoneData inheritRotation/inheritScale
@@ -3085,7 +3173,7 @@ def patch_node_sprite_actions_particles(cocos_root: str) -> None:
     # 1. CCNode.cpp: null guards across all 3 addChild overloads, clean reparenting, and runAction null guard
     node_cpp = os.path.join(cocos_root, "cocos2dx", "base_nodes", "CCNode.cpp")
     if os.path.exists(node_cpp):
-        txt = open(node_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(node_cpp)
         orig_txt = txt
         if CCNODE_GUARD_MARKER not in txt:
             for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "CCNode::addChild")):
@@ -3118,7 +3206,7 @@ def patch_node_sprite_actions_particles(cocos_root: str) -> None:
                 txt = txt[:b_start] + patched + txt[b_end:]
 
         if txt != orig_txt:
-            open(node_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(node_cpp, txt)
             print(f"[ok] Patched CCNode.cpp: {node_cpp}")
         else:
             print(f"[skip] Already patched CCNode.cpp: {node_cpp}")
@@ -3126,7 +3214,7 @@ def patch_node_sprite_actions_particles(cocos_root: str) -> None:
     # 2. CCSprite.cpp: null guards in initWithSpriteFrame, setDisplayFrame, setDisplayFrameWithAnimationName
     sprite_cpp = os.path.join(cocos_root, "cocos2dx", "sprite_nodes", "CCSprite.cpp")
     if os.path.exists(sprite_cpp):
-        txt = open(sprite_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(sprite_cpp)
         orig_txt = txt
         if CCSPRITE_GUARD_MARKER not in txt:
             for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "CCSprite::initWithSpriteFrame")):
@@ -3166,7 +3254,7 @@ def patch_node_sprite_actions_particles(cocos_root: str) -> None:
                 txt = txt[:b_start] + new_body + txt[b_end:]
 
         if txt != orig_txt:
-            open(sprite_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(sprite_cpp, txt)
             print(f"[ok] Patched CCSprite.cpp: {sprite_cpp}")
         else:
             print(f"[skip] Already patched CCSprite.cpp: {sprite_cpp}")
@@ -3174,7 +3262,7 @@ def patch_node_sprite_actions_particles(cocos_root: str) -> None:
     # 3. CCActionInterval.cpp: null/empty guards in CCAnimate, CCRepeatForever, CCRepeat, CCSequence, CCSpawn
     act_cpp = os.path.join(cocos_root, "cocos2dx", "actions", "CCActionInterval.cpp")
     if os.path.exists(act_cpp):
-        txt = open(act_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(act_cpp)
         orig_txt = txt
         if CCACTION_GUARD_MARKER not in txt:
             single_bool_guards = (
@@ -3242,7 +3330,7 @@ def patch_node_sprite_actions_particles(cocos_root: str) -> None:
                     txt = txt[:b_start] + new_factory + txt[b_end:]
 
         if txt != orig_txt:
-            open(act_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(act_cpp, txt)
             print(f"[ok] Patched CCActionInterval.cpp: {act_cpp}")
         else:
             print(f"[skip] Already patched CCActionInterval.cpp: {act_cpp}")
@@ -3250,7 +3338,7 @@ def patch_node_sprite_actions_particles(cocos_root: str) -> None:
     # 4. CCParticleSystem.cpp: check if (!dict) return false; before initWithDictionary and dict->release()
     part_cpp = os.path.join(cocos_root, "cocos2dx", "particle_nodes", "CCParticleSystem.cpp")
     if os.path.exists(part_cpp):
-        txt = open(part_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(part_cpp)
         orig_txt = txt
         if PARTICLE_GUARD_MARKER not in txt:
             for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "CCParticleSystem::initWithFile")):
@@ -3275,7 +3363,7 @@ def patch_node_sprite_actions_particles(cocos_root: str) -> None:
                     txt = txt[:b_start] + body + txt[b_end:]
 
         if txt != orig_txt:
-            open(part_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(part_cpp, txt)
             print(f"[ok] Patched CCParticleSystem.cpp: {part_cpp}")
         else:
             print(f"[skip] Already patched CCParticleSystem.cpp: {part_cpp}")
@@ -3287,7 +3375,7 @@ def patch_armature_and_richtext(cocos_root: str) -> None:
     # 1. CCArmature.cpp: guard animationData, armatureData, movementNames.at(0), and boneData in createBone
     arm_cpp = os.path.join(arm_root, "CCArmature.cpp")
     if os.path.exists(arm_cpp):
-        txt = open(arm_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(arm_cpp)
         orig_txt = txt
         if ARMATURE_GUARD_MARKER not in txt:
             txt = re.sub(
@@ -3322,7 +3410,7 @@ def patch_armature_and_richtext(cocos_root: str) -> None:
                 txt = txt[:b_start] + body + txt[b_end:]
 
         if txt != orig_txt:
-            open(arm_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(arm_cpp, txt)
             print(f"[ok] Patched CCArmature.cpp: {arm_cpp}")
         else:
             print(f"[skip] Already patched CCArmature.cpp: {arm_cpp}")
@@ -3330,7 +3418,7 @@ def patch_armature_and_richtext(cocos_root: str) -> None:
     # 2. CCArmatureAnimation.cpp: guard m_pAnimationData, m_pMovementData, and animationIndex bounds
     armanim_cpp = os.path.join(arm_root, "animation", "CCArmatureAnimation.cpp")
     if os.path.exists(armanim_cpp):
-        txt = open(armanim_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(armanim_cpp)
         orig_txt = txt
         if ARMATURE_GUARD_MARKER not in txt:
             for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "CCArmatureAnimation::play")):
@@ -3371,7 +3459,7 @@ def patch_armature_and_richtext(cocos_root: str) -> None:
                 txt = txt[:b_start] + body + txt[b_end:]
 
         if txt != orig_txt:
-            open(armanim_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(armanim_cpp, txt)
             print(f"[ok] Patched CCArmatureAnimation.cpp: {armanim_cpp}")
         else:
             print(f"[skip] Already patched CCArmatureAnimation.cpp: {armanim_cpp}")
@@ -3379,7 +3467,7 @@ def patch_armature_and_richtext(cocos_root: str) -> None:
     # 3. CCSkin.cpp: guard m_pBone in CCSkin::updateArmatureTransform & null name in initWithSpriteFrameName
     skin_cpp = os.path.join(arm_root, "display", "CCSkin.cpp")
     if os.path.exists(skin_cpp):
-        txt = open(skin_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(skin_cpp)
         orig_txt = txt
         if ARMATURE_GUARD_MARKER not in txt:
             txt = _prepend_to_method_body(txt, "CCSkin::updateArmatureTransform", "if (!m_pBone) return;", ARMATURE_GUARD_MARKER)
@@ -3389,7 +3477,7 @@ def patch_armature_and_richtext(cocos_root: str) -> None:
                 body = txt[b_start:b_end]
                 txt = txt[:b_start] + _inject_after_open_brace(body, f"if (!{n_var} || !{n_var}[0]) return false; // {ARMATURE_GUARD_MARKER}") + txt[b_end:]
         if txt != orig_txt:
-            open(skin_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(skin_cpp, txt)
             print(f"[ok] Patched CCSkin.cpp: {skin_cpp}")
         else:
             print(f"[skip] Already patched CCSkin.cpp: {skin_cpp}")
@@ -3397,7 +3485,7 @@ def patch_armature_and_richtext(cocos_root: str) -> None:
     # 4. CCTween.cpp: guard movementBoneData & getFrameData(0) in CCTween::play and updateFrameData
     tween_cpp = os.path.join(arm_root, "animation", "CCTween.cpp")
     if os.path.exists(tween_cpp):
-        txt = open(tween_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(tween_cpp)
         orig_txt = txt
         if ARMATURE_GUARD_MARKER not in txt:
             for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "CCTween::play")):
@@ -3447,7 +3535,7 @@ def patch_armature_and_richtext(cocos_root: str) -> None:
                 txt = txt[:b_start] + body + txt[b_end:]
 
         if txt != orig_txt:
-            open(tween_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(tween_cpp, txt)
             print(f"[ok] Patched CCTween.cpp: {tween_cpp}")
         else:
             print(f"[skip] Already patched CCTween.cpp: {tween_cpp}")
@@ -3455,7 +3543,7 @@ def patch_armature_and_richtext(cocos_root: str) -> None:
     # 5. CCDisplayFactory.cpp: guard null CCParticleSystem in createParticleDisplay & updateParticleDisplay
     df_cpp = os.path.join(arm_root, "display", "CCDisplayFactory.cpp")
     if os.path.exists(df_cpp):
-        txt = open(df_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(df_cpp)
         orig_txt = txt
         if ARMATURE_GUARD_MARKER not in txt:
             for b_start, b_end in reversed(_find_method_body_spans(txt, "CCDisplayFactory::createParticleDisplay")):
@@ -3490,7 +3578,7 @@ def patch_armature_and_richtext(cocos_root: str) -> None:
             )
 
         if txt != orig_txt:
-            open(df_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(df_cpp, txt)
             print(f"[ok] Patched CCDisplayFactory.cpp: {df_cpp}")
         else:
             print(f"[skip] Already patched CCDisplayFactory.cpp: {df_cpp}")
@@ -3499,7 +3587,7 @@ def patch_armature_and_richtext(cocos_root: str) -> None:
     #    and UTF-8 safe non-infinite recursion in handleTextRenderer when leftLength <= 0.
     rt_cpp = os.path.join(cocos_root, "extensions", "CocoStudio", "GUI", "UIWidgets", "UIRichText.cpp")
     if os.path.exists(rt_cpp):
-        txt = open(rt_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(rt_cpp)
         orig_txt = txt
         if RICHTEXT_GUARD_MARKER not in txt:
             txt = re.sub(
@@ -3635,7 +3723,7 @@ def patch_armature_and_richtext(cocos_root: str) -> None:
                 txt = txt[:b_start] + new_htr + txt[b_end:]
 
         if txt != orig_txt:
-            open(rt_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(rt_cpp, txt)
             print(f"[ok] Patched UIRichText.cpp: {rt_cpp}")
         else:
             print(f"[skip] Already patched UIRichText.cpp: {rt_cpp}")
@@ -3647,7 +3735,7 @@ def patch_spine_skeleton_ndebug(cocos_root: str) -> None:
     # 1. CCSkeleton.cpp: guard skeletonData == NULL, skeleton == NULL, and skeleton->boneCount == 0
     skel_cpp = os.path.join(spine_dir, "CCSkeleton.cpp")
     if os.path.exists(skel_cpp):
-        txt = open(skel_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(skel_cpp)
         orig_txt = txt
         if SPINE_GUARD_MARKER not in txt:
             for b_start, b_end in reversed(_find_method_body_spans(txt, "CCSkeleton::initialize")):
@@ -3767,7 +3855,7 @@ def patch_spine_skeleton_ndebug(cocos_root: str) -> None:
             )
 
         if txt != orig_txt:
-            open(skel_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(skel_cpp, txt)
             print(f"[ok] Patched CCSkeleton.cpp null/boneCount guards: {skel_cpp}")
         else:
             print(f"[skip] Already patched CCSkeleton.cpp null/boneCount guards: {skel_cpp}")
@@ -3775,7 +3863,7 @@ def patch_spine_skeleton_ndebug(cocos_root: str) -> None:
     # 2. CCSkeletonAnimation.cpp: guard skeleton == NULL & state / states across constructors, ~dtor, update, and anim APIs
     skel_anim_cpp = os.path.join(spine_dir, "CCSkeletonAnimation.cpp")
     if os.path.exists(skel_anim_cpp):
-        txt = open(skel_anim_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(skel_anim_cpp)
         orig_txt = txt
         if SPINE_GUARD_MARKER not in txt:
             for b_start, b_end in reversed(_find_method_body_spans(txt, "CCSkeletonAnimation::initialize")):
@@ -3874,7 +3962,7 @@ def patch_spine_skeleton_ndebug(cocos_root: str) -> None:
                 txt = _prepend_to_method_body(txt, "CCSkeletonAnimation::clearTrack", "if (!state) return;", SPINE_GUARD_MARKER)
 
         if txt != orig_txt:
-            open(skel_anim_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(skel_anim_cpp, txt)
             print(f"[ok] Patched CCSkeletonAnimation.cpp: {skel_anim_cpp}")
         else:
             print(f"[skip] Already patched CCSkeletonAnimation.cpp: {skel_anim_cpp}")
@@ -3886,7 +3974,7 @@ def patch_audio_win32(cocos_root: str) -> None:
     # 1. SimpleAudioEngine.cpp: null/empty guards BEFORE _Hash(pszFilePath) & mute/volume tracking
     sae_cpp = os.path.join(audio_dir, "SimpleAudioEngine.cpp")
     if os.path.exists(sae_cpp):
-        txt = open(sae_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(sae_cpp)
         orig_txt = txt
         if AUDIO_GUARD_MARKER not in txt:
             vol_state = (
@@ -3984,7 +4072,7 @@ def patch_audio_win32(cocos_root: str) -> None:
                 txt = txt[:b_start] + new_set_eff + txt[b_end:]
 
         if txt != orig_txt:
-            open(sae_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(sae_cpp, txt)
             print(f"[ok] Patched SimpleAudioEngine.cpp: {sae_cpp}")
         else:
             print(f"[skip] Already patched SimpleAudioEngine.cpp: {sae_cpp}")
@@ -3993,7 +4081,7 @@ def patch_audio_win32(cocos_root: str) -> None:
     #    and clear GWLP_USERDATA before Close() in ~MciPlayer().
     mci_cpp = os.path.join(audio_dir, "MciPlayer.cpp")
     if os.path.exists(mci_cpp):
-        txt = open(mci_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(mci_cpp)
         orig_txt = txt
         if AUDIO_GUARD_MARKER not in txt:
             mci_helpers = (
@@ -4174,7 +4262,7 @@ def patch_audio_win32(cocos_root: str) -> None:
                 txt = txt[:b_start] + new_open + txt[b_end:]
 
         if txt != orig_txt:
-            open(mci_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(mci_cpp, txt)
             print(f"[ok] Patched MciPlayer.cpp: {mci_cpp}")
         else:
             print(f"[skip] Already patched MciPlayer.cpp: {mci_cpp}")
@@ -4184,7 +4272,7 @@ def patch_lua_stack_and_tolua(cocos_root: str) -> None:
     # 1. CCLuaStack.cpp: check if (!objectValue) { lua_pushnil(m_state); return; } BEFORE objectValue->m_uID
     luastack_cpp = os.path.join(cocos_root, "scripting", "lua", "cocos2dx_support", "CCLuaStack.cpp")
     if os.path.exists(luastack_cpp):
-        txt = open(luastack_cpp, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(luastack_cpp)
         orig_txt = txt
         if LUA_GUARD_MARKER not in txt:
             for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "CCLuaStack::pushCCObject")):
@@ -4202,7 +4290,7 @@ def patch_lua_stack_and_tolua(cocos_root: str) -> None:
                 txt = txt[:b_start] + _inject_after_open_brace(body, guard) + txt[b_end:]
 
         if txt != orig_txt:
-            open(luastack_cpp, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(luastack_cpp, txt)
             print(f"[ok] Patched CCLuaStack.cpp: {luastack_cpp}")
         else:
             print(f"[skip] Already patched CCLuaStack.cpp: {luastack_cpp}")
@@ -4210,7 +4298,7 @@ def patch_lua_stack_and_tolua(cocos_root: str) -> None:
     # 2. tolua_push.c: push nil (1 value) when luaL_getmetatable returns non-table, preventing stack underflow!
     tolua_push_c = os.path.join(cocos_root, "scripting", "lua", "tolua", "tolua_push.c")
     if os.path.exists(tolua_push_c):
-        txt = open(tolua_push_c, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(tolua_push_c)
         orig_txt = txt
         if LUA_GUARD_MARKER not in txt:
             txt = re.sub(
@@ -4238,7 +4326,7 @@ def patch_lua_stack_and_tolua(cocos_root: str) -> None:
             )
 
         if txt != orig_txt:
-            open(tolua_push_c, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(tolua_push_c, txt)
             print(f"[ok] Patched tolua_push.c: {tolua_push_c}")
         else:
             print(f"[skip] Already patched tolua_push.c: {tolua_push_c}")
@@ -4366,7 +4454,7 @@ def patch_null_texture_guards(cocos_root: str) -> None:
     for path, reps in targets:
         if not os.path.exists(path):
             continue
-        txt = open(path, "r", encoding="utf-8", errors="replace").read()
+        txt = _read_text_closed(path)
         if marker in txt:
             print(f"[skip] Null-texture guard already patched: {path}")
             continue
@@ -4375,15 +4463,525 @@ def patch_null_texture_guards(cocos_root: str) -> None:
             if old in txt:
                 txt = txt.replace(old, new)
         if txt != orig:
-            open(path, "w", encoding="utf-8", newline="\n").write(txt)
+            _write_text_closed(path, txt)
             print(f"[ok] Applied null-texture guard: {path}")
 
 
-def main() -> int:
-    if len(sys.argv) < 2:
-        print("Usage: python patch_cocos2dx.py <path_to_cocos2d-x-2.2.6>")
-        return 1
-    cocos_root = sys.argv[1]
+def verify_cocos2dx_version(cocos_root: str, allow_partial_tree: bool = False) -> None:
+    """Verify exact Cocos2d-x 2.2.6 (0x00020206) source version before applying patches."""
+    cocos2d_h = os.path.join(cocos_root, "cocos2dx", "include", "cocos2d.h")
+    if not os.path.exists(cocos2d_h):
+        if allow_partial_tree:
+            return
+        raise RuntimeError(f"Missing Cocos2d-x version header: {cocos2d_h}")
+    txt = _read_text_closed(cocos2d_h)
+    m = re.search(r"#\s*define\s+COCOS2D_VERSION\s+(0x[0-9A-Fa-f]+)", txt)
+    if not m:
+        raise RuntimeError(f"COCOS2D_VERSION macro not found in {cocos2d_h}")
+    ver_int = int(m.group(1), 16)
+    if ver_int != 0x00020206:
+        raise RuntimeError(
+            f"Unsupported Cocos2d-x version {m.group(1)} in {cocos2d_h}; expected 0x00020206 (2.2.6)"
+        )
+    print(f"[ok] Verified Cocos2d-x version {m.group(1)} (2.2.6)")
+
+
+def patch_label_and_atlas_lifecycle_guards(cocos_root: str) -> None:
+    """
+    1. Inject mandatory Section 2 defensive guard into CCLabelAtlas::updateAtlasValues()
+       plus zero-pixel texture UV guard and null setString guard.
+    2. Guard CCAtlasNode::calculateMaxItems() against null texture and zero tile dimensions,
+       and make CCAtlasNode::setTexture() + CCAtlasNode::draw() self-heal deferred labels.
+    3. Guard CCDirector::setGLDefaultValues(), CCDirector::showStats(),
+       CCEGLViewProtocol::setDesignResolutionSize(), and Win32 CCEGLView::WindowProc.
+    """
+    # --- A. cocos2dx/label_nodes/CCLabelAtlas.cpp (Fail-Closed!) ---
+    label_atlas_cpp = os.path.join(cocos_root, "cocos2dx", "label_nodes", "CCLabelAtlas.cpp")
+    if os.path.exists(label_atlas_cpp):
+        txt = _read_text_closed(label_atlas_cpp).replace("\r\n", "\n")
+        orig = txt
+        if LABEL_ATLAS_GUARD_MARKER not in txt:
+            spans = _find_method_body_spans(txt, "CCLabelAtlas::updateAtlasValues")
+            if not spans:
+                raise RuntimeError(
+                    f"Fail-closed: CCLabelAtlas::updateAtlasValues() not found in {label_atlas_cpp}"
+                )
+            b_start, b_end = spans[0]
+            body = txt[b_start:b_end]
+            if "m_uItemsPerRow" not in body or "m_pTextureAtlas" not in body:
+                raise RuntimeError(
+                    f"Fail-closed: unexpected CCLabelAtlas::updateAtlasValues() body in {label_atlas_cpp}"
+                )
+            exact_guard = (
+                f"// {LABEL_ATLAS_GUARD_MARKER}\n"
+                "    if (!m_pTextureAtlas ||\n"
+                "        !m_pTextureAtlas->getTexture() ||\n"
+                "        m_uItemsPerRow == 0)\n"
+                "    {\n"
+                "        return;\n"
+                "    }"
+            )
+            body = _inject_after_open_brace(body, exact_guard)
+            body, uv_subs = re.subn(
+                r"(float\s+textureHigh\s*=\s*\(\s*float\s*\)\s*texture->getPixelsHigh\s*\(\s*\)\s*;)",
+                r"\1\n    if (textureWide <= 0.0f || textureHigh <= 0.0f) { return; }",
+                body,
+                count=1,
+            )
+            if uv_subs == 0:
+                raise RuntimeError(
+                    f"Fail-closed: textureHigh anchor not found in CCLabelAtlas::updateAtlasValues ({label_atlas_cpp})"
+                )
+            txt = txt[:b_start] + body + txt[b_end:]
+
+            # Null-guard CCLabelAtlas::setString(const char *label)
+            for p_open, p_close, sb_start, sb_end in reversed(
+                _find_method_spans_with_sig(txt, "CCLabelAtlas::setString")
+            ):
+                params = _split_top_level_params(txt[p_open + 1 : p_close - 1])
+                lbl_var = _extract_param_ident(params[0], "label") if params else "label"
+                sbody = txt[sb_start:sb_end]
+                if f"if (!{lbl_var})" not in sbody:
+                    sbody = _inject_after_open_brace(sbody, f'if (!{lbl_var}) {{ {lbl_var} = ""; }}')
+                    txt = txt[:sb_start] + sbody + txt[sb_end:]
+
+            _write_text_closed(label_atlas_cpp, txt)
+            print(f"[ok] Patched CCLabelAtlas.cpp: {label_atlas_cpp}")
+        else:
+            print(f"[skip] Already patched CCLabelAtlas.cpp: {label_atlas_cpp}")
+
+    # --- B. cocos2dx/base_nodes/CCAtlasNode.cpp (Fail-Closed!) ---
+    atlas_node_cpp = os.path.join(cocos_root, "cocos2dx", "base_nodes", "CCAtlasNode.cpp")
+    if os.path.exists(atlas_node_cpp):
+        txt = _read_text_closed(atlas_node_cpp).replace("\r\n", "\n")
+        orig = txt
+        if ATLAS_LIFECYCLE_MARKER not in txt:
+            calc_spans = _find_method_body_spans(txt, "CCAtlasNode::calculateMaxItems")
+            if not calc_spans:
+                raise RuntimeError(
+                    f"Fail-closed: CCAtlasNode::calculateMaxItems() not found in {atlas_node_cpp}"
+                )
+            c_start, c_end = calc_spans[0]
+            c_body = txt[c_start:c_end]
+            if "m_uItemHeight" not in c_body or "m_uItemWidth" not in c_body:
+                raise RuntimeError(
+                    f"Fail-closed: unexpected CCAtlasNode::calculateMaxItems() body in {atlas_node_cpp}"
+                )
+            calc_guard = (
+                f"// {ATLAS_LIFECYCLE_MARKER}\n"
+                "    if (!m_pTextureAtlas || !m_pTextureAtlas->getTexture() || "
+                "m_uItemWidth == 0 || m_uItemHeight == 0)\n"
+                "    {\n"
+                "        m_uItemsPerColumn = 0;\n"
+                "        m_uItemsPerRow = 0;\n"
+                "        return;\n"
+                "    }"
+            )
+            txt = txt[:c_start] + _inject_after_open_brace(c_body, calc_guard) + txt[c_end:]
+
+            # Self-heal deferred labels when CCAtlasNode::setTexture() receives a valid texture
+            set_tex_spans = _find_method_spans_with_sig(txt, "CCAtlasNode::setTexture")
+            if set_tex_spans:
+                p_open, p_close, st_start, st_end = set_tex_spans[0]
+                params = _split_top_level_params(txt[p_open + 1 : p_close - 1])
+                tex_var = _extract_param_ident(params[0], "texture") if params else "texture"
+                st_body = txt[st_start:st_end]
+                if "if (!m_pTextureAtlas)" not in st_body:
+                    st_body = _inject_after_open_brace(st_body, "if (!m_pTextureAtlas) { return; }")
+                    close_brace = st_body.rfind("}")
+                    recalc_tail = (
+                        f"    if ({tex_var} && m_uItemWidth > 0 && m_uItemHeight > 0)\n"
+                        "    {\n"
+                        "        this->calculateMaxItems();\n"
+                        "        this->updateAtlasValues();\n"
+                        "    }\n"
+                    )
+                    st_body = st_body[:close_brace] + recalc_tail + st_body[close_brace:]
+                    txt = txt[:st_start] + st_body + txt[st_end:]
+
+            # Guard CCAtlasNode::draw() and self-heal if texture finished initializing after construction
+            draw_spans = _find_method_body_spans(txt, "CCAtlasNode::draw")
+            if draw_spans:
+                d_start, d_end = draw_spans[0]
+                d_body = txt[d_start:d_end]
+                draw_guard = (
+                    "if (!m_pTextureAtlas || !m_pTextureAtlas->getTexture()) { return; }\n"
+                    "    if (m_uItemsPerRow == 0 && m_uItemWidth > 0 && m_uItemHeight > 0)\n"
+                    "    {\n"
+                    "        this->calculateMaxItems();\n"
+                    "        if (m_uItemsPerRow > 0) { this->updateAtlasValues(); }\n"
+                    "    }\n"
+                    "    if (m_uItemsPerRow == 0) { return; }"
+                )
+                txt = txt[:d_start] + _inject_after_open_brace(d_body, draw_guard) + txt[d_end:]
+
+            _write_text_closed(atlas_node_cpp, txt)
+            print(f"[ok] Patched CCAtlasNode.cpp: {atlas_node_cpp}")
+        else:
+            print(f"[skip] Already patched CCAtlasNode.cpp: {atlas_node_cpp}")
+
+    # --- C. cocos2dx/textures/CCTextureAtlas.cpp ---
+    tex_atlas_cpp = os.path.join(cocos_root, "cocos2dx", "textures", "CCTextureAtlas.cpp")
+    if os.path.exists(tex_atlas_cpp):
+        txt = _read_text_closed(tex_atlas_cpp).replace("\r\n", "\n")
+        if ATLAS_LIFECYCLE_MARKER not in txt:
+            orig = txt
+            txt = _prepend_to_method_body(
+                txt,
+                "CCTextureAtlas::drawNumberOfQuads",
+                "if (!m_pTexture || m_pTexture->getName() == 0) { return; }",
+                ATLAS_LIFECYCLE_MARKER,
+            )
+            txt = _prepend_to_method_body(
+                txt,
+                "CCTextureAtlas::updateQuad",
+                "if (!quad || index >= m_uCapacity || !m_pQuads) { return; }",
+                ATLAS_LIFECYCLE_MARKER,
+            )
+            if txt != orig:
+                _write_text_closed(tex_atlas_cpp, txt)
+                print(f"[ok] Patched CCTextureAtlas.cpp: {tex_atlas_cpp}")
+
+    # --- D. cocos2dx/CCDirector.cpp & CCEGLViewProtocol.cpp & win32/CCEGLView.cpp ---
+    director_cpp = os.path.join(cocos_root, "cocos2dx", "CCDirector.cpp")
+    if os.path.exists(director_cpp):
+        txt = _read_text_closed(director_cpp).replace("\r\n", "\n")
+        if DIRECTOR_LIFECYCLE_MARKER not in txt:
+            orig = txt
+            txt = _prepend_to_method_body(
+                txt,
+                "CCDirector::setGLDefaultValues",
+                "if (!m_pobOpenGLView) { return; }",
+                DIRECTOR_LIFECYCLE_MARKER,
+            )
+            txt = _prepend_to_method_body(
+                txt,
+                "CCDirector::createStatsLabel",
+                "if (!m_pobOpenGLView) { return; }",
+                DIRECTOR_LIFECYCLE_MARKER,
+            )
+            for b_start, b_end in reversed(_find_method_body_spans(txt, "CCDirector::showStats")):
+                sbody = txt[b_start:b_end]
+                if DIRECTOR_LIFECYCLE_MARKER not in sbody:
+                    sbody = sbody.replace(
+                        "m_pFPSLabel->setString(",
+                        "if (m_pFPSLabel) m_pFPSLabel->setString(",
+                    ).replace(
+                        "m_pSPFLabel->setString(",
+                        "if (m_pSPFLabel) m_pSPFLabel->setString(",
+                    ).replace(
+                        "m_pDrawsLabel->setString(",
+                        "if (m_pDrawsLabel) m_pDrawsLabel->setString(",
+                    ).replace(
+                        "m_pFPSLabel->visit();",
+                        "if (m_pFPSLabel) m_pFPSLabel->visit();",
+                    ).replace(
+                        "m_pSPFLabel->visit();",
+                        "if (m_pSPFLabel) m_pSPFLabel->visit();",
+                    ).replace(
+                        "m_pDrawsLabel->visit();",
+                        "if (m_pDrawsLabel) m_pDrawsLabel->visit();",
+                    )
+                    sbody = _inject_after_open_brace(sbody, f"// {DIRECTOR_LIFECYCLE_MARKER}")
+                    txt = txt[:b_start] + sbody + txt[b_end:]
+            if txt != orig:
+                _write_text_closed(director_cpp, txt)
+                print(f"[ok] Patched CCDirector.cpp: {director_cpp}")
+
+    egl_proto_cpp = os.path.join(cocos_root, "cocos2dx", "platform", "CCEGLViewProtocol.cpp")
+    if os.path.exists(egl_proto_cpp):
+        txt = _read_text_closed(egl_proto_cpp).replace("\r\n", "\n")
+        if DIRECTOR_LIFECYCLE_MARKER not in txt:
+            orig = txt
+            txt = _prepend_to_method_body(
+                txt,
+                "CCEGLViewProtocol::setDesignResolutionSize",
+                "if (width <= 0.0f || height <= 0.0f || m_obScreenSize.width <= 0.0f || m_obScreenSize.height <= 0.0f) { return; }",
+                DIRECTOR_LIFECYCLE_MARKER,
+            )
+            if txt != orig:
+                _write_text_closed(egl_proto_cpp, txt)
+                print(f"[ok] Patched CCEGLViewProtocol.cpp: {egl_proto_cpp}")
+
+    egl_win_cpp = os.path.join(cocos_root, "cocos2dx", "platform", "win32", "CCEGLView.cpp")
+    if os.path.exists(egl_win_cpp):
+        txt = _read_text_closed(egl_win_cpp).replace("\r\n", "\n")
+        if DIRECTOR_LIFECYCLE_MARKER not in txt:
+            orig = txt
+            txt = txt.replace(
+                "CCApplication::sharedApplication()->applicationWillEnterForeground();",
+                f"if (m_pDelegate != NULL && isOpenGLReady()) {{ CCApplication::sharedApplication()->applicationWillEnterForeground(); }} // {DIRECTOR_LIFECYCLE_MARKER}",
+            )
+            txt = txt.replace(
+                "CCApplication::sharedApplication()->applicationDidEnterBackground();",
+                f"if (m_pDelegate != NULL && isOpenGLReady()) {{ CCApplication::sharedApplication()->applicationDidEnterBackground(); }} // {DIRECTOR_LIFECYCLE_MARKER}",
+            )
+            if txt != orig:
+                _write_text_closed(egl_win_cpp, txt)
+                print(f"[ok] Patched win32/CCEGLView.cpp: {egl_win_cpp}")
+
+
+def patch_vs2022_vcxproj_and_vcpkg(cocos_root: str, vcpkg_installed_dir: str = "") -> None:
+    """
+    Modernize stock Cocos2d-x 2.2.6 Win32 .vcxproj files for Visual Studio 2022 (v143, /MD, /Zi PDB),
+    stub unused libExtensions HttpClient/AssetsManager so legacy libcurl_imp.lib (MSVCR100.dll) is dropped,
+    strip unused libiconv.lib, neutralize PreLinkEvent/PostBuildEvent xcopy of legacy v2-deps-4 DLLs,
+    and optionally rewire pthread/zlib/glew to vcpkg x86-windows (pthreadVC3.lib, zlib.lib, glew32.lib).
+    """
+    import shutil
+
+    # 1. Stub unused HttpClient.cpp & AssetsManager.cpp so libExtensions needs ZERO legacy libcurl_imp.lib
+    http_cpp = os.path.join(cocos_root, "extensions", "network", "HttpClient.cpp")
+    if os.path.exists(http_cpp):
+        txt = _read_text_closed(http_cpp)
+        if "GCLIENT_NO_HTTPCLIENT_V143" not in txt:
+            stub = (
+                "// GCLIENT_NO_HTTPCLIENT_V143: unused Cocos2d-x CCHttpClient stubbed in favor of WinHttpClient (vcpkg libcurl)\n"
+                '#include "HttpClient.h"\n'
+                "NS_CC_EXT_BEGIN\n"
+                "static CCHttpClient* s_pHttpClient = NULL;\n"
+                "CCHttpClient* CCHttpClient::getInstance() { if (!s_pHttpClient) s_pHttpClient = new CCHttpClient(); return s_pHttpClient; }\n"
+                "void CCHttpClient::destroyInstance() { CC_SAFE_DELETE(s_pHttpClient); }\n"
+                "CCHttpClient::CCHttpClient() : _timeoutForConnect(30), _timeoutForRead(60) {}\n"
+                "CCHttpClient::~CCHttpClient() {}\n"
+                "bool CCHttpClient::lazyInitThreadSemphore() { return false; }\n"
+                "void CCHttpClient::send(CCHttpRequest* request) { CC_UNUSED_PARAM(request); }\n"
+                "void CCHttpClient::dispatchResponseCallbacks(float delta) { CC_UNUSED_PARAM(delta); }\n"
+                "NS_CC_EXT_END\n"
+            )
+            _write_text_closed(http_cpp, stub)
+            print(f"[ok] Stubbed unused HttpClient.cpp: {http_cpp}")
+
+    assets_mgr_cpp = os.path.join(cocos_root, "extensions", "AssetsManager", "AssetsManager.cpp")
+    if os.path.exists(assets_mgr_cpp):
+        txt = _read_text_closed(assets_mgr_cpp)
+        if "GCLIENT_NO_ASSETSMANAGER_V143" not in txt:
+            stub = (
+                "// GCLIENT_NO_ASSETSMANAGER_V143: unused Cocos2d-x AssetsManager stubbed in favor of AtomicHotUpdater\n"
+                '#include "AssetsManager.h"\n'
+                "NS_CC_EXT_BEGIN\n"
+                "AssetsManager::AssetsManager(const char* packageUrl, const char* versionFileUrl, const char* storagePath)\n"
+                "    : _storagePath(storagePath ? storagePath : \"\"), _version(\"\"),\n"
+                "      _packageUrl(packageUrl ? packageUrl : \"\"), _versionFileUrl(versionFileUrl ? versionFileUrl : \"\"),\n"
+                "      _downloadedVersion(\"\"), _curl(NULL), _tid(NULL), _connectionTimeout(0),\n"
+                "      _delegate(NULL), _isDownloading(false), _shouldDeleteDelegateWhenExit(false) {}\n"
+                "AssetsManager::~AssetsManager() {}\n"
+                "void AssetsManager::checkStoragePath() {}\n"
+                "bool AssetsManager::checkUpdate() { return false; }\n"
+                "void AssetsManager::update() {}\n"
+                "bool AssetsManager::uncompress() { return false; }\n"
+                "bool AssetsManager::downLoad() { return false; }\n"
+                "const char* AssetsManager::getPackageUrl() const { return _packageUrl.c_str(); }\n"
+                "void AssetsManager::setPackageUrl(const char* packageUrl) { _packageUrl = packageUrl ? packageUrl : \"\"; }\n"
+                "const char* AssetsManager::getStoragePath() const { return _storagePath.c_str(); }\n"
+                "void AssetsManager::setStoragePath(const char* storagePath) { _storagePath = storagePath ? storagePath : \"\"; }\n"
+                "const char* AssetsManager::getVersionFileUrl() const { return _versionFileUrl.c_str(); }\n"
+                "void AssetsManager::setVersionFileUrl(const char* versionFileUrl) { _versionFileUrl = versionFileUrl ? versionFileUrl : \"\"; }\n"
+                "std::string AssetsManager::getVersion() { return _version; }\n"
+                "void AssetsManager::deleteVersion() {}\n"
+                "void AssetsManager::setDelegate(AssetsManagerDelegateProtocol* delegate) { _delegate = delegate; }\n"
+                "void AssetsManager::setConnectionTimeout(unsigned int timeout) { _connectionTimeout = timeout; }\n"
+                "unsigned int AssetsManager::getConnectionTimeout() { return _connectionTimeout; }\n"
+                "AssetsManager* AssetsManager::create(const char* packageUrl, const char* versionFileUrl, const char* storagePath, ErrorCallback, ProgressCallback, SuccessCallback) {\n"
+                "    AssetsManager* mgr = new AssetsManager(packageUrl, versionFileUrl, storagePath);\n"
+                "    if (mgr) mgr->autorelease();\n"
+                "    return mgr;\n"
+                "}\n"
+                "void AssetsManager::createStoragePath() {}\n"
+                "void AssetsManager::destroyStoragePath() {}\n"
+                "NS_CC_EXT_END\n"
+            )
+            _write_text_closed(assets_mgr_cpp, stub)
+            print(f"[ok] Stubbed unused AssetsManager.cpp: {assets_mgr_cpp}")
+
+    # 2. Sync PThreads4W headers from vcpkg x86-windows if supplied so pthreadVC3.lib ABI matches 100%
+    has_vcpkg = bool(vcpkg_installed_dir and os.path.isdir(vcpkg_installed_dir))
+    vcpkg_inc = os.path.join(vcpkg_installed_dir, "include").replace("\\", "/") if has_vcpkg else ""
+    vcpkg_lib = os.path.join(vcpkg_installed_dir, "lib").replace("\\", "/") if has_vcpkg else ""
+    has_pthread_vc3 = has_vcpkg and os.path.exists(os.path.join(vcpkg_lib, "pthreadVC3.lib"))
+    has_vcpkg_zlib = has_vcpkg and os.path.exists(os.path.join(vcpkg_lib, "zlib.lib"))
+    has_vcpkg_glew = has_vcpkg and os.path.exists(os.path.join(vcpkg_lib, "glew32.lib"))
+
+    if has_pthread_vc3:
+        pt_dst = os.path.join(cocos_root, "cocos2dx", "platform", "third_party", "win32", "pthread")
+        os.makedirs(pt_dst, exist_ok=True)
+        for hname in ("pthread.h", "sched.h", "semaphore.h", "_ptw32.h"):
+            src_h = os.path.join(vcpkg_inc, hname)
+            if os.path.exists(src_h):
+                shutil.copyfile(src_h, os.path.join(pt_dst, hname))
+        patch_pthread_header(os.path.join(pt_dst, "pthread.h"))
+        print(f"[ok] Synced PThreads4W headers from {vcpkg_inc} -> {pt_dst}")
+
+    if has_vcpkg_glew:
+        ogles_dst = os.path.join(cocos_root, "cocos2dx", "platform", "third_party", "win32", "OGLES", "GL")
+        if os.path.isdir(ogles_dst):
+            for hname in ("glew.h", "wglew.h", "glxew.h"):
+                src_h = os.path.join(vcpkg_inc, "GL", hname)
+                if os.path.exists(src_h):
+                    shutil.copyfile(src_h, os.path.join(ogles_dst, hname))
+
+    # Purge obsolete MSVCR100.dll-bound DLLs from third_party/win32/libraries & external/libwebsockets
+    legacy_dll_dirs = [
+        os.path.join(cocos_root, "cocos2dx", "platform", "third_party", "win32", "libraries"),
+        os.path.join(cocos_root, "external", "libwebsockets", "win32", "lib"),
+        os.path.join(cocos_root, "Release.win32"),
+    ]
+    always_dead_dlls = {
+        "libtiff.dll",
+        "websockets.dll",
+        "libcurl.dll",
+        "ssleay32.dll",
+        "libeay32.dll",
+        "iconv.dll",
+        "libiconv.dll",
+    }
+    if has_pthread_vc3:
+        always_dead_dlls.add("pthreadvce2.dll")
+    if has_vcpkg_zlib:
+        always_dead_dlls.add("zlib1.dll")
+    if has_vcpkg_glew:
+        always_dead_dlls.add("glew32.dll")
+
+    for d in legacy_dll_dirs:
+        if not os.path.isdir(d):
+            continue
+        for entry in os.listdir(d):
+            if entry.lower() in always_dead_dlls:
+                os.remove(os.path.join(d, entry))
+                print(f"[ok] Purged obsolete prebuilt DLL: {os.path.join(d, entry)}")
+
+    luajit_win32_dir = os.path.join(cocos_root, "scripting", "lua", "luajit", "win32")
+    v143_marker = os.path.join(luajit_win32_dir, "luajit-v143-built.marker")
+    if os.path.isdir(luajit_win32_dir) and not os.path.exists(v143_marker):
+        for stale_lj in ("lua51.dll", "lua51.lib"):
+            stale_path = os.path.join(luajit_win32_dir, stale_lj)
+            if os.path.exists(stale_path):
+                os.remove(stale_path)
+                print(f"[ok] Purged stale prebuilt VS2010 LuaJIT binary: {stale_path}")
+
+    # 3. Modernize all 6 Win32 .vcxproj files for VS2022 v143 /MD + Release PDB + zero legacy xcopy
+    vcxproj_rel_paths = [
+        ("external", "Box2D", "proj.win32", "Box2D.vcxproj"),
+        ("external", "chipmunk", "proj.win32", "chipmunk.vcxproj"),
+        ("cocos2dx", "proj.win32", "cocos2d.vcxproj"),
+        ("CocosDenshion", "proj.win32", "CocosDenshion.vcxproj"),
+        ("extensions", "proj.win32", "libExtensions.vcxproj"),
+        ("scripting", "lua", "proj.win32", "liblua.vcxproj"),
+    ]
+    for rel_parts in vcxproj_rel_paths:
+        proj_path = os.path.join(cocos_root, *rel_parts)
+        if not os.path.exists(proj_path):
+            continue
+        txt = _read_text_closed(proj_path)
+        orig = txt
+
+        # Upgrade obsolete MSBuild ToolsVersion="4.0" and VS2010..VS2019 PlatformToolset tags to VS2022 v143
+        txt = re.sub(r'ToolsVersion="4\.0"', 'ToolsVersion="Current"', txt)
+        txt = re.sub(
+            r"<PlatformToolset>\s*v1(?:00|10(?:_xp)?|20(?:_xp)?|40(?:_xp)?|41(?:_xp)?|42)\s*</PlatformToolset>",
+            "<PlatformToolset>v143</PlatformToolset>",
+            txt,
+            flags=re.IGNORECASE,
+        )
+
+        # Strip unused/obsolete import libs
+        for dead_lib in ("libtiff.lib;", "websockets.lib;", "libcurl_imp.lib;", "libiconv.lib;"):
+            txt = txt.replace(dead_lib, "")
+
+        if has_pthread_vc3:
+            txt = txt.replace("pthreadVCE2.lib", "pthreadVC3.lib")
+        if has_vcpkg_zlib:
+            txt = txt.replace("libzlib.lib", "zlib.lib").replace("zlib1.lib", "zlib.lib")
+
+        # Neutralize legacy PreLinkEvent / PostBuildEvent xcopy commands that dump MSVCR100 DLLs into OutDir
+        txt = re.sub(
+            r"(<PreLinkEvent>\s*<Command>)(.*?)(</Command>\s*</PreLinkEvent>)",
+            r"\1rem Disabled legacy v2-deps-4 xcopy (" + VS2022_VCXPROJ_MARKER + r")\3",
+            txt,
+            flags=re.DOTALL,
+        )
+        txt = re.sub(
+            r"(<PostBuildEvent>\s*<Command>)(.*?)(</Command>\s*</PostBuildEvent>)",
+            r"\1rem Disabled legacy v2-deps-4 xcopy (" + VS2022_VCXPROJ_MARKER + r")\3",
+            txt,
+            flags=re.DOTALL,
+        )
+
+        # Disable TreatWarningAsError so new v143 warnings in 2014 Cocos2d-x C++03 code never abort builds
+        txt = re.sub(
+            r"<TreatWarningAsError>\s*true\s*</TreatWarningAsError>",
+            "<TreatWarningAsError>false</TreatWarningAsError>",
+            txt,
+            flags=re.IGNORECASE,
+        )
+        # Replace EditAndContinue (/ZI) with ProgramDatabase (/Zi) for v143 /MP /FS compatibility
+        txt = re.sub(
+            r"<DebugInformationFormat>\s*EditAndContinue\s*</DebugInformationFormat>",
+            "<DebugInformationFormat>ProgramDatabase</DebugInformationFormat>",
+            txt,
+            flags=re.IGNORECASE,
+        )
+        # Ensure Release uses MultiThreadedDLL (/MD)
+        txt = re.sub(
+            r"<RuntimeLibrary>\s*MultiThreaded\s*</RuntimeLibrary>",
+            "<RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>",
+            txt,
+        )
+
+        if has_vcpkg and vcpkg_lib not in txt:
+            txt = txt.replace(
+                "<AdditionalLibraryDirectories>",
+                f"<AdditionalLibraryDirectories>{vcpkg_lib};",
+            )
+            txt = txt.replace(
+                "<AdditionalIncludeDirectories>",
+                f"<AdditionalIncludeDirectories>{vcpkg_inc};",
+            )
+
+        if VS2022_VCXPROJ_MARKER not in txt:
+            txt = txt.replace(
+                "</Project>",
+                f"  <!-- {VS2022_VCXPROJ_MARKER} -->\n</Project>",
+                1,
+            )
+
+        if txt != orig:
+            _write_text_closed(proj_path, txt)
+            print(f"[ok] Modernized .vcxproj for VS2022 v143 /MD: {proj_path}")
+        else:
+            print(f"[skip] Already modernized .vcxproj: {proj_path}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Idempotently patch stock Cocos2d-x 2.2.6 for VS2022 v143 Win32 x86 Release."
+    )
+    parser.add_argument("cocos_root", help="Path to Cocos2d-x 2.2.6 root directory")
+    parser.add_argument(
+        "--vcpkg-installed-dir",
+        "--vcpkg-installed",
+        dest="vcpkg_installed_dir",
+        default=os.environ.get("GCLIENT_VCPKG_INSTALLED_DIR", ""),
+        help="Optional path to vcpkg installed triplet dir (e.g. C:/vcpkg/installed/x86-windows)",
+    )
+    parser.add_argument(
+        "--allow-partial-tree",
+        action="store_true",
+        help="Allow running against partial test fixture trees lacking cocos2dx/include/cocos2d.h",
+    )
+    args = parser.parse_args(argv)
+
+    cocos_root = args.cocos_root
+    vcpkg_dir = args.vcpkg_installed_dir
+    if not vcpkg_dir:
+        vcpkg_root = os.environ.get("VCPKG_INSTALLATION_ROOT", "")
+        if vcpkg_root:
+            cand = os.path.join(vcpkg_root, "installed", "x86-windows")
+            if os.path.isdir(cand):
+                vcpkg_dir = cand
+
     hdr = os.path.join(cocos_root, "cocos2dx", "platform", "CCFileUtils.h")
     cpp = os.path.join(cocos_root, "cocos2dx", "platform", "CCFileUtils.cpp")
     win_cpp = os.path.join(cocos_root, "cocos2dx", "platform", "win32", "CCFileUtilsWin32.cpp")
@@ -4392,28 +4990,36 @@ def main() -> int:
     stdc_h = os.path.join(cocos_root, "cocos2dx", "platform", "win32", "CCStdC.h")
     for p in (hdr, cpp):
         if not os.path.exists(p):
-            print(f"[error] Missing expected Cocos2d-x file: {p}")
+            print(f"[error] Missing expected Cocos2d-x file: {p}", file=sys.stderr)
             return 2
-    patch_header(hdr)
-    patch_cpp(cpp)
-    if os.path.exists(win_cpp):
-        patch_cpp(win_cpp)
-    patch_pthread_header(pthread_h)
-    patch_stdc_iob(stdc_cpp)
-    patch_stdc_h(stdc_h)
-    patch_chipmunk(os.path.join(cocos_root, "external", "chipmunk", "src", "chipmunk.c"))
-    patch_image_common_and_legacy_dlls(cocos_root)
-    patch_lua_loader(cocos_root)
-    patch_lua_stack_and_tolua(cocos_root)
-    patch_etc1_and_textures(cocos_root)
-    patch_clipping_node(cocos_root)
-    patch_spine_and_gui(cocos_root)
-    patch_spine_2x_mesh_and_ffd(cocos_root)
-    patch_spine_skeleton_ndebug(cocos_root)
-    patch_node_sprite_actions_particles(cocos_root)
-    patch_armature_and_richtext(cocos_root)
-    patch_audio_win32(cocos_root)
-    patch_null_texture_guards(cocos_root)
+
+    try:
+        verify_cocos2dx_version(cocos_root, allow_partial_tree=args.allow_partial_tree)
+        patch_header(hdr)
+        patch_cpp(cpp)
+        if os.path.exists(win_cpp):
+            patch_cpp(win_cpp)
+        patch_pthread_header(pthread_h)
+        patch_stdc_iob(stdc_cpp)
+        patch_stdc_h(stdc_h)
+        patch_chipmunk(os.path.join(cocos_root, "external", "chipmunk", "src", "chipmunk.c"))
+        patch_image_common_and_legacy_dlls(cocos_root)
+        patch_lua_loader(cocos_root)
+        patch_lua_stack_and_tolua(cocos_root)
+        patch_etc1_and_textures(cocos_root)
+        patch_clipping_node(cocos_root)
+        patch_spine_and_gui(cocos_root)
+        patch_spine_2x_mesh_and_ffd(cocos_root)
+        patch_spine_skeleton_ndebug(cocos_root)
+        patch_node_sprite_actions_particles(cocos_root)
+        patch_armature_and_richtext(cocos_root)
+        patch_audio_win32(cocos_root)
+        patch_null_texture_guards(cocos_root)
+        patch_label_and_atlas_lifecycle_guards(cocos_root)
+        patch_vs2022_vcxproj_and_vcpkg(cocos_root, vcpkg_dir)
+    except RuntimeError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

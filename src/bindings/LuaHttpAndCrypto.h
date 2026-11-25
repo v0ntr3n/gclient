@@ -11,5 +11,8 @@ namespace bindings {
 // LuaHttpResponse, and CCCrypto bindings in the given Lua state.
 void registerLuaHttpAndCrypto(lua_State* L);
 
+// Cleanly tears down WinHttpClient scheduler & pending callback queue prior to Lua VM destruction.
+void shutdownLuaHttpClient();
+
 } // namespace bindings
 } // namespace gclient

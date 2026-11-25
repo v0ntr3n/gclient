@@ -337,34 +337,38 @@ std::vector<std::string> ExtractFntPageFiles(const uint8_t* data, size_t size) {
         return pages;
     }
 
-    // Binary AngelCode BMFont v3 ("BMF\x03")
+    // Binary AngelCode BMFont v3 ("BMF\x03") — subtraction checks prevent 32-bit size_t wrap on Win32 x86!
     if (data[0] == 'B' && data[1] == 'M' && data[2] == 'F' && data[3] == 3) {
         size_t off = 4;
-        while (off + 5 <= size) {
+        while (size - off >= 5u) {
             const uint8_t  blockType = data[off];
             const uint32_t blockSize = static_cast<uint32_t>(data[off + 1]) |
                                        (static_cast<uint32_t>(data[off + 2]) << 8) |
                                        (static_cast<uint32_t>(data[off + 3]) << 16) |
                                        (static_cast<uint32_t>(data[off + 4]) << 24);
-            off += 5;
-            if (off + blockSize > size) {
+            off += 5u;
+            if (static_cast<size_t>(blockSize) > size - off) {
                 break;
             }
             if (blockType == 3 && blockSize > 0) {
                 size_t pOff = 0;
-                while (pOff < blockSize) {
+                while (pOff < static_cast<size_t>(blockSize)) {
                     const uint8_t* start  = data + off + pOff;
-                    const void*    nulPtr = std::memchr(start, '\0', blockSize - pOff);
+                    const size_t   rem    = static_cast<size_t>(blockSize) - pOff;
+                    const void*    nulPtr = std::memchr(start, '\0', rem);
                     const size_t   sLen   = nulPtr
                                                 ? static_cast<size_t>(static_cast<const uint8_t*>(nulPtr) - start)
-                                                : (blockSize - pOff);
+                                                : rem;
                     if (sLen > 0) {
                         AppendUniquePath(pages, std::string(reinterpret_cast<const char*>(start), sLen));
                     }
-                    pOff += sLen + 1;
+                    if (!nulPtr) {
+                        break;
+                    }
+                    pOff += sLen + 1u;
                 }
             }
-            off += blockSize;
+            off += static_cast<size_t>(blockSize);
         }
         return pages;
     }
@@ -882,6 +886,24 @@ void ApplyLabelAtlasOptions(cocos2d::ui::LabelAtlas* atlas,
                       "Skipping LabelAtlas::setProperty: missing charMap texture '%s' (base '%s')",
                       rawCharMap.c_str(),
                       baseDir.c_str());
+        LogGuiWarn(msg);
+        return;
+    }
+
+    // Guard against charMap textures smaller than 1 cell (m_uItemsPerRow == 0 -> 0xC0000094 divide-by-zero).
+    const cocos2d::CCSize texSize = tex->getContentSize();
+    if (!std::isfinite(texSize.width) || !std::isfinite(texSize.height) ||
+        static_cast<int>(texSize.width) < itemW ||
+        static_cast<int>(texSize.height) < itemH) {
+        char msg[320];
+        std::snprintf(msg,
+                      sizeof(msg),
+                      "Skipping LabelAtlas::setProperty: charMap '%s' (%0.1fx%0.1f) smaller than cell (%dx%d)",
+                      rawCharMap.c_str(),
+                      texSize.width,
+                      texSize.height,
+                      itemW,
+                      itemH);
         LogGuiWarn(msg);
         return;
     }

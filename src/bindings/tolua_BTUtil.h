@@ -1,11 +1,7 @@
 #pragma once
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include <string>
+
 #include "tolua++.h"
-#ifdef __cplusplus
-}
-#endif
 
 TOLUA_API int tolua_BTUtil_open(lua_State* tolua_S);

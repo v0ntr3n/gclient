@@ -194,7 +194,8 @@ int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
     const uint16_t totalEntries = readZipLe16(eocd + 10);
     const uint32_t cdSize = readZipLe32(eocd + 12);
     const uint32_t cdOffset = readZipLe32(eocd + 16);
-    if (static_cast<size_t>(cdOffset) + static_cast<size_t>(cdSize) > fileLen) {
+    if (static_cast<size_t>(cdOffset) > fileLen ||
+        static_cast<size_t>(cdSize) > fileLen - static_cast<size_t>(cdOffset)) {
         return GameUtil::EUnzipBadFile;
     }
 
@@ -226,7 +227,9 @@ int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
         const uint16_t commentLen = readZipLe16(entry + 32);
         const uint32_t localHeaderOff = readZipLe32(entry + 42);
 
-        if (cdCursor + 46 + nameLen + extraLen + commentLen > cd.size()) {
+        const size_t varMetaLen =
+            static_cast<size_t>(nameLen) + static_cast<size_t>(extraLen) + static_cast<size_t>(commentLen);
+        if (cd.size() - cdCursor < 46u || (cd.size() - cdCursor - 46u) < varMetaLen) {
             return GameUtil::EUnzipBadFile;
         }
         std::string entryName(reinterpret_cast<const char*>(entry + 46), nameLen);
@@ -250,7 +253,8 @@ int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
             continue;
         }
 
-        if (static_cast<size_t>(localHeaderOff) + 30 > fileLen) {
+        if (static_cast<size_t>(localHeaderOff) > fileLen ||
+            fileLen - static_cast<size_t>(localHeaderOff) < 30u) {
             return GameUtil::EUnzipBadFile;
         }
         uint8_t localHdr[30];
@@ -261,8 +265,12 @@ int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
         }
         const uint16_t localNameLen = readZipLe16(localHdr + 26);
         const uint16_t localExtraLen = readZipLe16(localHdr + 28);
-        const size_t dataOffset = static_cast<size_t>(localHeaderOff) + 30u + localNameLen + localExtraLen;
-        if (dataOffset + compSize > fileLen ||
+        const size_t localHdrTotal = 30u + static_cast<size_t>(localNameLen) + static_cast<size_t>(localExtraLen);
+        if (fileLen - static_cast<size_t>(localHeaderOff) < localHdrTotal) {
+            return GameUtil::EUnzipBadFile;
+        }
+        const size_t dataOffset = static_cast<size_t>(localHeaderOff) + localHdrTotal;
+        if (static_cast<size_t>(compSize) > fileLen - dataOffset ||
             std::fseek(zfp, static_cast<long>(dataOffset), SEEK_SET) != 0) {
             return GameUtil::EUnzipBadFile;
         }
@@ -486,18 +494,23 @@ int GameUtil::unzip(const char* zipPath, const char* dstDir) {
         return EUnzipBadFile;
     }
 
-    char nameBuf[1024];
     char readBuf[4096];
     for (uLong i = 0; i < gi.number_entry; ++i) {
-        unz_file_info fi;
-        if (unzGetCurrentFileInfo(zf, &fi, nameBuf, sizeof(nameBuf), nullptr, 0, nullptr, 0) != UNZ_OK) {
+        unz_file_info fi{};
+        if (unzGetCurrentFileInfo(zf, &fi, nullptr, 0, nullptr, 0, nullptr, 0) != UNZ_OK ||
+            fi.size_filename > 4096u) {
+            unzClose(zf);
+            return EUnzipBadFile;
+        }
+        std::string dynName(static_cast<size_t>(fi.size_filename) + 1u, '\0');
+        if (unzGetCurrentFileInfo(zf, &fi, dynName.data(), static_cast<uLong>(dynName.size()), nullptr, 0, nullptr, 0) != UNZ_OK) {
             unzClose(zf);
             return EUnzipBadFile;
         }
 
         fs::path relPath;
         bool isDirEntry = false;
-        if (!normalizeZipEntryRelativePath(nameBuf, relPath, isDirEntry)) {
+        if (!normalizeZipEntryRelativePath(dynName.c_str(), relPath, isDirEntry)) {
             unzClose(zf);
             return EUnzipBadFile;
         }
