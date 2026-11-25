@@ -4781,14 +4781,6 @@ def patch_vs2022_vcxproj_and_vcpkg(cocos_root: str, vcpkg_installed_dir: str = "
                 "AssetsManager::AssetsManager(const char* packageUrl, const char* versionFileUrl, const char* storagePath)",
                 "    : " + ",\n      ".join(init_fields) + " {}",
             ]
-            if re.search(r"\bAssetsManager\s*\(\s*\)\s*;", hdr_txt):
-                default_fields = [
-                    f.replace('packageUrl ? packageUrl : ""', '""')
-                     .replace('versionFileUrl ? versionFileUrl : ""', '""')
-                     .replace('storagePath ? storagePath : ""', '""')
-                    for f in init_fields
-                ]
-                stub_lines.append("AssetsManager::AssetsManager()\n    : " + ",\n      ".join(default_fields) + " {}")
             stub_lines.extend([
                 "AssetsManager::~AssetsManager() {}",
                 "void AssetsManager::checkStoragePath() {}",
