@@ -789,6 +789,7 @@ int main(int argc, char** argv) {
             detail = "CCDirector::getScheduler() returned null";
             return false;
         }
+        using cocos2d::SEL_SCHEDULE;
         auto* dummy = new DummyTickTarget();
         sched->unscheduleSelector(schedule_selector(DummyTickTarget::onTick), dummy);
         sched->scheduleSelector(schedule_selector(DummyTickTarget::onTick), dummy, 0.0f, false);
