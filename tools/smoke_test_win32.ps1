@@ -84,12 +84,20 @@ function Invoke-BoundedGClient([string]$Label, [string[]]$Arguments) {
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $proc = [System.Diagnostics.Process]::Start($psi)
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
     $exited = $proc.WaitForExit($TimeoutSeconds * 1000)
     if (-not $exited) {
-        try { $proc.Kill() } catch {}
+        try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
         $proc.WaitForExit(3000) | Out-Null
     }
     $sw.Stop()
+
+    $stderrText = ""
+    try {
+        if ($stderrTask.Wait(2000)) { $stderrText = $stderrTask.Result.Trim() }
+    } catch {}
+    try { [void]$stdoutTask.Wait(1000) } catch {}
 
     $rawCode = if ($exited) { [int]$proc.ExitCode } else { -1 }
     $unsignedCode = [uint32]([BitConverter]::ToUInt32([BitConverter]::GetBytes($rawCode), 0))
@@ -104,10 +112,16 @@ function Invoke-BoundedGClient([string]$Label, [string[]]$Arguments) {
     $logsDir = Join-Path $ProfDir "logs"
     $glContextFailedInHeadless = $false
     if (Test-Path -LiteralPath $logsDir) {
-        $logTxt = (Get-ChildItem -LiteralPath $logsDir -Filter "*.log" | Get-Content -Raw -ErrorAction SilentlyContinue) -join "`n"
+        $logTxt = @(
+            Get-ChildItem -LiteralPath $logsDir -Filter "*.log" -ErrorAction SilentlyContinue |
+                ForEach-Object { [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8) }
+        ) -join "`n"
         if ($logTxt -match "Failed to create Win32 OpenGL 2\.0 view") {
             $glContextFailedInHeadless = $true
         }
+    }
+    if ($stderrText -match "Failed to initialize Win32 OpenGL context|HeadlessDialogSuppressed") {
+        $glContextFailedInHeadless = $true
     }
 
     return [ordered]@{
@@ -119,7 +133,7 @@ function Invoke-BoundedGClient([string]$Label, [string[]]$Arguments) {
         ntstatus_crash_name          = $crashName
         minidump_count               = $dumps.Count
         headless_gl_unavailable      = $glContextFailedInHeadless
-        stderr_snippet               = ($proc.StandardError.ReadToEnd().Trim())
+        stderr_snippet               = $stderrText
     }
 }
 
@@ -174,6 +188,7 @@ $Report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ReportPath -Encodi
 Write-Host "[SmokeTest] Verdict: $($Report.gui_runtime_verdict) | Report: $ReportPath"
 
 if ($HardFailure) {
+    Write-Host ($Report | ConvertTo-Json -Depth 6)
     Write-Error "Win32 smoke test detected a crash, minidump, hang, or unexpected non-zero exit!"
     exit 1
 }

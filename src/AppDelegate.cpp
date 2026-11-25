@@ -412,6 +412,19 @@ AppDelegate::~AppDelegate() {
     g_activeAppInstance.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
 }
 
+bool AppDelegate::executeHeadlessAssetValidation() {
+    LifecycleState expectedState = LifecycleState::Uninitialized;
+    if (!m_lifecycleState.compare_exchange_strong(
+            expectedState, LifecycleState::Initializing, std::memory_order_acq_rel)) {
+        return m_assetValidationOk;
+    }
+    configureFileUtils();
+    m_assetValidationOk = runAssetValidation();
+    diagnostics::CrashAndTelemetry::flushLogs();
+    teardownSubsystems(m_assetValidationOk ? LifecycleState::Terminated : LifecycleState::Failed);
+    return m_assetValidationOk;
+}
+
 void AppDelegate::shutdown() {
     teardownSubsystems(LifecycleState::Terminated);
 }

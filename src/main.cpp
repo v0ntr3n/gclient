@@ -109,6 +109,46 @@ bool isHeadlessOrNonInteractive(const gclient::AppConfig& cfg) {
     return false;
 }
 
+HHOOK g_headlessCbtHook = nullptr;
+
+LRESULT CALLBACK headlessDialogSuppressorCbtProc(int nCode, WPARAM wParam, LPARAM lParam) noexcept {
+    if (nCode == HCBT_ACTIVATE) {
+        HWND hwnd = reinterpret_cast<HWND>(wParam);
+        wchar_t className[32] = {};
+        if (hwnd != nullptr && ::GetClassNameW(hwnd, className, _countof(className)) > 0) {
+            if (std::wcscmp(className, L"#32770") == 0) {
+                wchar_t titleBuf[256] = {};
+                ::GetWindowTextW(hwnd, titleBuf, _countof(titleBuf));
+                std::fwprintf(stderr, L"[GCLIENT][HeadlessDialogSuppressed] Auto-dismissed modal dialog '%ls'\n", titleBuf);
+                std::fflush(stderr);
+                ::PostMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+                ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                return 0;
+            }
+        }
+    }
+    return ::CallNextHookEx(g_headlessCbtHook, nCode, wParam, lParam);
+}
+
+class ScopedHeadlessDialogSuppressor {
+public:
+    explicit ScopedHeadlessDialogSuppressor(bool enabled) noexcept {
+        if (enabled) {
+            ::SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+            g_headlessCbtHook = ::SetWindowsHookExW(
+                WH_CBT, &headlessDialogSuppressorCbtProc, nullptr, ::GetCurrentThreadId());
+        }
+    }
+    ~ScopedHeadlessDialogSuppressor() noexcept {
+        if (g_headlessCbtHook != nullptr) {
+            ::UnhookWindowsHookEx(g_headlessCbtHook);
+            g_headlessCbtHook = nullptr;
+        }
+    }
+    ScopedHeadlessDialogSuppressor(const ScopedHeadlessDialogSuppressor&) = delete;
+    ScopedHeadlessDialogSuppressor& operator=(const ScopedHeadlessDialogSuppressor&) = delete;
+};
+
 void reportFatalStartupMessage(const gclient::AppConfig& cfg, const wchar_t* message) {
     ::OutputDebugStringW(message);
     ::OutputDebugStringW(L"\n");
@@ -681,10 +721,29 @@ int WINAPI wWinMain(
         config.baseAssetsDir.c_str(),
         config.profileDir.c_str());
 
+    // Suppress any third-party modal MessageBox (such as Cocos2d-x's OpenGL < 1.5 dialog on headless VMs)
+    // whenever running in headless / non-interactive CI mode.
+    ScopedHeadlessDialogSuppressor headlessDialogGuard(isHeadlessOrNonInteractive(config));
+
     // 5. Instantiate AppDelegate BEFORE CCEGLView::setFrameSize so WM_SIZE during window creation
     // finds a valid CCApplication::sharedApplication() instance guarded by LifecycleState::Uninitialized.
     gclient::AppDelegate app(config);
     gclient::ui::Win32DesktopBridge::instance().setInitialMuted(config.muteAudio);
+
+    // 5b. Execute --validate-assets headlessly without requiring a GPU / OpenGL 2.0 WGL context.
+    if (config.validateAssetsOnly) {
+        const bool ok = app.executeHeadlessAssetValidation();
+        const int valExit = ok ? EXIT_SUCCESS : EXIT_FAILURE;
+        app.shutdown();
+        gclient::diagnostics::CrashAndTelemetry::log(
+            gclient::diagnostics::LogLevel::Info,
+            "Main",
+            "Headless --validate-assets completed with exit code %d",
+            valExit);
+        gclient::diagnostics::CrashAndTelemetry::shutdown();
+        releaseProfileSlotLock();
+        return valExit;
+    }
 
     // 6. Create Cocos2d-x Win32 EGL view, verify WGL/HWND readiness, attach Win32DesktopBridge, and run.
     cocos2d::CCEGLView* eglView = cocos2d::CCEGLView::sharedOpenGLView();

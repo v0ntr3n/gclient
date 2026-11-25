@@ -48,6 +48,9 @@ public:
     void applicationDidEnterBackground() override;
     void applicationWillEnterForeground() override;
 
+    // Headless CLI --validate-assets entrypoint (runs without requiring an OpenGL 2.0 context)
+    bool executeHeadlessAssetValidation();
+
     // Explicit ordered teardown (safe & idempotent; called by wWinMain prior to telemetry shutdown)
     void shutdown();
 
