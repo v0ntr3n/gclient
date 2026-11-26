@@ -92,6 +92,11 @@ public:
                                               cocos2d::CCTexture2D* texture = nullptr,
                                               cocos2d::CCSpriteFrameCache* cache = nullptr);
 
+    // Removes sprite frames previously registered from a .plistb / .plist path
+    // so AssetManager:removeSpriteFrame / removeArmatureFileInfo cleans up stale frames.
+    static bool RemoveSpriteFramesWithBinary(const std::string& plistPath,
+                                             cocos2d::CCSpriteFrameCache* cache = nullptr);
+
     // Parses an in-memory decrypted .plistb or XML .plist buffer into a
     // Cocos2d-x CCDictionary (for particle / dictionary / sprite-sheet callers).
     static cocos2d::CCDictionary* LoadDictionaryFromBinaryBuffer(const uint8_t* data,

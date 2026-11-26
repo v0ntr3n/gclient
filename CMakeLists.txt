@@ -471,6 +471,8 @@ if(GCLIENT_BUILD_TESTS)
         add_executable(gclient_win32_regression_tests
             tests/test_win32_regression.cpp
             src/assets/BtDecryptHook.cpp
+            src/assets/PlistbLoader.cpp
+            src/assets/XmlbArmatureLoader.cpp
             src/net/LCPacket.cpp
             src/net/CConnection.cpp
             src/net/CNetwork.cpp

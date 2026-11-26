@@ -60,6 +60,8 @@ ATLAS_LIFECYCLE_MARKER = "GCLIENT_ATLAS_LIFECYCLE_GUARD"
 DIRECTOR_LIFECYCLE_MARKER = "GCLIENT_DIRECTOR_LIFECYCLE_GUARD"
 WIN32_ISFILEEXIST_UTF8_MARKER = "GCLIENT_WIN32_ISFILEEXIST_UTF8"
 VS2022_VCXPROJ_MARKER = "GCLIENT_VS2022_V143_MD_MODERNIZED"
+PVR_RGBA8_PREMUL_MARKER = "GCLIENT_PVR_RGBA8_PREMUL_FIX"
+ARMATURE_RENDER_FIX_MARKER = "GCLIENT_ARMATURE_RENDER_FIX"
 
 
 def _mask_cpp_comments_and_strings(src: str) -> str:
@@ -592,12 +594,12 @@ def patch_cpp(path: str) -> None:
             "}\n"
             "}\n"
         )
-        txt = _insert_before_ns_cc_begin(txt, utf8_exist_helper)
         txt = re.sub(
-            r"\bGetFileAttributesA\s*\(",
+            r"(?<!::)\bGetFileAttributesA\s*\(",
             "gclientGetFileAttributesUtf8(",
             txt,
         )
+        txt = _insert_before_ns_cc_begin(txt, utf8_exist_helper)
 
     if txt == orig_txt:
         expected_markers = (
@@ -1406,15 +1408,16 @@ def patch_texture_cache_multi_ext(cocos_root: str) -> None:
             m_end = epilogue_re.search(patched_body)
             if m_end:
                 disguised_rescue = (
-                    "    if (!texture) {\n"
+                    "    if (!texture) { // " + PVR_RGBA8_PREMUL_MARKER + "\n"
                     "        CCTexture2D* gclientDisguised = new CCTexture2D();\n"
-                    "        if (gclientDisguised && gclientDisguised->initWithETCFile(gclientResolved.c_str())) {\n"
-                    "            m_pTextures->setObject(gclientDisguised, gclientOrigKey.c_str());\n"
+                    "        bool gclientOk = gclientDisguised && (gclientDisguised->initWithETCFile(gclientResolved.c_str()) || gclientDisguised->initWithPVRFile(gclientResolved.c_str()));\n"
+                    "        if (!gclientOk && gclientDisguised) { CCImage gImg; if (gImg.initWithImageFile(gclientResolved.c_str())) gclientOk = gclientDisguised->initWithImage(&gImg); }\n"
+                    "        if (gclientOk) {\n"
+                    "            m_pTextures->setObject(gclientDisguised, gclientResolved.c_str());\n"
+                    "            if (gclientOrigKey != gclientResolved) m_pTextures->setObject(gclientDisguised, gclientOrigKey.c_str());\n"
                     "            gclientDisguised->autorelease();\n"
                     "            texture = gclientDisguised;\n"
-                    "        } else {\n"
-                    "            CC_SAFE_RELEASE(gclientDisguised);\n"
-                    "        }\n"
+                    "        } else { CC_SAFE_RELEASE(gclientDisguised); }\n"
                     "    }\n"
                 )
                 patched_body = patched_body[:m_end.start()] + disguised_rescue + patched_body[m_end.start():]
@@ -4721,6 +4724,329 @@ def patch_label_and_atlas_lifecycle_guards(cocos_root: str) -> None:
                 print(f"[ok] Patched win32/CCEGLView.cpp: {egl_win_cpp}")
 
 
+
+PVR_CREATE_GL_TEX_BODY = """{
+    // GCLIENT_PVR_RGBA8_PREMUL_FIX
+    unsigned int width = m_uWidth, height = m_uHeight;
+    GLenum err;
+    if (!m_pPixelFormatInfo || m_uNumberOfMipmaps == 0 || width == 0 || height == 0) return false;
+    if (m_uName != 0) { ccGLDeleteTexture(m_uName); m_uName = 0; }
+    glGenTextures(1, &m_uName);
+    ccGLBindTexture2D(m_uName);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, m_uNumberOfMipmaps == 1 ? GL_LINEAR : GL_LINEAR_MIPMAP_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    CHECK_GL_ERROR_DEBUG();
+    const GLenum internalFormat = m_pPixelFormatInfo->internalFormat;
+    const GLenum srcFormat = m_pPixelFormatInfo->format;
+    const bool compressed = m_pPixelFormatInfo->compressed;
+    const CCTexture2DPixelFormat ccFmt = m_pPixelFormatInfo->ccPixelFormat;
+    const bool srcAlreadyPremul = m_bForcePremultipliedAlpha ? m_bHasPremultipliedAlpha : true;
+#ifndef GL_RGBA8
+#define GL_RGBA8 0x8058
+#endif
+    for (unsigned int i = 0; i < m_uNumberOfMipmaps; ++i) {
+        if (compressed && !CCConfiguration::sharedConfiguration()->supportsPVRTC()) return false;
+        unsigned char *data = m_asMipmaps[i].address;
+        GLsizei datalen = m_asMipmaps[i].len;
+        if (!data || datalen <= 0) return false;
+        if (compressed) {
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glCompressedTexImage2D(GL_TEXTURE_2D, i, internalFormat, width, height, 0, datalen, data);
+        } else {
+            const size_t pixelCount = (size_t)width * (size_t)height;
+            const size_t srcBytes = (size_t)(m_pPixelFormatInfo->bpp / 8);
+            const size_t availPx = srcBytes > 0 ? ((size_t)datalen / srcBytes) : 0;
+            const size_t copyPx = availPx < pixelCount ? availPx : pixelCount;
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            if (ccFmt == kCCTexture2DPixelFormat_RGBA8888 && srcFormat == GL_RGBA && srcAlreadyPremul && copyPx == pixelCount) {
+                glTexImage2D(GL_TEXTURE_2D, i, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+            } else {
+                unsigned char *rgba8 = (unsigned char *)malloc(pixelCount * 4);
+                if (!rgba8) return false;
+                if (copyPx < pixelCount) memset(rgba8 + copyPx * 4, 0, (pixelCount - copyPx) * 4);
+                for (size_t p = 0; p < copyPx; ++p) {
+                    unsigned int r = 0, g = 0, b = 0, a = 255;
+                    switch (ccFmt) {
+                    case kCCTexture2DPixelFormat_RGBA8888:
+                        if (srcFormat == GL_BGRA) { b = data[p*4]; g = data[p*4+1]; r = data[p*4+2]; a = data[p*4+3]; }
+                        else { r = data[p*4]; g = data[p*4+1]; b = data[p*4+2]; a = data[p*4+3]; }
+                        if (!srcAlreadyPremul) { r = (r*a+127u)/255u; g = (g*a+127u)/255u; b = (b*a+127u)/255u; }
+                        break;
+                    case kCCTexture2DPixelFormat_RGBA4444: {
+                        const unsigned int px = (unsigned int)data[p*2] | ((unsigned int)data[p*2+1] << 8);
+                        r = ((px >> 12) & 0xFu) * 17u; g = ((px >> 8) & 0xFu) * 17u;
+                        b = ((px >> 4) & 0xFu) * 17u;  a = (px & 0xFu) * 17u;
+                        if (!srcAlreadyPremul) { r = (r*a+127u)/255u; g = (g*a+127u)/255u; b = (b*a+127u)/255u; }
+                        break;
+                    }
+                    case kCCTexture2DPixelFormat_RGB5A1: {
+                        const unsigned int px = (unsigned int)data[p*2] | ((unsigned int)data[p*2+1] << 8);
+                        unsigned int r5 = (px >> 11) & 0x1Fu, g5 = (px >> 6) & 0x1Fu, b5 = (px >> 1) & 0x1Fu;
+                        a = (px & 1u) ? 255u : 0u;
+                        r = (r5 << 3) | (r5 >> 2); g = (g5 << 3) | (g5 >> 2); b = (b5 << 3) | (b5 >> 2);
+                        if (!srcAlreadyPremul && a == 0u) r = g = b = 0u;
+                        break;
+                    }
+                    case kCCTexture2DPixelFormat_RGB565: {
+                        const unsigned int px = (unsigned int)data[p*2] | ((unsigned int)data[p*2+1] << 8);
+                        unsigned int r5 = (px >> 11) & 0x1Fu, g6 = (px >> 5) & 0x3Fu, b5 = px & 0x1Fu;
+                        r = (r5 << 3) | (r5 >> 2); g = (g6 << 2) | (g6 >> 4); b = (b5 << 3) | (b5 >> 2); a = 255u;
+                        break;
+                    }
+                    case kCCTexture2DPixelFormat_RGB888:
+                        r = data[p*3]; g = data[p*3+1]; b = data[p*3+2]; a = 255u;
+                        break;
+                    case kCCTexture2DPixelFormat_A8:
+                        a = data[p]; r = g = b = a;
+                        break;
+                    case kCCTexture2DPixelFormat_I8:
+                        r = g = b = data[p]; a = 255u;
+                        break;
+                    case kCCTexture2DPixelFormat_AI88:
+                        r = data[p*2]; a = data[p*2+1];
+                        if (!srcAlreadyPremul) r = (r*a+127u)/255u;
+                        g = b = r;
+                        break;
+                    default: break;
+                    }
+                    rgba8[p*4] = (unsigned char)r; rgba8[p*4+1] = (unsigned char)g;
+                    rgba8[p*4+2] = (unsigned char)b; rgba8[p*4+3] = (unsigned char)a;
+                }
+                glTexImage2D(GL_TEXTURE_2D, i, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba8);
+                free(rgba8);
+            }
+        }
+        err = glGetError();
+        if (err != GL_NO_ERROR) return false;
+        width = MAX(width >> 1, 1); height = MAX(height >> 1, 1);
+    }
+    if (!compressed) {
+        m_eFormat = kCCTexture2DPixelFormat_RGBA8888;
+        m_bForcePremultipliedAlpha = true;
+        m_bHasAlpha = (ccFmt == kCCTexture2DPixelFormat_A8 || ccFmt == kCCTexture2DPixelFormat_AI88 || m_pPixelFormatInfo->alpha);
+        m_bHasPremultipliedAlpha = m_bHasAlpha;
+    }
+    return true;
+}"""
+
+CCSKIN_SET_TEXCOORDS_IMPL = """
+// GCLIENT_ARMATURE_RENDER_FIX: half-texel UV clamping strictly on untrimmed sub-rect cut edges
+void CCSkin::setTextureCoords(CCRect rect)
+{
+    CCSprite::setTextureCoords(rect);
+    CCTexture2D *tex = m_pobBatchNode ? m_pobTextureAtlas->getTexture() : m_pobTexture;
+    if (!tex) return;
+    const float atlasWidth = (float)tex->getPixelsWide(), atlasHeight = (float)tex->getPixelsHigh();
+    if (atlasWidth <= 0.0f || atlasHeight <= 0.0f) return;
+    const float scale = CC_CONTENT_SCALE_FACTOR();
+    const CCRect rectPx = CC_RECT_POINTS_TO_PIXELS(rect);
+    const float spanU = m_bRectRotated ? rectPx.size.height : rectPx.size.width;
+    const float spanV = m_bRectRotated ? rectPx.size.width : rectPx.size.height;
+    const bool isSubRect = (rectPx.origin.x > 0.0f) || (rectPx.origin.y > 0.0f) ||
+                           (spanU < atlasWidth - 0.5f) || (spanV < atlasHeight - 0.5f);
+    if (!isSubRect) return;
+    const float trimLeftPx = (m_obUnflippedOffsetPositionFromCenter.x + (m_obContentSize.width - m_obRect.size.width) * 0.5f) * scale;
+    const float trimBottomPx = (m_obUnflippedOffsetPositionFromCenter.y + (m_obContentSize.height - m_obRect.size.height) * 0.5f) * scale;
+    const float trimRightPx = (m_obContentSize.width - m_obRect.size.width) * scale - trimLeftPx;
+    const float trimTopPx = (m_obContentSize.height - m_obRect.size.height) * scale - trimBottomPx;
+    float left = rectPx.origin.x / atlasWidth, right = (rectPx.origin.x + spanU) / atlasWidth;
+    float top = rectPx.origin.y / atlasHeight, bottom = (rectPx.origin.y + spanV) / atlasHeight;
+    const float halfU = 0.5f / atlasWidth, halfV = 0.5f / atlasHeight;
+    if (m_bRectRotated) {
+        if (spanU >= 2.0f) { if (trimBottomPx <= 0.5f) left += halfU; if (trimTopPx <= 0.5f) right -= halfU; }
+        if (spanV >= 2.0f) { if (trimLeftPx <= 0.5f) top += halfV; if (trimRightPx <= 0.5f) bottom -= halfV; }
+        if (m_bFlipX) { CC_SWAP(top, bottom, float); }
+        if (m_bFlipY) { CC_SWAP(left, right, float); }
+        m_sQuad.bl.texCoords.u = left;  m_sQuad.bl.texCoords.v = top;
+        m_sQuad.br.texCoords.u = left;  m_sQuad.br.texCoords.v = bottom;
+        m_sQuad.tl.texCoords.u = right; m_sQuad.tl.texCoords.v = top;
+        m_sQuad.tr.texCoords.u = right; m_sQuad.tr.texCoords.v = bottom;
+    } else {
+        if (spanU >= 2.0f) { if (trimLeftPx <= 0.5f) left += halfU; if (trimRightPx <= 0.5f) right -= halfU; }
+        if (spanV >= 2.0f) { if (trimTopPx <= 0.5f) top += halfV; if (trimBottomPx <= 0.5f) bottom -= halfV; }
+        if (m_bFlipX) { CC_SWAP(left, right, float); }
+        if (m_bFlipY) { CC_SWAP(top, bottom, float); }
+        m_sQuad.bl.texCoords.u = left;  m_sQuad.bl.texCoords.v = bottom;
+        m_sQuad.br.texCoords.u = right; m_sQuad.br.texCoords.v = bottom;
+        m_sQuad.tl.texCoords.u = left;  m_sQuad.tl.texCoords.v = top;
+        m_sQuad.tr.texCoords.u = right; m_sQuad.tr.texCoords.v = top;
+    }
+}
+
+"""
+
+
+def patch_pvr_and_armature_rendering(cocos_root: str) -> None:
+    tex2d_cpp = os.path.join(cocos_root, "cocos2dx", "textures", "CCTexture2D.cpp")
+    if os.path.exists(tex2d_cpp):
+        t2d = _read_text_closed(tex2d_cpp)
+        if PVR_RGBA8_PREMUL_MARKER not in t2d:
+            orig = t2d
+            t2d = re.sub(
+                r"static\s+bool\s+PVRHaveAlphaPremultiplied_\s*=\s*false\s*;",
+                f"static bool PVRHaveAlphaPremultiplied_ = true; // {PVR_RGBA8_PREMUL_MARKER}",
+                t2d, count=1,
+            )
+            t2d = re.sub(
+                r"m_bHasPremultipliedAlpha\s*=\s*PVRHaveAlphaPremultiplied_\s*;",
+                "m_bHasPremultipliedAlpha = pvr->isForcePremultipliedAlpha() ? pvr->hasPremultipliedAlpha() "
+                f": (pvr->hasAlpha() ? PVRHaveAlphaPremultiplied_ : false); // {PVR_RGBA8_PREMUL_MARKER}",
+                t2d, count=1,
+            )
+            if t2d != orig:
+                _write_text_closed(tex2d_cpp, t2d)
+                print(f"[ok] Patched PVR premultiplied-alpha in CCTexture2D.cpp: {tex2d_cpp}")
+
+    pvr_cpp = os.path.join(cocos_root, "cocos2dx", "textures", "CCTexturePVR.cpp")
+    if os.path.exists(pvr_cpp):
+        pvr = _read_text_closed(pvr_cpp)
+        if PVR_RGBA8_PREMUL_MARKER not in pvr:
+            orig = pvr
+            if "<stdlib.h>" not in pvr and "<cstdlib>" not in pvr:
+                pvr = _insert_before_ns_cc_begin(pvr, "#include <stdlib.h>\n#include <string.h>")
+            elif "<string.h>" not in pvr and "<cstring>" not in pvr:
+                pvr = _insert_before_ns_cc_begin(pvr, "#include <string.h>")
+            pvr = pvr.replace(
+                "#define kPVR3TexturePixelFormat_LA_88      0x000008080000616cULL",
+                "#define kPVR3TexturePixelFormat_LA_88      0x000008080000616cULL\n"
+                f"#define kPVR3TexturePixelFormat_R_8        0x0000000800000072ULL // {PVR_RGBA8_PREMUL_MARKER}\n"
+                "#define kPVR3TexturePixelFormat_RG_88      0x0000080800006772ULL", 1,
+            )
+            pvr = re.sub(
+                r"(\{\s*kPVR3TexturePixelFormat_LA_88\s*,\s*&PVRTableFormats\[8\]\s*\}\s*,)",
+                r"\1" + "\n\t{kPVR3TexturePixelFormat_R_8,\t\t&PVRTableFormats[7] },\n\t{kPVR3TexturePixelFormat_RG_88,\t\t&PVRTableFormats[8] },",
+                pvr, count=1,
+            )
+            pvr = re.sub(
+                r"if\s*\(\s*!\s*CCConfiguration::sharedConfiguration\(\)->supportsPVRTC\(\)\s*\)\s*\{\s*pvr3TableElements\s*=\s*9\s*;\s*\}",
+                "const bool gclientSupportsPVRTC = CCConfiguration::sharedConfiguration()->supportsPVRTC();",
+                pvr, count=1,
+            )
+            pvr = pvr.replace(
+                "if( v3_pixel_formathash[i].pixelFormat == pixelFormat )",
+                "if (v3_pixel_formathash[i].pixelFormatInfo->compressed && !gclientSupportsPVRTC) continue;\n"
+                "\t\tif( v3_pixel_formathash[i].pixelFormat == pixelFormat )", 1,
+            )
+            cgt_spans = _find_method_body_spans(pvr, "CCTexturePVR::createGLTexture")
+            if cgt_spans:
+                b_start, b_end = cgt_spans[-1]
+                pvr = pvr[:b_start] + PVR_CREATE_GL_TEX_BODY + pvr[b_end:]
+            if pvr != orig:
+                _write_text_closed(pvr_cpp, pvr)
+                print(f"[ok] Patched desktop GL RGBA8 & premul PVR conversion in CCTexturePVR.cpp: {pvr_cpp}")
+
+    arm_root = os.path.join(cocos_root, "extensions", "CocoStudio", "Armature")
+    bone_cpp = os.path.join(arm_root, "CCBone.cpp")
+    if os.path.exists(bone_cpp):
+        btxt = _read_text_closed(bone_cpp)
+        if ARMATURE_RENDER_FIX_MARKER not in btxt:
+            orig = btxt
+            for b_start, b_end in reversed(_find_method_body_spans(btxt, "CCBone::updateColor")):
+                new_uc = (
+                    "{\n"
+                    f"    // {ARMATURE_RENDER_FIX_MARKER}\n"
+                    "    if (!m_pDisplayManager || !m_pTweenData) return;\n"
+                    "    CCNode *display = m_pDisplayManager->getDisplayRenderNode();\n"
+                    "    CCRGBAProtocol *protocol = dynamic_cast<CCRGBAProtocol *>(display);\n"
+                    "    if (protocol != NULL) {\n"
+                    "        int r = ((int)_displayedColor.r * m_pTweenData->r) / 255;\n"
+                    "        int g = ((int)_displayedColor.g * m_pTweenData->g) / 255;\n"
+                    "        int b = ((int)_displayedColor.b * m_pTweenData->b) / 255;\n"
+                    "        int a = ((int)_displayedOpacity * m_pTweenData->a) / 255;\n"
+                    "        if (r < 0) r = 0; else if (r > 255) r = 255;\n"
+                    "        if (g < 0) g = 0; else if (g > 255) g = 255;\n"
+                    "        if (b < 0) b = 0; else if (b > 255) b = 255;\n"
+                    "        if (a < 0) a = 0; else if (a > 255) a = 255;\n"
+                    "        protocol->setColor(ccc3((GLubyte)r, (GLubyte)g, (GLubyte)b));\n"
+                    "        protocol->setOpacity((GLubyte)a);\n"
+                    "    }\n}"
+                )
+                btxt = btxt[:b_start] + new_uc + btxt[b_end:]
+            if btxt != orig:
+                _write_text_closed(bone_cpp, btxt)
+                print(f"[ok] Patched CCBone::updateColor [0, 255] clamping in CCBone.cpp: {bone_cpp}")
+
+    skin_h = os.path.join(arm_root, "display", "CCSkin.h")
+    if os.path.exists(skin_h):
+        shtxt = _read_text_closed(skin_h)
+        if ARMATURE_RENDER_FIX_MARKER not in shtxt and "protected:" in shtxt:
+            shtxt = shtxt.replace(
+                "protected:",
+                f"protected:\n    virtual void setTextureCoords(CCRect rect); // {ARMATURE_RENDER_FIX_MARKER}", 1,
+            )
+            _write_text_closed(skin_h, shtxt)
+            print(f"[ok] Patched CCSkin.h setTextureCoords override: {skin_h}")
+
+    skin_cpp = os.path.join(arm_root, "display", "CCSkin.cpp")
+    if os.path.exists(skin_cpp):
+        sctxt = _read_text_closed(skin_cpp)
+        if ARMATURE_RENDER_FIX_MARKER not in sctxt and "NS_CC_EXT_END" in sctxt:
+            idx_end = sctxt.rfind("NS_CC_EXT_END")
+            sctxt = sctxt[:idx_end] + CCSKIN_SET_TEXCOORDS_IMPL + sctxt[idx_end:]
+            _write_text_closed(skin_cpp, sctxt)
+            print(f"[ok] Patched CCSkin::setTextureCoords seam clamping in CCSkin.cpp: {skin_cpp}")
+
+    arm_cpp = os.path.join(arm_root, "CCArmature.cpp")
+    if os.path.exists(arm_cpp):
+        atxt = _read_text_closed(arm_cpp).replace("\r\n", "\n")
+        if ARMATURE_RENDER_FIX_MARKER not in atxt:
+            orig = atxt
+            atxt, n_spr = re.subn(
+                r"                CCTextureAtlas \*textureAtlas = skin->getTextureAtlas\(\);\n"
+                r"(?:                if \(!textureAtlas(?: \|\| !textureAtlas->getTexture\(\))?\) continue;(?: /\* [^*]+ \*/)?\n)?"
+                r"\n?                ccBlendFunc func = bone->getBlendFunc\(\);\n"
+                r"                bool blendDirty = func\.src != CC_BLEND_SRC \|\| func\.dst != CC_BLEND_DST;",
+                f"                // {ARMATURE_RENDER_FIX_MARKER}\n"
+                "                CCTextureAtlas *textureAtlas = skin->getTextureAtlas();\n"
+                f"                if (!textureAtlas || !textureAtlas->getTexture()) continue; /* {ARMATURE_GUARD_MARKER} */\n"
+                "                ccBlendFunc func = bone->getBlendFunc();\n"
+                "                if (func.dst == GL_ONE && (func.src == GL_ONE || func.src == GL_SRC_ALPHA)) {\n"
+                "                    func.src = skin->isOpacityModifyRGB() ? GL_ONE : GL_SRC_ALPHA;\n"
+                "                }\n"
+                "                bool blendDirty = func.src != m_sBlendFunc.src || func.dst != m_sBlendFunc.dst;",
+                atxt,
+                count=1,
+            )
+            if n_spr != 1:
+                raise RuntimeError(f"Fail-closed: CCArmature::draw CS_DISPLAY_SPRITE anchor drifted in {arm_cpp}")
+            atxt = atxt.replace(
+                "                CCArmature *armature = (CCArmature *)(node);\n\n"
+                "                CCTextureAtlas *textureAtlas = armature->getTextureAtlas();\n"
+                "                if(m_pAtlas != textureAtlas)\n"
+                "                {\n"
+                "                    if (m_pAtlas)\n"
+                "                    {\n"
+                "                        m_pAtlas->drawQuads();\n"
+                "                        m_pAtlas->removeAllQuads();\n"
+                "                    }\n"
+                "                }\n"
+                "                armature->draw();\n\n"
+                "                m_pAtlas = armature->getTextureAtlas();",
+                "                CCArmature *armature = (CCArmature *)(node);\n"
+                "                CCTextureAtlas *textureAtlas = armature->getTextureAtlas();\n"
+                "                ccBlendFunc childFunc = bone->getBlendFunc();\n"
+                "                bool childBlendDirty = childFunc.src != m_sBlendFunc.src || childFunc.dst != m_sBlendFunc.dst;\n"
+                "                if (m_pAtlas != textureAtlas || childBlendDirty) {\n"
+                "                    if (m_pAtlas) { m_pAtlas->drawQuads(); m_pAtlas->removeAllQuads(); }\n"
+                "                }\n"
+                "                ccBlendFunc prevChildBlend = armature->getBlendFunc();\n"
+                "                if (childBlendDirty) armature->setBlendFunc(childFunc);\n"
+                "                armature->draw();\n"
+                "                m_pAtlas = armature->getTextureAtlas();\n"
+                "                if (childBlendDirty) {\n"
+                "                    if (m_pAtlas) { m_pAtlas->drawQuads(); m_pAtlas->removeAllQuads(); }\n"
+                "                    armature->setBlendFunc(prevChildBlend);\n"
+                "                    ccGLBlendFunc(m_sBlendFunc.src, m_sBlendFunc.dst);\n"
+                "                }",
+                1,
+            )
+            if atxt != orig:
+                _write_text_closed(arm_cpp, atxt)
+                print(f"[ok] Patched CCArmature::draw premul-aware additive & child-armature blend: {arm_cpp}")
+
+
 def patch_vs2022_vcxproj_and_vcpkg(cocos_root: str, vcpkg_installed_dir: str = "") -> None:
     """
     Modernize stock Cocos2d-x 2.2.6 Win32 .vcxproj files for Visual Studio 2022 (v143, /MD, /Zi PDB),
@@ -5086,6 +5412,7 @@ def main(argv: list[str] | None = None) -> int:
         patch_audio_win32(cocos_root)
         patch_null_texture_guards(cocos_root)
         patch_label_and_atlas_lifecycle_guards(cocos_root)
+        patch_pvr_and_armature_rendering(cocos_root)
         patch_vs2022_vcxproj_and_vcpkg(cocos_root, vcpkg_dir)
     except RuntimeError as exc:
         print(f"[error] {exc}", file=sys.stderr)

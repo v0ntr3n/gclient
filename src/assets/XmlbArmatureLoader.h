@@ -35,8 +35,38 @@ struct XmlbBitCacheLayout {
     size_t textureDataStructSize      = 68;
 };
 
+struct XmlbDecodedMovementHeader {
+    std::string name;
+    int32_t     duration      = 0;
+    int32_t     durationTo    = 0;
+    int32_t     durationTween = 0;
+    bool        loop          = false;
+    int32_t     tweenEasing   = 0;
+    uint16_t    movBoneCount  = 0;
+};
+
+struct XmlbDecodedFrameRecord {
+    float       x = 0.0f, y = 0.0f, scaleX = 1.0f, scaleY = 1.0f;
+    float       skewX = 0.0f, skewY = 0.0f, tweenRotate = 0.0f;
+    int32_t     duration = 0, zOrder = 0, tweenEasing = 0, displayIndex = 0;
+    uint8_t     a = 255, r = 255, g = 255, b = 255, rawBlendType = 0;
+    bool        isUseColorInfo = false, isTween = true;
+    uint32_t    blendSrc = 0x0001u, blendDst = 0x0303u;
+    std::string strEvent, strMovement;
+};
+
 class XmlbArmatureLoader {
 public:
+    static uint8_t ClampColorChannel(int32_t value);
+    static int32_t DecodeBitCacheTweenEasing(int8_t rawEasing);
+    static void MapBlendTypeToGL(uint8_t rawBlend, uint32_t* outSrc, uint32_t* outDst);
+    static bool DecodeBitCacheMovementHeader(const uint8_t* movHdr, size_t availBytes,
+                                             XmlbDecodedMovementHeader* outMov,
+                                             const XmlbBitCacheLayout& layout = XmlbBitCacheLayout());
+    static bool DecodeBitCacheFrameRecord(const uint8_t* fr, size_t availBytes,
+                                          bool* ioHasStickyBlend, uint32_t* ioStickyBlendSrc,
+                                          uint32_t* ioStickyBlendDst, XmlbDecodedFrameRecord* outFrame,
+                                          const XmlbBitCacheLayout& layout = XmlbBitCacheLayout());
     // Loads and decrypts an .xmlb file, auto-discovers sibling .plistb/.plist
     // sheets (including numbered <stem>0.plistb .. <stem>9.plistb), parses
     // ArmatureRoot protobuf (falling back to validated BitCache binary layout if
@@ -117,7 +147,8 @@ public:
                                     bool asyncLock = false,
                                     const XmlbBitCacheLayout& layout = XmlbBitCacheLayout(),
                                     const std::string& plistPath = "",
-                                    const std::string& imagePath = "");
+                                    const std::string& imagePath = "",
+                                    const std::string& baseFilePath = "");
 
 private:
     static bool AddDataFromXmlbFileImpl(const std::string& imagePath,
