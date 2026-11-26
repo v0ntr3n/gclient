@@ -792,12 +792,12 @@ int WINAPI wWinMain(
     }
 
     eglView->setViewName("Game Client");
-    eglView->setFrameSize(
-        static_cast<float>(config.windowWidth),
-        static_cast<float>(config.windowHeight));
 #ifdef _WIN32
     gclient::ui::Win32DesktopBridge::instance().attachToWindow(eglView->getHWnd());
 #endif
+    eglView->setFrameSize(
+        static_cast<float>(config.windowWidth),
+        static_cast<float>(config.windowHeight));
 
     int exitCode = cocos2d::CCApplication::sharedApplication()->run();
 

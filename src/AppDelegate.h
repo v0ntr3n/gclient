@@ -70,6 +70,7 @@ public:
         return m_pendingBackground.load(std::memory_order_acquire);
     }
 
+    static bool hasActiveInstance() noexcept;
     static bool isLifecycleReady() noexcept;
 
     bool assetValidationSucceeded() const noexcept { return m_assetValidationOk; }

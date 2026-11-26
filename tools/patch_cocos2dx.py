@@ -60,6 +60,8 @@ ATLAS_LIFECYCLE_MARKER = "GCLIENT_ATLAS_LIFECYCLE_GUARD"
 DIRECTOR_LIFECYCLE_MARKER = "GCLIENT_DIRECTOR_LIFECYCLE_GUARD"
 WIN32_ISFILEEXIST_UTF8_MARKER = "GCLIENT_WIN32_ISFILEEXIST_UTF8"
 VS2022_VCXPROJ_MARKER = "GCLIENT_VS2022_V143_MD_MODERNIZED"
+UILAYOUT_ADDCHILD_MARKER = "GCLIENT_UILAYOUT_ADDCHILD_GUARD"
+WIN32_MOUSE_ROUTING_MARKER = "GCLIENT_WIN32_MOUSE_ROUTING_GUARD"
 
 
 def _mask_cpp_comments_and_strings(src: str) -> str:
@@ -574,30 +576,40 @@ def patch_cpp(path: str) -> None:
             patched_body = _inject_after_open_brace(body, "GClientFileUtilsLockGuard _gclientLock; (void)_gclientLock; // " + THREADSAFE_MARKER)
             txt = txt[:b_start] + patched_body + txt[b_end:]
 
-    if not is_base_fileutils and WIN32_ISFILEEXIST_UTF8_MARKER not in txt:
-        utf8_exist_helper = (
-            "// " + WIN32_ISFILEEXIST_UTF8_MARKER + "\n"
-            "namespace {\n"
-            "static DWORD gclientGetFileAttributesUtf8(const char* pPath) {\n"
-            "    if (!pPath || !pPath[0]) return INVALID_FILE_ATTRIBUTES;\n"
-            "    int wlen = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pPath, -1, NULL, 0);\n"
-            "    if (wlen > 0) {\n"
-            "        std::wstring wide((size_t)wlen, L'\\0');\n"
-            "        if (::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pPath, -1, &wide[0], wlen) > 0) {\n"
-            "            DWORD attr = ::GetFileAttributesW(wide.c_str());\n"
-            "            if (attr != INVALID_FILE_ATTRIBUTES) return attr;\n"
-            "        }\n"
-            "    }\n"
-            "    return ::GetFileAttributesA(pPath);\n"
-            "}\n"
-            "}\n"
-        )
-        txt = _insert_before_ns_cc_begin(txt, utf8_exist_helper)
+    if not is_base_fileutils:
+        # Self-heal any previously patched CCFileUtilsWin32.cpp where ::GetFileAttributesA
+        # inside gclientGetFileAttributesUtf8 was rewritten into infinite tail-recursion.
         txt = re.sub(
-            r"\bGetFileAttributesA\s*\(",
-            "gclientGetFileAttributesUtf8(",
+            r"::\s*gclientGetFileAttributesUtf8\s*\(",
+            "::GetFileAttributesA(",
             txt,
         )
+        if WIN32_ISFILEEXIST_UTF8_MARKER not in txt:
+            utf8_exist_helper = (
+                "// " + WIN32_ISFILEEXIST_UTF8_MARKER + "\n"
+                "namespace {\n"
+                "static DWORD gclientGetFileAttributesUtf8(const char* pPath) {\n"
+                "    if (!pPath || !pPath[0]) return INVALID_FILE_ATTRIBUTES;\n"
+                "    int wlen = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pPath, -1, NULL, 0);\n"
+                "    if (wlen > 0) {\n"
+                "        std::wstring wide((size_t)wlen, L'\\0');\n"
+                "        if (::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pPath, -1, &wide[0], wlen) > 0) {\n"
+                "            DWORD attr = ::GetFileAttributesW(wide.c_str());\n"
+                "            if (attr != INVALID_FILE_ATTRIBUTES) return attr;\n"
+                "        }\n"
+                "    }\n"
+                "    return ::GetFileAttributesA(pPath);\n"
+                "}\n"
+                "}\n"
+            )
+            # Rewrite unqualified call sites BEFORE injecting utf8_exist_helper (and exclude ::GetFileAttributesA)
+            # so ::GetFileAttributesA(pPath) inside gclientGetFileAttributesUtf8 never tail-recurses!
+            txt = re.sub(
+                r"(?<!::)\bGetFileAttributesA\s*\(",
+                "gclientGetFileAttributesUtf8(",
+                txt,
+            )
+            txt = _insert_before_ns_cc_begin(txt, utf8_exist_helper)
 
     if txt == orig_txt:
         expected_markers = (
@@ -2080,7 +2092,7 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
                     new_body = (
                         "{\n"
                         f"    // {UIWIDGET_ADDCHILD_MARKER}\n"
-                        f"    if (!{c_var}) return;\n"
+                        f"    if (!{c_var} || {c_var} == this) return;\n"
                         f"    if (dynamic_cast<Widget*>({c_var}) == NULL)\n"
                         "    {\n"
                         f"        this->addNode({c_var}, {c_var}->getZOrder(), {c_var}->getTag());\n"
@@ -2305,6 +2317,40 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
             print(f"[ok] Patched UIHelper.cpp: {helper_cpp}")
         else:
             print(f"[skip] Already patched UIHelper.cpp: {helper_cpp}")
+
+    # 4. UILayout.cpp: guard Layout::addChild against non-Widget CCNode* before supplyTheLayoutParameterLackToChild
+    layout_cpp = os.path.join(cocos_root, "extensions", "CocoStudio", "GUI", "Layouts", "UILayout.cpp")
+    if os.path.exists(layout_cpp):
+        txt = _read_text_closed(layout_cpp)
+        orig_txt = txt
+        if UILAYOUT_ADDCHILD_MARKER not in txt:
+            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Layout::addChild")):
+                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+                if len(params) == 3:
+                    c_var = _extract_param_ident(params[0], "child")
+                    z_var = _extract_param_ident(params[1], "zOrder")
+                    t_var = _extract_param_ident(params[2], "tag")
+                    new_lbody = (
+                        "{\n"
+                        f"    // {UILAYOUT_ADDCHILD_MARKER}\n"
+                        f"    if (!{c_var}) return;\n"
+                        f"    Widget* _gclientWidgetChild = dynamic_cast<Widget*>({c_var});\n"
+                        "    if (!_gclientWidgetChild)\n"
+                        "    {\n"
+                        f"        this->addNode({c_var}, {z_var}, {t_var});\n"
+                        "        return;\n"
+                        "    }\n"
+                        "    supplyTheLayoutParameterLackToChild(_gclientWidgetChild);\n"
+                        f"    Widget::addChild({c_var}, {z_var}, {t_var});\n"
+                        "    _doLayoutDirty = true;\n"
+                        "}"
+                    )
+                    txt = txt[:b_start] + new_lbody + txt[b_end:]
+        if txt != orig_txt:
+            _write_text_closed(layout_cpp, txt)
+            print(f"[ok] Patched UILayout.cpp: {layout_cpp}")
+        else:
+            print(f"[skip] Already patched UILayout.cpp: {layout_cpp}")
 
 
 def patch_spine_atlas_and_cocos2dx(cocos_root: str) -> None:
@@ -4721,6 +4767,313 @@ def patch_label_and_atlas_lifecycle_guards(cocos_root: str) -> None:
                 print(f"[ok] Patched win32/CCEGLView.cpp: {egl_win_cpp}")
 
 
+def patch_win32_mouse_and_viewport(cocos_root: str) -> None:
+    """
+    Fix Win32 native mouse routing, capture-loss recovery, and DPI/monitor-clamped client rect sizing:
+      1. CCEGLViewProtocol.cpp: self-heal stranded touch IDs (e.g. Win32 mouse id=0 after capture loss
+         or Lua exception) in handleTouchesBegin instead of silently dropping all subsequent clicks,
+         and null-guard m_pDelegate dispatches.
+      2. win32/CCEGLView.cpp:
+         - Fix MOUSEEVENTF_FROMTOUCH check (use 0xFFFFFF80 == 0xFF515780 and !::InSendMessage()) so
+           Windows Pen/Stylus/Precision Touchpad (0xFF515700..0xFF51577F) and synchronous SendMessageW
+           clicks are never discarded when RegisterTouchWindow is active.
+         - Fix MK_LBUTTON == wParam exact-equality bug in WM_LBUTTONDOWN and WM_MOUSEMOVE so modifier
+           keys (Ctrl/Shift/RMB) and wParam=0 synthetic SendMessageW clicks are accepted.
+         - Handle WM_CAPTURECHANGED and WM_CANCELMODE (and clear m_bCaptured before ReleaseCapture in
+           WM_LBUTTONUP) so losing mouse capture mid-click cleanly cancels touch id=0.
+         - Fix WM_TOUCH zoom division order (divide by m_fFrameZoomFactor before m_obViewPortRect test).
+         - Fix CCEGLView::resize to use AdjustWindowRectExForDpi / AdjustWindowRectEx and fix
+           CCEGLView::setFrameSize to apply m_fFrameZoomFactor and sync m_obScreenSize to actual
+           GetClientRect(m_hWnd) when Windows clamps outer window dimensions to monitor bounds.
+    """
+    egl_proto_cpp = os.path.join(cocos_root, "cocos2dx", "platform", "CCEGLViewProtocol.cpp")
+    if os.path.exists(egl_proto_cpp):
+        txt = _read_text_closed(egl_proto_cpp).replace("\r\n", "\n")
+        orig = txt
+        if WIN32_MOUSE_ROUTING_MARKER not in txt and "CCEGLViewProtocol::handleTouchesBegin" in txt:
+            stale_touch_anchor = "CCInteger* pIndex = (CCInteger*)s_TouchesIntergerDict.objectForKey(id);"
+            stale_touch_fix = (
+                f"CCInteger* pIndex = (CCInteger*)s_TouchesIntergerDict.objectForKey(id); // {WIN32_MOUSE_ROUTING_MARKER}\n"
+                "        if (pIndex != NULL)\n"
+                "        {\n"
+                "            int staleIdx = pIndex->getValue();\n"
+                "            if (staleIdx >= 0 && staleIdx < CC_MAX_TOUCHES && s_pTouches[staleIdx] != NULL)\n"
+                "            {\n"
+                "                if (m_pDelegate != NULL)\n"
+                "                {\n"
+                "                    CCSet cancelSet;\n"
+                "                    cancelSet.addObject(s_pTouches[staleIdx]);\n"
+                "                    m_pDelegate->touchesCancelled(&cancelSet, NULL);\n"
+                "                }\n"
+                "                s_pTouches[staleIdx]->release();\n"
+                "                s_pTouches[staleIdx] = NULL;\n"
+                "                removeUsedIndexBit(staleIdx);\n"
+                "            }\n"
+                "            s_TouchesIntergerDict.removeObjectForKey(id);\n"
+                "            pIndex = NULL;\n"
+                "        }"
+            )
+            if stale_touch_anchor in txt:
+                txt = txt.replace(stale_touch_anchor, stale_touch_fix, 1)
+
+            for call_stmt in (
+                "m_pDelegate->touchesBegan(&set, NULL);",
+                "m_pDelegate->touchesMoved(&set, NULL);",
+                "m_pDelegate->touchesEnded(&set, NULL);",
+                "m_pDelegate->touchesCancelled(&set, NULL);",
+            ):
+                txt = txt.replace(f"    {call_stmt}", f"    if (m_pDelegate != NULL) {{ {call_stmt} }}")
+
+            if txt != orig:
+                _write_text_closed(egl_proto_cpp, txt)
+                print(f"[ok] Patched CCEGLViewProtocol.cpp mouse/touch recovery: {egl_proto_cpp}")
+
+    egl_win_cpp = os.path.join(cocos_root, "cocos2dx", "platform", "win32", "CCEGLView.cpp")
+    if os.path.exists(egl_win_cpp):
+        txt = _read_text_closed(egl_win_cpp).replace("\r\n", "\n")
+        orig = txt
+        if WIN32_MOUSE_ROUTING_MARKER not in txt:
+            # 1. Fix MOUSEEVENTF_FROMTOUCH false-positive pen/touchpad/SendMessageW drop
+            txt = txt.replace(
+                "if (m_bSupportTouch && (s_pfGetMessageExtraInfoFunction() & MOUSEEVENTF_FROMTOUCH) == MOUSEEVENTF_FROMTOUCH) break;",
+                f"if (m_bSupportTouch && !::InSendMessage() && s_pfGetMessageExtraInfoFunction != NULL && ((s_pfGetMessageExtraInfoFunction() & 0xFFFFFF80u) == 0xFF515780u)) break; // {WIN32_MOUSE_ROUTING_MARKER}",
+            )
+
+            # 2. Fix WM_LBUTTONDOWN exact wParam equality & zero-zoom guard
+            old_lbuttondown = (
+                "        if (m_pDelegate && MK_LBUTTON == wParam)\n"
+                "        {\n"
+                "            POINT point = {(short)LOWORD(lParam), (short)HIWORD(lParam)};\n"
+                "            CCPoint pt(point.x, point.y);\n"
+                "            pt.x /= m_fFrameZoomFactor;\n"
+                "            pt.y /= m_fFrameZoomFactor;"
+            )
+            new_lbuttondown = (
+                f"        if (m_pDelegate != NULL) // {WIN32_MOUSE_ROUTING_MARKER}\n"
+                "        {\n"
+                "            POINT point = {(short)LOWORD(lParam), (short)HIWORD(lParam)};\n"
+                "            CCPoint pt((float)point.x, (float)point.y);\n"
+                "            const float zoom = (m_fFrameZoomFactor > 0.0f) ? m_fFrameZoomFactor : 1.0f;\n"
+                "            pt.x /= zoom;\n"
+                "            pt.y /= zoom;"
+            )
+            if old_lbuttondown in txt:
+                txt = txt.replace(old_lbuttondown, new_lbuttondown, 1)
+
+            # 3. Fix WM_MOUSEMOVE exact wParam equality & zero-zoom guard
+            old_mousemove = (
+                "        if (MK_LBUTTON == wParam && m_bCaptured)\n"
+                "        {\n"
+                "            POINT point = {(short)LOWORD(lParam), (short)HIWORD(lParam)};\n"
+                "            CCPoint pt(point.x, point.y);\n"
+                "            int id = 0;\n"
+                "            pt.x /= m_fFrameZoomFactor;\n"
+                "            pt.y /= m_fFrameZoomFactor;\n"
+                "            handleTouchesMove(1, &id, &pt.x, &pt.y);\n"
+                "        }"
+            )
+            new_mousemove = (
+                f"        if (m_pDelegate != NULL && m_bCaptured && ((wParam & MK_LBUTTON) != 0)) // {WIN32_MOUSE_ROUTING_MARKER}\n"
+                "        {\n"
+                "            POINT point = {(short)LOWORD(lParam), (short)HIWORD(lParam)};\n"
+                "            CCPoint pt((float)point.x, (float)point.y);\n"
+                "            int id = 0;\n"
+                "            const float zoom = (m_fFrameZoomFactor > 0.0f) ? m_fFrameZoomFactor : 1.0f;\n"
+                "            pt.x /= zoom;\n"
+                "            pt.y /= zoom;\n"
+                "            handleTouchesMove(1, &id, &pt.x, &pt.y);\n"
+                "        }"
+            )
+            if old_mousemove in txt:
+                txt = txt.replace(old_mousemove, new_mousemove, 1)
+
+            # 4. Fix WM_LBUTTONUP capture ordering & add WM_CAPTURECHANGED / WM_CANCELMODE recovery
+            old_lbuttonup = (
+                "        if (m_bCaptured)\n"
+                "        {\n"
+                "            POINT point = {(short)LOWORD(lParam), (short)HIWORD(lParam)};\n"
+                "            CCPoint pt(point.x, point.y);\n"
+                "            int id = 0;\n"
+                "            pt.x /= m_fFrameZoomFactor;\n"
+                "            pt.y /= m_fFrameZoomFactor;\n"
+                "            handleTouchesEnd(1, &id, &pt.x, &pt.y);\n"
+                "\n"
+                "            ReleaseCapture();\n"
+                "            m_bCaptured = false;\n"
+                "        }\n"
+                "        break;"
+            )
+            new_lbuttonup = (
+                "        if (m_bCaptured)\n"
+                "        {\n"
+                f"            m_bCaptured = false; // {WIN32_MOUSE_ROUTING_MARKER}\n"
+                "            POINT point = {(short)LOWORD(lParam), (short)HIWORD(lParam)};\n"
+                "            CCPoint pt((float)point.x, (float)point.y);\n"
+                "            int id = 0;\n"
+                "            const float zoom = (m_fFrameZoomFactor > 0.0f) ? m_fFrameZoomFactor : 1.0f;\n"
+                "            pt.x /= zoom;\n"
+                "            pt.y /= zoom;\n"
+                "            if (m_pDelegate != NULL)\n"
+                "            {\n"
+                "                handleTouchesEnd(1, &id, &pt.x, &pt.y);\n"
+                "            }\n"
+                "            if (::GetCapture() == m_hWnd)\n"
+                "            {\n"
+                "                ::ReleaseCapture();\n"
+                "            }\n"
+                "        }\n"
+                "        break;\n"
+                "\n"
+                "    case WM_CAPTURECHANGED:\n"
+                "        if (m_bCaptured && (HWND)lParam != m_hWnd)\n"
+                "        {\n"
+                "            m_bCaptured = false;\n"
+                "            int id = 0;\n"
+                "            float cx = 0.0f, cy = 0.0f;\n"
+                "            if (m_pDelegate != NULL)\n"
+                "            {\n"
+                "                handleTouchesCancel(1, &id, &cx, &cy);\n"
+                "            }\n"
+                "        }\n"
+                "        break;\n"
+                "\n"
+                "    case WM_CANCELMODE:\n"
+                "        if (m_bCaptured)\n"
+                "        {\n"
+                "            m_bCaptured = false;\n"
+                "            int id = 0;\n"
+                "            float cx = 0.0f, cy = 0.0f;\n"
+                "            if (m_pDelegate != NULL)\n"
+                "            {\n"
+                "                handleTouchesCancel(1, &id, &cx, &cy);\n"
+                "            }\n"
+                "            if (::GetCapture() == m_hWnd)\n"
+                "            {\n"
+                "                ::ReleaseCapture();\n"
+                "            }\n"
+                "        }\n"
+                "        break;"
+            )
+            if old_lbuttonup in txt:
+                txt = txt.replace(old_lbuttonup, new_lbuttonup, 1)
+
+            # 5. Fix WM_TOUCH zoom division order before viewport containment check
+            old_wmtouch = (
+                "                        CCPoint pt(input.x, input.y);\n"
+                "                        CCPoint tmp = ccp(pt.x, m_obScreenSize.height - pt.y);\n"
+                "                        if (m_obViewPortRect.equals(CCRectZero) || m_obViewPortRect.containsPoint(tmp))\n"
+                "                        {\n"
+                "                            pt.x /= m_fFrameZoomFactor;\n"
+                "                            pt.y /= m_fFrameZoomFactor;"
+            )
+            new_wmtouch = (
+                "                        CCPoint pt((float)input.x, (float)input.y);\n"
+                "                        const float zoom = (m_fFrameZoomFactor > 0.0f) ? m_fFrameZoomFactor : 1.0f;\n"
+                "                        pt.x /= zoom;\n"
+                "                        pt.y /= zoom;\n"
+                "                        CCPoint tmp = ccp(pt.x, m_obScreenSize.height - pt.y);\n"
+                "                        if (m_obViewPortRect.equals(CCRectZero) || m_obViewPortRect.containsPoint(tmp))\n"
+                "                        {"
+            )
+            if old_wmtouch in txt:
+                txt = txt.replace(old_wmtouch, new_wmtouch, 1)
+
+            # 6. Fix CCEGLView::resize to use AdjustWindowRectExForDpi / AdjustWindowRectEx output
+            old_resize_tail = (
+                "    AdjustWindowRectEx(&rcClient, GetWindowLong(m_hWnd, GWL_STYLE), FALSE, GetWindowLong(m_hWnd, GWL_EXSTYLE));\n"
+                "\n"
+                "    // change width and height\n"
+                "    SetWindowPos(m_hWnd, 0, 0, 0, width + ptDiff.x, height + ptDiff.y,\n"
+                "                 SWP_NOCOPYBITS | SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER);"
+            )
+            new_resize_tail = (
+                f"    // {WIN32_MOUSE_ROUTING_MARKER}: use DPI-aware AdjustWindowRectExForDpi when available\n"
+                "    (void)ptDiff;\n"
+                "    RECT rcDesired = { 0, 0, width, height };\n"
+                "    const DWORD dwStyle = (DWORD)::GetWindowLongW(m_hWnd, GWL_STYLE);\n"
+                "    const DWORD dwExStyle = (DWORD)::GetWindowLongW(m_hWnd, GWL_EXSTYLE);\n"
+                "    const BOOL bHasMenu = (::GetMenu(m_hWnd) != NULL) ? TRUE : FALSE;\n"
+                "    typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);\n"
+                "    typedef BOOL (WINAPI *AdjustWindowRectExForDpiFn)(LPRECT, DWORD, BOOL, DWORD, UINT);\n"
+                "    HMODULE hUser32 = ::GetModuleHandleW(L\"user32.dll\");\n"
+                "    GetDpiForWindowFn pfnGetDpi = hUser32 ? (GetDpiForWindowFn)::GetProcAddress(hUser32, \"GetDpiForWindow\") : NULL;\n"
+                "    AdjustWindowRectExForDpiFn pfnAdjDpi = hUser32 ? (AdjustWindowRectExForDpiFn)::GetProcAddress(hUser32, \"AdjustWindowRectExForDpi\") : NULL;\n"
+                "    if (pfnGetDpi && pfnAdjDpi)\n"
+                "    {\n"
+                "        const UINT dpi = pfnGetDpi(m_hWnd);\n"
+                "        if (dpi == 0 || !pfnAdjDpi(&rcDesired, dwStyle, bHasMenu, dwExStyle, dpi))\n"
+                "        {\n"
+                "            ::AdjustWindowRectEx(&rcDesired, dwStyle, bHasMenu, dwExStyle);\n"
+                "        }\n"
+                "    }\n"
+                "    else\n"
+                "    {\n"
+                "        ::AdjustWindowRectEx(&rcDesired, dwStyle, bHasMenu, dwExStyle);\n"
+                "    }\n"
+                "    SetWindowPos(m_hWnd, 0, 0, 0, rcDesired.right - rcDesired.left, rcDesired.bottom - rcDesired.top,\n"
+                "                 SWP_NOCOPYBITS | SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER);"
+            )
+            if old_resize_tail in txt:
+                txt = txt.replace(old_resize_tail, new_resize_tail, 1)
+
+            # 7a. Guard CCEGLView::setFrameZoomFactor against zero m_obScreenSize / uninitialized CCDirector
+            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "CCEGLView::setFrameZoomFactor")):
+                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+                if len(params) == 1:
+                    z_var = _extract_param_ident(params[0], "fZoomFactor")
+                    new_sfz = (
+                        "{\n"
+                        f"    // {WIN32_MOUSE_ROUTING_MARKER}\n"
+                        f"    m_fFrameZoomFactor = ({z_var} > 0.0f) ? {z_var} : 1.0f;\n"
+                        "    if (m_obScreenSize.width > 0.0f && m_obScreenSize.height > 0.0f)\n"
+                        "    {\n"
+                        "        resize((int)(m_obScreenSize.width * m_fFrameZoomFactor + 0.5f), (int)(m_obScreenSize.height * m_fFrameZoomFactor + 0.5f));\n"
+                        "        centerWindow();\n"
+                        "    }\n"
+                        "    CCDirector* _gclientDir = CCDirector::sharedDirector();\n"
+                        "    if (_gclientDir && _gclientDir->getOpenGLView() != NULL && _gclientDir->getWinSize().height > 0.0f)\n"
+                        "    {\n"
+                        "        _gclientDir->setProjection(_gclientDir->getProjection());\n"
+                        "    }\n"
+                        "}"
+                    )
+                    txt = txt[:b_start] + new_sfz + txt[b_end:]
+
+            # 7. Fix CCEGLView::setFrameSize to respect m_fFrameZoomFactor and sync actual GetClientRect
+            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "CCEGLView::setFrameSize")):
+                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+                if len(params) == 2:
+                    w_var = _extract_param_ident(params[0], "width")
+                    h_var = _extract_param_ident(params[1], "height")
+                    new_sfs = (
+                        "{\n"
+                        f"    // {WIN32_MOUSE_ROUTING_MARKER}\n"
+                        "    const float zoom = (m_fFrameZoomFactor > 0.0f) ? m_fFrameZoomFactor : 1.0f;\n"
+                        f"    CCEGLViewProtocol::setFrameSize({w_var}, {h_var});\n"
+                        f"    resize((int)({w_var} * zoom + 0.5f), (int)({h_var} * zoom + 0.5f));\n"
+                        "    centerWindow();\n"
+                        "    if (m_hWnd && ::IsWindow(m_hWnd) && !::IsIconic(m_hWnd))\n"
+                        "    {\n"
+                        "        RECT rcActual = { 0, 0, 0, 0 };\n"
+                        "        if (::GetClientRect(m_hWnd, &rcActual))\n"
+                        "        {\n"
+                        "            const int actualW = rcActual.right - rcActual.left;\n"
+                        "            const int actualH = rcActual.bottom - rcActual.top;\n"
+                        "            if (actualW > 0 && actualH > 0)\n"
+                        "            {\n"
+                        "                CCEGLViewProtocol::setFrameSize((float)actualW / zoom, (float)actualH / zoom);\n"
+                        "            }\n"
+                        "        }\n"
+                        "    }\n"
+                        "}"
+                    )
+                    txt = txt[:b_start] + new_sfs + txt[b_end:]
+
+            if txt != orig:
+                _write_text_closed(egl_win_cpp, txt)
+                print(f"[ok] Patched win32/CCEGLView.cpp mouse/viewport routing: {egl_win_cpp}")
+
+
 def patch_vs2022_vcxproj_and_vcpkg(cocos_root: str, vcpkg_installed_dir: str = "") -> None:
     """
     Modernize stock Cocos2d-x 2.2.6 Win32 .vcxproj files for Visual Studio 2022 (v143, /MD, /Zi PDB),
@@ -5086,6 +5439,7 @@ def main(argv: list[str] | None = None) -> int:
         patch_audio_win32(cocos_root)
         patch_null_texture_guards(cocos_root)
         patch_label_and_atlas_lifecycle_guards(cocos_root)
+        patch_win32_mouse_and_viewport(cocos_root)
         patch_vs2022_vcxproj_and_vcpkg(cocos_root, vcpkg_dir)
     except RuntimeError as exc:
         print(f"[error] {exc}", file=sys.stderr)

@@ -1712,7 +1712,7 @@ int main(int argc, char** argv) {
         REQUIRE_TRUE(composedHid > 10000001LL);
 
         auto ca = clientA.callRpc("exchange.composeArm",
-                                  {Amf3Value::makeInt(3100101), Amf3Value::makeInt(1)});
+                                  {Amf3Value::makeInt(3113001), Amf3Value::makeInt(1)});
         REQUIRE_EQ(ca.err, std::string("ok"));
         craftedArmGid = ca.ret.get("gid")->asInt();
         REQUIRE_TRUE(craftedArmGid >= 20001LL);
@@ -1849,14 +1849,14 @@ int main(int argc, char** argv) {
         int64_t trsGid = 0;
         if (const auto* armSub = bag.get("arm")) {
             for (const auto& kv : armSub->fields) {
-                if (kv.second.get("item_template_id")->asInt() == 101101) {
+                if (kv.second.get("item_template_id")->asInt() == 112001) {
                     wpnGid = std::stoll(kv.first);
                 }
             }
         }
         if (const auto* trsSub = bag.get("treasure")) {
             for (const auto& kv : trsSub->fields) {
-                if (kv.second.get("item_template_id")->asInt() == 180101) {
+                if (kv.second.get("item_template_id")->asInt() == 182001) {
                     trsGid = std::stoll(kv.first);
                 }
             }

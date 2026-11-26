@@ -511,6 +511,24 @@ void CCEGLViewProtocol::setDesignResolutionSize(float width, float height, Resol
     }
     m_obDesignResolutionSize.setSize(width, height);
 }
+void CCEGLViewProtocol::handleTouchesBegin(int num, int ids[], float xs[], float ys[])
+{
+    CCSet set;
+    for (int i = 0; i < num; ++i)
+    {
+        int id = ids[i];
+        float x = xs[i];
+        float y = ys[i];
+
+        CCInteger* pIndex = (CCInteger*)s_TouchesIntergerDict.objectForKey(id);
+        int nUnusedIndex = 0;
+        if (pIndex == NULL)
+        {
+            set.addObject(NULL);
+        }
+    }
+    m_pDelegate->touchesBegan(&set, NULL);
+}
 }
 """,
     )
@@ -522,6 +540,51 @@ LRESULT CCEGLView::WindowProc(UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
     {
+    case WM_LBUTTONDOWN:
+        if (m_bSupportTouch && (s_pfGetMessageExtraInfoFunction() & MOUSEEVENTF_FROMTOUCH) == MOUSEEVENTF_FROMTOUCH) break;
+        if (m_pDelegate && MK_LBUTTON == wParam)
+        {
+            POINT point = {(short)LOWORD(lParam), (short)HIWORD(lParam)};
+            CCPoint pt(point.x, point.y);
+            pt.x /= m_fFrameZoomFactor;
+            pt.y /= m_fFrameZoomFactor;
+            CCPoint tmp = ccp(pt.x, m_obScreenSize.height - pt.y);
+            if (m_obViewPortRect.equals(CCRectZero) || m_obViewPortRect.containsPoint(tmp))
+            {
+                m_bCaptured = true;
+                SetCapture(m_hWnd);
+                int id = 0;
+                handleTouchesBegin(1, &id, &pt.x, &pt.y);
+            }
+        }
+        break;
+    case WM_MOUSEMOVE:
+        if (m_bSupportTouch && (s_pfGetMessageExtraInfoFunction() & MOUSEEVENTF_FROMTOUCH) == MOUSEEVENTF_FROMTOUCH) break;
+        if (MK_LBUTTON == wParam && m_bCaptured)
+        {
+            POINT point = {(short)LOWORD(lParam), (short)HIWORD(lParam)};
+            CCPoint pt(point.x, point.y);
+            int id = 0;
+            pt.x /= m_fFrameZoomFactor;
+            pt.y /= m_fFrameZoomFactor;
+            handleTouchesMove(1, &id, &pt.x, &pt.y);
+        }
+        break;
+    case WM_LBUTTONUP:
+        if (m_bSupportTouch && (s_pfGetMessageExtraInfoFunction() & MOUSEEVENTF_FROMTOUCH) == MOUSEEVENTF_FROMTOUCH) break;
+        if (m_bCaptured)
+        {
+            POINT point = {(short)LOWORD(lParam), (short)HIWORD(lParam)};
+            CCPoint pt(point.x, point.y);
+            int id = 0;
+            pt.x /= m_fFrameZoomFactor;
+            pt.y /= m_fFrameZoomFactor;
+            handleTouchesEnd(1, &id, &pt.x, &pt.y);
+
+            ReleaseCapture();
+            m_bCaptured = false;
+        }
+        break;
     case WM_SIZE:
         if (wParam == SIZE_RESTORED)
         {
@@ -535,7 +598,36 @@ LRESULT CCEGLView::WindowProc(UINT message, WPARAM wParam, LPARAM lParam)
     }
     return 0;
 }
+void CCEGLView::resize(int width, int height)
+{
+    POINT ptDiff = {0, 0};
+    RECT rcClient = {0, 0, width, height};
+    AdjustWindowRectEx(&rcClient, GetWindowLong(m_hWnd, GWL_STYLE), FALSE, GetWindowLong(m_hWnd, GWL_EXSTYLE));
+
+    // change width and height
+    SetWindowPos(m_hWnd, 0, 0, 0, width + ptDiff.x, height + ptDiff.y,
+                 SWP_NOCOPYBITS | SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER);
 }
+void CCEGLView::setFrameSize(float width, float height)
+{
+    CCEGLViewProtocol::setFrameSize(width, height);
+    resize(width, height);
+    centerWindow();
+}
+}
+""",
+    )
+    w(
+        "extensions/CocoStudio/GUI/Layouts/UILayout.cpp",
+        """#include "UILayout.h"
+namespace cocos2d { namespace ui {
+void Layout::addChild(CCNode *child, int zOrder, int tag)
+{
+    supplyTheLayoutParameterLackToChild(static_cast<Widget*>(child));
+    Widget::addChild(child, zOrder, tag);
+    _doLayoutDirty = true;
+}
+}}
 """,
     )
     w(
@@ -665,6 +757,69 @@ class TestCocos2dxPatcher(unittest.TestCase):
             )
             rc_drift = patch_cocos2dx.main([str(drifted_root)])
             self.assertNotEqual(rc_drift, 0)
+
+    def test_fileutils_win32_utf8_no_infinite_tail_recursion_and_self_heal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cocos_root = Path(tmp) / "cocos2d-x-2.2.6"
+            create_mock_cocos2dx_226_tree(cocos_root)
+
+            rc = patch_cocos2dx.main([str(cocos_root)])
+            self.assertEqual(rc, 0)
+
+            win_fu = (cocos_root / "cocos2dx/platform/win32/CCFileUtilsWin32.cpp").read_text(encoding="utf-8")
+            self.assertIn("static DWORD gclientGetFileAttributesUtf8(const char* pPath)", win_fu)
+            self.assertIn("return ::GetFileAttributesA(pPath);", win_fu)
+            self.assertIn("return gclientGetFileAttributesUtf8(strPath.c_str())", win_fu)
+            self.assertNotIn("::gclientGetFileAttributesUtf8", win_fu)
+
+            # Simulate legacy corrupted tree where ::GetFileAttributesA was rewritten to tail-recurse
+            corrupted = win_fu.replace(
+                "return ::GetFileAttributesA(pPath);",
+                "return ::gclientGetFileAttributesUtf8(pPath);",
+            )
+            (cocos_root / "cocos2dx/platform/win32/CCFileUtilsWin32.cpp").write_text(
+                corrupted, encoding="utf-8"
+            )
+
+            rc_heal = patch_cocos2dx.main([str(cocos_root)])
+            self.assertEqual(rc_heal, 0)
+            healed = (cocos_root / "cocos2dx/platform/win32/CCFileUtilsWin32.cpp").read_text(encoding="utf-8")
+            self.assertIn("return ::GetFileAttributesA(pPath);", healed)
+            self.assertNotIn("::gclientGetFileAttributesUtf8", healed)
+
+    def test_win32_mouse_routing_capture_recovery_and_client_rect_sync_patches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cocos_root = Path(tmp) / "cocos2d-x-2.2.6"
+            create_mock_cocos2dx_226_tree(cocos_root)
+
+            rc1 = patch_cocos2dx.main([str(cocos_root)])
+            self.assertEqual(rc1, 0)
+
+            egl_win = (cocos_root / "cocos2dx/platform/win32/CCEGLView.cpp").read_text(encoding="utf-8")
+            self.assertIn("GCLIENT_WIN32_MOUSE_ROUTING_GUARD", egl_win)
+            self.assertNotIn("MK_LBUTTON == wParam", egl_win)
+            self.assertIn("0xFFFFFF80u) == 0xFF515780u", egl_win)
+            self.assertIn("!::InSendMessage()", egl_win)
+            self.assertIn("case WM_CAPTURECHANGED:", egl_win)
+            self.assertIn("case WM_CANCELMODE:", egl_win)
+            self.assertIn("AdjustWindowRectExForDpi", egl_win)
+            self.assertIn("::GetClientRect(m_hWnd, &rcActual)", egl_win)
+
+            egl_proto = (cocos_root / "cocos2dx/platform/CCEGLViewProtocol.cpp").read_text(encoding="utf-8")
+            self.assertIn("GCLIENT_WIN32_MOUSE_ROUTING_GUARD", egl_proto)
+            self.assertIn("m_pDelegate->touchesCancelled(&cancelSet, NULL);", egl_proto)
+
+            ui_layout = (cocos_root / "extensions/CocoStudio/GUI/Layouts/UILayout.cpp").read_text(encoding="utf-8")
+            self.assertIn("GCLIENT_UILAYOUT_ADDCHILD_GUARD", ui_layout)
+            self.assertIn("dynamic_cast<Widget*>(child)", ui_layout)
+
+            # Verify idempotency on second run
+            rc2 = patch_cocos2dx.main([str(cocos_root)])
+            self.assertEqual(rc2, 0)
+            self.assertEqual(
+                egl_win,
+                (cocos_root / "cocos2dx/platform/win32/CCEGLView.cpp").read_text(encoding="utf-8"),
+            )
 
 
 class TestPeDependencyAuditor(unittest.TestCase):
