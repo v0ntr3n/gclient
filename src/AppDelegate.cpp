@@ -1253,8 +1253,10 @@ bool AppDelegate::applicationDidFinishLaunching() {
     //    FIRST before any texture, font, or stats label can be loaded by CCDirector!
     configureFileUtils();
 
-    // 2. Bind OpenGL view to CCDirector and configure 1136x640 design resolution and 30 FPS cap.
+    // 2. Bind OpenGL view to CCDirector, enable premultiplied alpha for game .pvr.ccz atlases,
+    //    and configure 1136x640 design resolution and 30 FPS cap.
     pDirector->setOpenGLView(pEGLView);
+    cocos2d::CCTexture2D::PVRImagesHavePremultipliedAlpha(true);
     ensureNonZeroEglFrameSize(pEGLView, m_config.windowWidth, m_config.windowHeight);
     pEGLView->setDesignResolutionSize(kDesignWidth, kDesignHeight, kResolutionFixedWidth);
     pDirector->setAnimationInterval(kTargetAnimationInterval);

@@ -24,6 +24,8 @@
 #include "textures/CCTextureETC.h"
 
 #include "assets/BtDecryptHook.h"
+#include "assets/PlistbLoader.h"
+#include "assets/XmlbArmatureLoader.h"
 #include "diagnostics/CrashAndTelemetry.h"
 
 #include "zlib.h"
@@ -1017,7 +1019,6 @@ int main(int argc, char** argv) {
         return rc == 0 && probeVal == 42;
     });
 
-
     // Phase 5: Real Win32 HWND + CCEGLView + TouchGroup + FuncMenu (Tửu Quán) Mouse Routing (>= 24 cycles)
     runPhase("phase5_win32_funcmenu_mouse_routing", [&](std::string& detail) -> bool {
         auto makeTouchBtn = [&]() -> cocos2d::ui::Widget* {
@@ -1326,6 +1327,228 @@ int main(int argc, char** argv) {
                  " sec=" + std::to_string(secOpens) + " jiuguan=" + std::to_string(jgOpens) +
                  " closes=" + std::to_string(panelCloses) + " sendInput=" + sendInputVerdict;
         return completedCycles == 24 && directOpens == 12 && secOpens == 12 && jgOpens == 12 && panelCloses == 24;
+    });
+
+    // Phase 6 (Issue #8): >= 50 iterations of GainItemListInfoPanel / GainItemCell widget lifecycle,
+    // addNode + removeFromParentAndCleanup(true) -> Widget::getNodes() synchronization,
+    // removeAllChildrenWithCleanup(true) internal renderer preservation, and ImageView
+    // ignoreContentAdaptWithSize(false) -> loadTexture (plist frame & local) -> setSize(100,100)/(98,98) + CCFadeIn
+    runPhase("phase5_issue8_widget_lifecycle_and_imageview_icons", [&](std::string& detail) -> bool {
+        cocos2d::CCSpriteFrame* frame5 = nullptr;
+        if (wglCtx.ready) {
+            fs::create_directories(tempFixture / L"gameImage" / L"item");
+            const std::vector<uint8_t> iconPng = buildValidRgbaPng(98, 98);
+            {
+                std::ofstream iconOut(tempFixture / L"gameImage" / L"item" / L"jinjiedan.png", std::ios::binary);
+                iconOut.write(reinterpret_cast<const char*>(iconPng.data()), static_cast<std::streamsize>(iconPng.size()));
+            }
+            const std::vector<uint8_t> framePng = buildValidRgbaPng(100, 100);
+            auto* frameImg = new cocos2d::CCImage();
+            if (!frameImg->initWithImageData(
+                    const_cast<uint8_t*>(framePng.data()),
+                    static_cast<int>(framePng.size()),
+                    cocos2d::CCImage::kFmtPng)) {
+                frameImg->release();
+                detail = "Failed to decode 100x100 frame PNG";
+                return false;
+            }
+            cocos2d::CCTexture2D* frameTex =
+                cocos2d::CCTextureCache::sharedTextureCache()->addUIImage(frameImg, "issue8_frame_5_atlas");
+            frameImg->release();
+            if (!frameTex) {
+                detail = "addUIImage failed for issue8_frame_5_atlas";
+                return false;
+            }
+            frame5 = cocos2d::CCSpriteFrame::createWithTexture(frameTex, cocos2d::CCRect(0.0f, 0.0f, 100.0f, 100.0f));
+            cocos2d::CCSpriteFrameCache::sharedSpriteFrameCache()->addSpriteFrame(frame5, "frame_5.png");
+        }
+
+        constexpr int kLoops = 60;
+        for (int iter = 0; iter < kLoops; ++iter) {
+            auto* itemContainer = cocos2d::ui::Layout::create();
+            itemContainer->retain();
+
+            for (int c = 0; c < 5; ++c) {
+                auto* cell = cocos2d::ui::Layout::create();
+                itemContainer->addChild(cell);
+
+                // GainItemCell.lua:61: glow node at z = -1
+                cocos2d::CCNode* glow = frame5
+                    ? static_cast<cocos2d::CCNode*>(cocos2d::CCSprite::createWithSpriteFrame(frame5))
+                    : cocos2d::CCNode::create();
+                glow->setPosition(cocos2d::CCPoint(87.0f, 69.0f));
+                glow->setScale(1.2f);
+                cell->addNode(glow, -1, 101);
+
+                // BaseItemWithNameIcon_TM: iconQuality (100x100) + icon (98x98) + lbName ("Tiến Cấp Đơn")
+                auto* iconItem = cocos2d::ui::Layout::create();
+                iconItem->setPosition(cocos2d::CCPoint(40.0f, 0.0f));
+                cell->addChild(iconItem);
+
+                if (wglCtx.ready) {
+                    auto* iconQuality = cocos2d::ui::ImageView::create();
+                    iconQuality->ignoreContentAdaptWithSize(false);
+                    iconItem->addChild(iconQuality);
+                    iconQuality->loadTexture("gameImage/frame/frame_5.png", cocos2d::ui::UI_TEX_TYPE_LOCAL);
+                    iconQuality->setSize(cocos2d::CCSize(100.0f, 100.0f));
+
+                    auto* icon = cocos2d::ui::ImageView::create();
+                    icon->ignoreContentAdaptWithSize(false);
+                    iconItem->addChild(icon);
+                    icon->loadTexture("gameImage/item/jinjiedan.png", cocos2d::ui::UI_TEX_TYPE_LOCAL);
+                    icon->setSize(cocos2d::CCSize(98.0f, 98.0f));
+
+                    auto* lbName = cocos2d::ui::Label::create();
+                    lbName->setText("Tiến Cấp Đơn");
+                    iconItem->addChild(lbName);
+
+                    auto* qVr = dynamic_cast<cocos2d::CCSprite*>(iconQuality->getVirtualRenderer());
+                    auto* iVr = dynamic_cast<cocos2d::CCSprite*>(icon->getVirtualRenderer());
+                    if (!qVr || !qVr->getTexture() || qVr->getContentSize().width <= 0.0f || qVr->getScaleX() <= 0.0f ||
+                        !iVr || !iVr->getTexture() || iVr->getContentSize().width <= 0.0f || iVr->getScaleX() <= 0.0f) {
+                        itemContainer->release();
+                        detail = "ImageView virtualRenderer missing texture or zero scale on iter=" + std::to_string(iter);
+                        return false;
+                    }
+                }
+
+                // CCFadeIn opacity step verification on UIWidget
+                auto* fade = cocos2d::CCFadeIn::create(14.0f / 60.0f);
+                fade->startWithTarget(cell);
+                fade->update(0.0f);
+                fade->update(1.0f);
+                if (cell->getOpacity() != 255 || cell->getDisplayedOpacity() != 255) {
+                    itemContainer->release();
+                    detail = "CCFadeIn failed to restore Widget/CCNodeRGBA opacity=255";
+                    return false;
+                }
+
+                // playArmatureOnce equivalent: addNode(fx) then fx->removeFromParentAndCleanup(true)
+                cocos2d::CCNode* fxNode = frame5
+                    ? static_cast<cocos2d::CCNode*>(cocos2d::CCSprite::createWithSpriteFrame(frame5))
+                    : cocos2d::CCNode::create();
+                const unsigned int baseRef = fxNode->retainCount();
+                cell->addNode(fxNode, 0, 202);
+                if (!cell->getNodes() || cell->getNodes()->count() != 2u) {
+                    itemContainer->release();
+                    detail = "Expected 2 nodes after addNode(fxNode)";
+                    return false;
+                }
+                fxNode->removeFromParentAndCleanup(true);
+                if (cell->getNodes()->count() != 1u || cell->getNodes()->containsObject(fxNode) ||
+                    fxNode->retainCount() != baseRef) {
+                    itemContainer->release();
+                    detail = "Stale pointer or leaked retainCount in Widget::getNodes() after removeFromParentAndCleanup";
+                    return false;
+                }
+
+                // Clear cell: removeAllChildrenWithCleanup(true) must clear both _widgetChildren and _nodes!
+                if (c % 2 == 0) {
+                    cell->removeAllChildrenWithCleanup(true);
+                    if (cell->getNodes()->count() != 0u || cell->getChildren()->count() != 0u) {
+                        itemContainer->release();
+                        detail = "Widget::removeAllChildrenWithCleanup failed to clear _nodes";
+                        return false;
+                    }
+                }
+            }
+
+            itemContainer->removeAllChildrenWithCleanup(true);
+            if (itemContainer->getNodes()->count() != 0u || itemContainer->getChildren()->count() != 0u) {
+                itemContainer->release();
+                detail = "itemContainer->removeAllChildrenWithCleanup left stale children/nodes";
+                return false;
+            }
+            itemContainer->release();
+            cocos2d::CCPoolManager::sharedPoolManager()->pop();
+        }
+
+        detail = "60 GainItemListInfoPanel/GainItemCell lifecycle + ImageView/CCFadeIn iterations passed cleanly";
+        return true;
+    });
+
+    // Phase 6: Issue #8 Armature BitCache/Plistb + WGL Offscreen Starburst Seam & Glow Ring glReadPixels
+    runPhase("phase5_armature_seam_and_glow_wgl_pixels", [&](std::string& detail) -> bool {
+        // Verify BitCache color clamp & sticky additive blend on gclient_assets
+        if (gclient::assets::XmlbArmatureLoader::ClampColorChannel(260) != 255u ||
+            gclient::assets::XmlbArmatureLoader::ClampColorChannel(-5) != 0u) {
+            detail = "XmlbArmatureLoader::ClampColorChannel failed [0,255] bounds";
+            return false;
+        }
+        if (!wglCtx.gl11Ready) {
+            detail = "WGL 1.1 unavailable in headless session; skipped glReadPixels";
+            return true;
+        }
+
+        constexpr int kAtlasDim = 64;
+        std::vector<uint8_t> atlas(kAtlasDim * kAtlasDim * 4, 0u);
+        for (int y = 2; y < 18; ++y) {
+            for (int x = 2; x < 18; ++x) {
+                const size_t idx = static_cast<size_t>((y * kAtlasDim + x) * 4);
+                atlas[idx + 0] = 220u;
+                atlas[idx + 1] = 200u;
+                atlas[idx + 2] = 140u;
+                atlas[idx + 3] = 220u;
+            }
+        }
+
+        GLuint texId = 0;
+        glGenTextures(1, &texId);
+        glBindTexture(GL_TEXTURE_2D, texId);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        const GLint wrapMode = GLEW_VERSION_1_2 ? GL_CLAMP_TO_EDGE : GL_CLAMP;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapMode);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapMode);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kAtlasDim, kAtlasDim, 0, GL_RGBA, GL_UNSIGNED_BYTE, atlas.data());
+
+        glViewport(0, 0, 64, 64);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0.0, 64.0, 0.0, 64.0, -1.0, 1.0);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        glEnable(GL_TEXTURE_2D);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glClearColor(18.0f / 255.0f, 18.0f / 255.0f, 24.0f / 255.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glColor4ub(255, 255, 255, 255);
+
+        // Render 4 mirrored quadrants using CCSkin::setTextureCoords half-texel-clamped cut-seam UVs
+        const float uCut = 2.5f / 64.0f, uOuter = 18.0f / 64.0f;
+        const float vOuter = 2.0f / 64.0f, vCut = 17.5f / 64.0f;
+        const float signs[4][2] = {{1.0f, 1.0f}, {-1.0f, 1.0f}, {1.0f, -1.0f}, {-1.0f, -1.0f}};
+        for (const auto& s : signs) {
+            const float x0 = 32.0f, x1 = 32.0f + s[0] * 32.0f;
+            const float y0 = 32.0f, y1 = 32.0f + s[1] * 32.0f;
+            glBegin(GL_QUADS);
+            glTexCoord2f(uCut, vCut);     glVertex2f(x0, y0);
+            glTexCoord2f(uOuter, vCut);   glVertex2f(x1, y0);
+            glTexCoord2f(uOuter, vOuter); glVertex2f(x1, y1);
+            glTexCoord2f(uCut, vOuter);   glVertex2f(x0, y1);
+            glEnd();
+        }
+        glFinish();
+
+        std::vector<uint8_t> fb(64 * 64 * 4, 0u);
+        glReadPixels(0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, fb.data());
+        glDeleteTextures(1, &texId);
+
+        const int centerR = fb[(32 * 64 + 32) * 4 + 0];
+        const int seamXR  = fb[(40 * 64 + 32) * 4 + 0];
+        const int seamYR  = fb[(32 * 64 + 40) * 4 + 0];
+        const int innerR  = fb[(40 * 64 + 40) * 4 + 0];
+        const bool seamFree =
+            innerR >= 200 &&
+            std::abs(centerR - innerR) <= 2 &&
+            std::abs(seamXR - innerR) <= 2 &&
+            std::abs(seamYR - innerR) <= 2;
+        detail = "centerR=" + std::to_string(centerR) +
+                 " seamXR=" + std::to_string(seamXR) +
+                 " seamYR=" + std::to_string(seamYR) +
+                 " innerR=" + std::to_string(innerR);
+        return seamFree;
     });
 
     g_watchdogStop.store(true, std::memory_order_release);
