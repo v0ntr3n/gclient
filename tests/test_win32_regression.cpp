@@ -6,6 +6,15 @@
 // ============================================================================
 
 #include "assets/BtDecryptHook.h"
+#include "assets/PlistbLoader.h"
+#include "assets/XmlbArmatureLoader.h"
+#if defined(GCLIENT_TEST_EGL_GL)
+#define GL_GLEXT_PROTOTYPES 1
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GL/gl.h>
+#include <GL/glext.h>
+#endif
 #include "diagnostics/CrashAndTelemetry.h"
 #include "net/CConnection.h"
 #include "net/CNetwork.h"
@@ -1777,7 +1786,321 @@ bool testIssue8GainItemPanelLifecycleAndImageViewRendering() {
         // Zero leaked CCObjects across every single iteration!
         REQUIRE_EQ(Issue8RefObject::s_liveInstances, 0);
     }
+    return true;
+}
 
+void writeLE16U(uint8_t* dst, uint16_t v) { dst[0] = static_cast<uint8_t>(v & 0xFFu); dst[1] = static_cast<uint8_t>((v >> 8) & 0xFFu); }
+void writeLE16S(uint8_t* dst, int16_t v) { writeLE16U(dst, static_cast<uint16_t>(v)); }
+
+bool testXmlbBitCacheBinaryLayoutStickyBlendAndColorClamp() {
+    using gclient::assets::XmlbArmatureLoader;
+    using gclient::assets::XmlbDecodedFrameRecord;
+    using gclient::assets::XmlbDecodedMovementHeader;
+
+    std::vector<uint8_t> movHdr(74, 0u);
+    const char* movName = "dangewupinhuode_baoguang_1";
+    std::memcpy(movHdr.data(), movName, std::strlen(movName));
+    writeLE16S(movHdr.data() + 64, 40);
+    writeLE16S(movHdr.data() + 66, 6);
+    writeLE16S(movHdr.data() + 68, 40);
+    movHdr[70] = 0;
+    movHdr[71] = 2; // Sine_EaseInOut -> 3
+    writeLE16U(movHdr.data() + 72, 1);
+
+    XmlbDecodedMovementHeader decMov{};
+    REQUIRE_TRUE(XmlbArmatureLoader::DecodeBitCacheMovementHeader(movHdr.data(), movHdr.size(), &decMov));
+    REQUIRE_EQ(decMov.duration, 40);
+    REQUIRE_EQ(decMov.durationTo, 6);
+    REQUIRE_EQ(decMov.durationTween, 40);
+    REQUIRE_TRUE(!decMov.loop);
+    REQUIRE_EQ(decMov.tweenEasing, 3);
+    REQUIRE_EQ(decMov.movBoneCount, 1u);
+
+    bool hasSticky = false;
+    uint32_t stickySrc = 0x0001u, stickyDst = 0x0303u;
+
+    std::vector<uint8_t> fr0(168, 0u);
+    writeLE16S(fr0.data() + 8, 1); writeLE16S(fr0.data() + 10, 1); writeLE16S(fr0.data() + 24, 3);
+    writeLE16S(fr0.data() + 26, 255); writeLE16S(fr0.data() + 28, 255);
+    writeLE16S(fr0.data() + 30, 255); writeLE16S(fr0.data() + 32, 255);
+    fr0[34] = static_cast<uint8_t>(static_cast<int8_t>(-2));
+    fr0[39] = static_cast<uint8_t>(static_cast<int8_t>(-1)); // hidden frame
+
+    XmlbDecodedFrameRecord dec0{};
+    REQUIRE_TRUE(XmlbArmatureLoader::DecodeBitCacheFrameRecord(fr0.data(), fr0.size(), &hasSticky, &stickySrc, &stickyDst, &dec0));
+    REQUIRE_EQ(dec0.displayIndex, -1);
+    REQUIRE_TRUE(!dec0.isTween);
+    REQUIRE_TRUE(!dec0.isUseColorInfo);
+    REQUIRE_EQ(dec0.blendDst, 0x0303u);
+
+    std::vector<uint8_t> fr1(168, 0u);
+    writeLE16S(fr1.data() + 0, -12); writeLE16S(fr1.data() + 4, -500);
+    writeLE16S(fr1.data() + 2, 8);   writeLE16S(fr1.data() + 6, 250);
+    writeLE16S(fr1.data() + 8, 1);   writeLE16S(fr1.data() + 12, 200);
+    writeLE16S(fr1.data() + 10, -1); writeLE16S(fr1.data() + 14, -200);
+    writeLE16S(fr1.data() + 16, 3142); writeLE16S(fr1.data() + 18, -3142);
+    writeLE16S(fr1.data() + 20, 2);  writeLE16S(fr1.data() + 22, 500);
+    writeLE16S(fr1.data() + 24, 10);
+    writeLE16S(fr1.data() + 26, 255); writeLE16S(fr1.data() + 28, 255);
+    writeLE16S(fr1.data() + 30, 260); writeLE16S(fr1.data() + 32, 260); // >255 must clamp to 255, NOT wrap to 4!
+    fr1[34] = 7; fr1[35] = 1; fr1[36] = 80; fr1[37] = 1; fr1[38] = 1; fr1[39] = 0; fr1[40] = '1';
+
+    XmlbDecodedFrameRecord dec1{};
+    REQUIRE_TRUE(XmlbArmatureLoader::DecodeBitCacheFrameRecord(fr1.data(), fr1.size(), &hasSticky, &stickySrc, &stickyDst, &dec1));
+    REQUIRE_TRUE(std::fabs(dec1.x - (-12.5f)) < 1e-4f);
+    REQUIRE_TRUE(std::fabs(dec1.scaleY - (-1.2f)) < 1e-4f);
+    REQUIRE_TRUE(std::fabs(dec1.tweenRotate - 2.5f) < 1e-4f);
+    REQUIRE_EQ(dec1.r, 255u); REQUIRE_EQ(dec1.g, 255u); REQUIRE_EQ(dec1.b, 255u);
+    REQUIRE_TRUE(dec1.isUseColorInfo); REQUIRE_TRUE(dec1.isTween);
+    REQUIRE_EQ(dec1.tweenEasing, 80); REQUIRE_EQ(dec1.displayIndex, 0);
+    REQUIRE_EQ(dec1.blendSrc, 0x0001u); REQUIRE_EQ(dec1.blendDst, 0x0001u);
+
+    std::vector<uint8_t> fr2 = fr1;
+    writeLE16S(fr2.data() + 26, 0); writeLE16S(fr2.data() + 32, -5); // <0 must clamp to 0!
+    fr2[38] = 0; fr2[40] = '\0';
+    XmlbDecodedFrameRecord dec2{};
+    REQUIRE_TRUE(XmlbArmatureLoader::DecodeBitCacheFrameRecord(fr2.data(), fr2.size(), &hasSticky, &stickySrc, &stickyDst, &dec2));
+    REQUIRE_EQ(dec2.a, 0u); REQUIRE_EQ(dec2.b, 0u);
+    REQUIRE_EQ(dec2.blendSrc, 0x0001u); REQUIRE_EQ(dec2.blendDst, 0x0001u);
+    return true;
+}
+
+struct QuadUV { float bl_u, bl_v, br_u, br_v, tl_u, tl_v, tr_u, tr_v; };
+
+QuadUV computeSkinQuadUV(const gclient::assets::PlistbFrameRecord& rec, float atlasW, float atlasH, bool clampSeam) {
+    const float spanU = rec.rotated ? rec.rectHeight : rec.rectWidth;
+    const float spanV = rec.rotated ? rec.rectWidth : rec.rectHeight;
+    const bool isSubRect = (rec.rectX > 0.0f) || (rec.rectY > 0.0f) || (spanU < atlasW - 0.5f) || (spanV < atlasH - 0.5f);
+    const float trimLeftPx = rec.offsetX + (rec.originalWidth - rec.rectWidth) * 0.5f;
+    const float trimBottomPx = rec.offsetY + (rec.originalHeight - rec.rectHeight) * 0.5f;
+    const float trimRightPx = (rec.originalWidth - rec.rectWidth) - trimLeftPx;
+    const float trimTopPx = (rec.originalHeight - rec.rectHeight) - trimBottomPx;
+    float left = rec.rectX / atlasW, right = (rec.rectX + spanU) / atlasW;
+    float top = rec.rectY / atlasH, bottom = (rec.rectY + spanV) / atlasH;
+    const float halfU = 0.5f / atlasW, halfV = 0.5f / atlasH;
+    if (rec.rotated) {
+        if (clampSeam && isSubRect) {
+            if (spanU >= 2.0f) { if (trimBottomPx <= 0.5f) left += halfU; if (trimTopPx <= 0.5f) right -= halfU; }
+            if (spanV >= 2.0f) { if (trimLeftPx <= 0.5f) top += halfV; if (trimRightPx <= 0.5f) bottom -= halfV; }
+        }
+        return QuadUV{left, top, left, bottom, right, top, right, bottom};
+    }
+    if (clampSeam && isSubRect) {
+        if (spanU >= 2.0f) { if (trimLeftPx <= 0.5f) left += halfU; if (trimRightPx <= 0.5f) right -= halfU; }
+        if (spanV >= 2.0f) { if (trimTopPx <= 0.5f) top += halfV; if (trimBottomPx <= 0.5f) bottom -= halfV; }
+    }
+    return QuadUV{left, bottom, right, bottom, left, top, right, top};
+}
+
+bool testPlistbParseRotatedFramesAndSkinSubRectUvClamp() {
+    using gclient::assets::PlistbFileData;
+    using gclient::assets::PlistbLoader;
+    auto addRec = [](std::vector<uint8_t>& buf, const char* name, uint16_t rx, uint16_t ry,
+                     uint16_t rw, uint16_t rh, bool rot, int16_t ox, int16_t oy, uint16_t ow, uint16_t oh) {
+        const size_t b = buf.size();
+        buf.resize(b + gclient::assets::kPlistbRecordSize, 0u);
+        std::memcpy(buf.data() + b, name, std::strlen(name));
+        writeLE16U(buf.data() + b + 64, rx); writeLE16U(buf.data() + b + 66, ry);
+        writeLE16U(buf.data() + b + 68, rw); writeLE16U(buf.data() + b + 70, rh);
+        buf[b + 72] = rot ? 1u : 0u;
+        writeLE16S(buf.data() + b + 74, ox); writeLE16S(buf.data() + b + 76, oy);
+        writeLE16U(buf.data() + b + 78, ow); writeLE16U(buf.data() + b + 80, oh);
+    };
+
+    std::vector<uint8_t> plistb(gclient::assets::kPlistbHeaderSize, 0u);
+    std::memcpy(plistb.data(), "baoguang.png", 12);
+    writeLE16S(plistb.data() + 64, 4);
+    addRec(plistb, "q_unrot.png", 2, 2, 82, 78, false, -9, -11, 100, 100);
+    addRec(plistb, "q_rot.png",  90, 2, 82, 78, true,  -9, -11, 100, 100);
+    addRec(plistb, "glow.png",    2, 90, 96, 96, false,  0,   0, 128, 128);
+    addRec(plistb, "px1.png",   200, 2,  1,  1, false,  0,   0,   1,   1);
+
+    PlistbFileData parsed{};
+    REQUIRE_TRUE(PlistbLoader::ParseBuffer(plistb.data(), plistb.size(), &parsed));
+    REQUIRE_EQ(parsed.frames.size(), 4u);
+
+    const QuadUV uv0 = computeSkinQuadUV(parsed.frames[0], 256.0f, 256.0f, true);
+    REQUIRE_TRUE(std::fabs(uv0.bl_u - (2.5f / 256.0f)) < 1e-6f && std::fabs(uv0.bl_v - (79.5f / 256.0f)) < 1e-6f);
+    REQUIRE_TRUE(std::fabs(uv0.tr_u - (84.0f / 256.0f)) < 1e-6f && std::fabs(uv0.tr_v - (2.0f / 256.0f)) < 1e-6f);
+
+    const QuadUV uv1 = computeSkinQuadUV(parsed.frames[1], 256.0f, 256.0f, true);
+    REQUIRE_TRUE(std::fabs(uv1.bl_u - (90.5f / 256.0f)) < 1e-6f && std::fabs(uv1.bl_v - (2.5f / 256.0f)) < 1e-6f);
+    REQUIRE_TRUE(std::fabs(uv1.tr_u - (168.0f / 256.0f)) < 1e-6f && std::fabs(uv1.tr_v - (84.0f / 256.0f)) < 1e-6f);
+
+    const QuadUV uv2C = computeSkinQuadUV(parsed.frames[2], 256.0f, 256.0f, true);
+    const QuadUV uv2S = computeSkinQuadUV(parsed.frames[2], 256.0f, 256.0f, false);
+    REQUIRE_TRUE(std::fabs(uv2C.bl_u - uv2S.bl_u) < 1e-6f && std::fabs(uv2C.tr_v - uv2S.tr_v) < 1e-6f);
+
+    const QuadUV uv3C = computeSkinQuadUV(parsed.frames[3], 256.0f, 256.0f, true);
+    const QuadUV uv3S = computeSkinQuadUV(parsed.frames[3], 256.0f, 256.0f, false);
+    REQUIRE_TRUE(std::fabs(uv3C.bl_u - uv3S.bl_u) < 1e-6f);
+    return true;
+}
+
+struct Rgba8 { uint8_t r, g, b, a; };
+
+bool testPvrRgba8UnpackPremulAlphaAndBlendPipeline() {
+    const uint16_t raw4444 = 0xFA48u;
+    const unsigned int px = (raw4444 & 0xFFu) | ((raw4444 >> 8) << 8);
+    REQUIRE_EQ(((px >> 12) & 0xFu) * 17u, 255u);
+    REQUIRE_EQ(((px >> 8) & 0xFu) * 17u, 170u);
+    REQUIRE_EQ(((px >> 4) & 0xFu) * 17u, 68u);
+    REQUIRE_EQ((px & 0xFu) * 17u, 136u);
+
+    const uint8_t boneOpacity = 2u, texPremulR = 200u;
+    const int outUnpatched = (254 * texPremulR) / 255;
+    const int outPatched = (static_cast<int>(254 * (boneOpacity / 255.0f)) * texPremulR) / 255;
+    REQUIRE_TRUE(outUnpatched > 190 && outPatched <= 2);
+
+    const Rgba8 glowPremul{128u, 110u, 40u, 128u};
+    REQUIRE_EQ(static_cast<int>(glowPremul.r), 128);
+    REQUIRE_EQ((glowPremul.r * glowPremul.a + 127) / 255, 64);
+    return true;
+}
+
+Rgba8 sampleBilinearClampToEdge(const std::vector<Rgba8>& tex, int w, int h, float u, float v) {
+    const float fx = std::clamp(u * w - 0.5f, 0.0f, static_cast<float>(w - 1));
+    const float fy = std::clamp(v * h - 0.5f, 0.0f, static_cast<float>(h - 1));
+    const int x0 = static_cast<int>(std::floor(fx)), y0 = static_cast<int>(std::floor(fy));
+    const int x1 = std::min(x0 + 1, w - 1), y1 = std::min(y0 + 1, h - 1);
+    const float tx = fx - x0, ty = fy - y0;
+    const Rgba8 &c00 = tex[y0 * w + x0], &c10 = tex[y0 * w + x1];
+    const Rgba8 &c01 = tex[y1 * w + x0], &c11 = tex[y1 * w + x1];
+    auto bl = [&](uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+        return static_cast<uint8_t>(std::clamp(std::lround((a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty), 0L, 255L));
+    };
+    return Rgba8{bl(c00.r, c10.r, c01.r, c11.r), bl(c00.g, c10.g, c01.g, c11.g),
+                 bl(c00.b, c10.b, c01.b, c11.b), bl(c00.a, c10.a, c01.a, c11.a)};
+}
+
+void rasterizeStarburst4Quadrants(const std::vector<Rgba8>& atlas, int atlasDim, const QuadUV& qUv,
+                                  std::vector<Rgba8>& fb, int fbSize) {
+    const int half = fbSize / 2;
+    for (int py = 0; py < fbSize; ++py) {
+        for (int px = 0; px < fbSize; ++px) {
+            const float sx = ((px >= half ? (px - half) : (half - 1 - px)) + 0.5f) / static_cast<float>(half);
+            const float sy = ((py >= half ? (py - half) : (half - 1 - py)) + 0.5f) / static_cast<float>(half);
+            const Rgba8 src = sampleBilinearClampToEdge(
+                atlas, atlasDim, atlasDim, qUv.bl_u + sx * (qUv.br_u - qUv.bl_u), qUv.bl_v + sy * (qUv.tl_v - qUv.bl_v));
+            Rgba8& dst = fb[py * fbSize + px];
+            const int invA = 255 - src.a;
+            dst.r = static_cast<uint8_t>(std::min(255, src.r + (dst.r * invA + 127) / 255));
+            dst.g = static_cast<uint8_t>(std::min(255, src.g + (dst.g * invA + 127) / 255));
+            dst.b = static_cast<uint8_t>(std::min(255, src.b + (dst.b * invA + 127) / 255));
+        }
+    }
+}
+
+bool testStarburstSeamAndGlowRingOffscreenPixelVerification() {
+    constexpr int kAtlasDim = 64, kFbDim = 64;
+    std::vector<Rgba8> atlas(kAtlasDim * kAtlasDim, Rgba8{0, 0, 0, 0});
+    for (int y = 2; y < 18; ++y)
+        for (int x = 2; x < 18; ++x)
+            atlas[y * kAtlasDim + x] = Rgba8{220, 200, 140, 220};
+
+    gclient::assets::PlistbFrameRecord rec{"baoguang_01.png", 2.0f, 2.0f, 16.0f, 16.0f, false, -2.0f, -2.0f, 20.0f, 20.0f};
+    const Rgba8 darkBg{18, 18, 24, 255};
+
+    std::vector<Rgba8> fbUnpatched(kFbDim * kFbDim, darkBg), fbPatched(kFbDim * kFbDim, darkBg);
+    const QuadUV uvUnpatched = computeSkinQuadUV(rec, kAtlasDim, kAtlasDim, false);
+    const QuadUV uvPatched   = computeSkinQuadUV(rec, kAtlasDim, kAtlasDim, true);
+    rasterizeStarburst4Quadrants(atlas, kAtlasDim, uvUnpatched, fbUnpatched, kFbDim);
+    rasterizeStarburst4Quadrants(atlas, kAtlasDim, uvPatched, fbPatched, kFbDim);
+
+    REQUIRE_TRUE(fbUnpatched[32 * kFbDim + 32].r < fbUnpatched[40 * kFbDim + 40].r - 85);
+    REQUIRE_TRUE(std::abs(static_cast<int>(fbPatched[32 * kFbDim + 32].r) - static_cast<int>(fbPatched[40 * kFbDim + 40].r)) <= 1);
+    REQUIRE_TRUE(std::abs(static_cast<int>(fbPatched[40 * kFbDim + 32].r) - static_cast<int>(fbPatched[40 * kFbDim + 40].r)) <= 1);
+    REQUIRE_TRUE(std::abs(static_cast<int>(fbPatched[32 * kFbDim + 40].r) - static_cast<int>(fbPatched[40 * kFbDim + 40].r)) <= 1);
+
+#if defined(GCLIENT_TEST_EGL_GL)
+    auto getPlatDpy = reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(eglGetProcAddress("eglGetPlatformDisplayEXT"));
+    EGLDisplay dpy = getPlatDpy ? getPlatDpy(0x31DD, nullptr, nullptr) : eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    REQUIRE_TRUE(dpy != EGL_NO_DISPLAY);
+    EGLint maj = 0, min = 0;
+    REQUIRE_TRUE(eglInitialize(dpy, &maj, &min) == EGL_TRUE && eglBindAPI(EGL_OPENGL_API) == EGL_TRUE);
+    const EGLint cfgAtt[] = { EGL_SURFACE_TYPE, 0, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_NONE };
+    EGLConfig cfg = nullptr; EGLint nCfg = 0;
+    (void)eglChooseConfig(dpy, cfgAtt, &cfg, 1, &nCfg);
+    const EGLint ctxAtt[] = { EGL_CONTEXT_MAJOR_VERSION, 2, EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE };
+    EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctxAtt);
+    REQUIRE_TRUE(ctx != EGL_NO_CONTEXT && eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx) == EGL_TRUE);
+
+    GLuint fbo = 0, colorTex = 0, starTex = 0, glowTexId = 0;
+    glGenFramebuffers(1, &fbo); glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glGenTextures(1, &colorTex); glBindTexture(GL_TEXTURE_2D, colorTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kFbDim, kFbDim, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex, 0);
+    REQUIRE_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), static_cast<GLenum>(GL_FRAMEBUFFER_COMPLETE));
+
+    glGenTextures(1, &starTex); glBindTexture(GL_TEXTURE_2D, starTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kAtlasDim, kAtlasDim, 0, GL_RGBA, GL_UNSIGNED_BYTE, atlas.data());
+
+    glViewport(0, 0, kFbDim, kFbDim);
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0.0, kFbDim, 0.0, kFbDim, -1.0, 1.0);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+    glEnable(GL_TEXTURE_2D); glEnable(GL_BLEND);
+
+    auto drawQuadSet = [&](const QuadUV& uv) {
+        glClearColor(18.0f / 255.0f, 18.0f / 255.0f, 24.0f / 255.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBindTexture(GL_TEXTURE_2D, starTex);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glColor4ub(255, 255, 255, 255);
+        const float signs[4][2] = {{1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
+        for (const auto& s : signs) {
+            glBegin(GL_QUADS);
+            glTexCoord2f(uv.bl_u, uv.bl_v); glVertex2f(32.0f, 32.0f);
+            glTexCoord2f(uv.br_u, uv.br_v); glVertex2f(32.0f + s[0] * 32.0f, 32.0f);
+            glTexCoord2f(uv.tr_u, uv.tr_v); glVertex2f(32.0f + s[0] * 32.0f, 32.0f + s[1] * 32.0f);
+            glTexCoord2f(uv.tl_u, uv.tl_v); glVertex2f(32.0f, 32.0f + s[1] * 32.0f);
+            glEnd();
+        }
+    };
+
+    std::vector<Rgba8> glPx(kFbDim * kFbDim);
+    drawQuadSet(uvUnpatched);
+    glReadPixels(0, 0, kFbDim, kFbDim, GL_RGBA, GL_UNSIGNED_BYTE, glPx.data());
+    REQUIRE_TRUE(glPx[32 * kFbDim + 32].r < glPx[40 * kFbDim + 40].r - 80);
+
+    drawQuadSet(uvPatched);
+    glReadPixels(0, 0, kFbDim, kFbDim, GL_RGBA, GL_UNSIGNED_BYTE, glPx.data());
+    REQUIRE_TRUE(std::abs(static_cast<int>(glPx[32 * kFbDim + 32].r) - static_cast<int>(glPx[40 * kFbDim + 40].r)) <= 2);
+    REQUIRE_TRUE(std::abs(static_cast<int>(glPx[40 * kFbDim + 32].r) - static_cast<int>(glPx[40 * kFbDim + 40].r)) <= 2);
+    REQUIRE_TRUE(std::abs(static_cast<int>(glPx[32 * kFbDim + 40].r) - static_cast<int>(glPx[40 * kFbDim + 40].r)) <= 2);
+
+    std::vector<Rgba8> glowTex(32 * 32, Rgba8{0, 0, 0, 0});
+    for (int y = 0; y < 32; ++y) {
+        const float dy = std::fabs((y + 0.5f) - 16.0f) / 16.0f;
+        const uint8_t a8 = static_cast<uint8_t>(std::clamp(std::lround((1.0f - dy) * 15.0f), 0L, 15L) * 17);
+        for (int x = 0; x < 32; ++x)
+            glowTex[y * 32 + x] = Rgba8{a8, static_cast<uint8_t>((221u * a8 + 127u) / 255u), static_cast<uint8_t>((102u * a8 + 127u) / 255u), a8};
+    }
+    glGenTextures(1, &glowTexId); glBindTexture(GL_TEXTURE_2D, glowTexId);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 32, 32, 0, GL_RGBA, GL_UNSIGNED_BYTE, glowTex.data());
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBlendFunc(GL_ONE, GL_ONE);
+    glColor4ub(gclient::assets::XmlbArmatureLoader::ClampColorChannel(255),
+               gclient::assets::XmlbArmatureLoader::ClampColorChannel(260),
+               gclient::assets::XmlbArmatureLoader::ClampColorChannel(260), 255);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0, 0); glVertex2f(0, 0); glTexCoord2f(1, 0); glVertex2f(64, 0);
+    glTexCoord2f(1, 1); glVertex2f(64, 64); glTexCoord2f(0, 1); glVertex2f(0, 64);
+    glEnd();
+    glReadPixels(0, 0, kFbDim, kFbDim, GL_RGBA, GL_UNSIGNED_BYTE, glPx.data());
+    REQUIRE_TRUE(glPx[32 * kFbDim + 32].r >= 240 && glPx[32 * kFbDim + 32].g >= 200 && glPx[32 * kFbDim + 32].b >= 100);
+    REQUIRE_TRUE(glPx[40 * kFbDim + 32].r > glPx[41 * kFbDim + 32].r && (glPx[40 * kFbDim + 32].r - glPx[41 * kFbDim + 32].r) <= 12);
+
+    glDeleteTextures(1, &glowTexId); glDeleteTextures(1, &starTex);
+    glDeleteTextures(1, &colorTex); glDeleteFramebuffers(1, &fbo);
+    eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroyContext(dpy, ctx); eglTerminate(dpy);
+#endif
     return true;
 }
 
@@ -1808,7 +2131,15 @@ int main() {
                 testLCPacketFramingAndOverloadSafety);
     runTestCase("10_CNetwork_LoopbackFraming_ReentrantDoRead_And_DestroyUafBarrier",
                 testCNetworkLoopbackReentrantAndDestroySafety);
-    runTestCase("11_Issue8_GainItemPanel_50PlusLifecycle_GetNodesSync_And_ImageViewIcons",
+    runTestCase("11_XmlbBitCache_RealBinaryLayout_StickyBlend_And_ColorClamp",
+                testXmlbBitCacheBinaryLayoutStickyBlendAndColorClamp);
+    runTestCase("12_PlistbLoader_BinaryParse_RotatedFrames_And_SkinSubRectUvClamp",
+                testPlistbParseRotatedFramesAndSkinSubRectUvClamp);
+    runTestCase("13_PvrRgba8Unpack_PremulAlpha_And_BlendPipeline",
+                testPvrRgba8UnpackPremulAlphaAndBlendPipeline);
+    runTestCase("14_StarburstSeam_And_GlowRing_OffscreenPixelVerification",
+                testStarburstSeamAndGlowRingOffscreenPixelVerification);
+    runTestCase("15_Issue8_GainItemPanel_50PlusLifecycle_GetNodesSync_And_ImageViewIcons",
                 testIssue8GainItemPanelLifecycleAndImageViewRendering);
 
     std::printf("======================================================================\n");

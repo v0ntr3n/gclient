@@ -2,7 +2,10 @@
 
 #include "BtDecryptHook.h"
 #include "PlistbLoader.h"
+#if !defined(GCLIENT_STANDALONE_BUILD) || defined(GCLIENT_XMLB_WITH_PROTOBUF)
 #include "db.pb.h"
+#define GCLIENT_XMLB_HAS_PROTOBUF 1
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -27,6 +30,9 @@ namespace assets {
 
 namespace {
 
+int16_t ReadLE16S_Common(const uint8_t* ptr);
+std::string ReadFixedCString_Common(const uint8_t* ptr, size_t maxLen);
+
 uint16_t ReadLE16U(const uint8_t* ptr) {
     return static_cast<uint16_t>(ptr[0]) |
            (static_cast<uint16_t>(ptr[1]) << 8);
@@ -37,6 +43,13 @@ uint32_t ReadLE32U(const uint8_t* ptr) {
            (static_cast<uint32_t>(ptr[1]) << 8) |
            (static_cast<uint32_t>(ptr[2]) << 16) |
            (static_cast<uint32_t>(ptr[3]) << 24);
+}
+
+int16_t ReadLE16S_Common(const uint8_t* ptr) { return static_cast<int16_t>(ReadLE16U(ptr)); }
+std::string ReadFixedCString_Common(const uint8_t* ptr, size_t maxLen) {
+    size_t len = 0;
+    while (len < maxLen && ptr[len] != '\0') ++len;
+    return std::string(reinterpret_cast<const char*>(ptr), len);
 }
 
 void LogArmatureWarn(const char* msg) {
@@ -226,7 +239,7 @@ cocos2d::ccBlendFunc MapBitCacheBlendType(uint8_t rawBlend) {
         case 0:
             return { CC_BLEND_SRC, CC_BLEND_DST };
         case 1:
-            return { GL_SRC_ALPHA, GL_ONE };
+            return { CC_BLEND_SRC, GL_ONE };
         case 2:
             return { GL_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA };
         case 3:
@@ -237,7 +250,7 @@ cocos2d::ccBlendFunc MapBitCacheBlendType(uint8_t rawBlend) {
 
     switch (static_cast<cocos2d::extension::CCBlendType>(rawBlend)) {
         case cocos2d::extension::BLEND_ADD:
-            return { GL_SRC_ALPHA, GL_ONE };
+            return { CC_BLEND_SRC, GL_ONE };
         case cocos2d::extension::BLEND_SCREEN:
             return { GL_ONE, GL_ONE_MINUS_SRC_COLOR };
         default:
@@ -418,7 +431,7 @@ void PreloadArmatureSpriteSheets(const std::string& normConfigPath,
         LoadResolvedSpriteSheet(plistPath, effectiveBase, explicitTex, loadedSet);
     }
 
-    const std::string dirAndStem = StripAssetExtension(normConfigPath);
+    const std::string dirAndStem = StripAssetExtension(effectiveBase.empty() ? normConfigPath : effectiveBase);
     if (dirAndStem.empty()) {
         return;
     }
@@ -586,17 +599,98 @@ void AppendClosingFrame(cocos2d::extension::CCMovementBoneData* movBoneData) {
     closingFrame->release();
 }
 
+#if defined(GCLIENT_XMLB_HAS_PROTOBUF)
 void ApplyProtoColor(cocos2d::extension::CCBaseData* dst, const ArmatureColor& color) {
     dst->isUseColorInfo = true;
-    dst->r              = static_cast<unsigned char>(color.has_r() ? color.r() : 255);
-    dst->g              = static_cast<unsigned char>(color.has_g() ? color.g() : 255);
-    dst->b              = static_cast<unsigned char>(color.has_b() ? color.b() : 255);
-    dst->a              = static_cast<unsigned char>(color.has_a() ? color.a() : 255);
+    dst->r = XmlbArmatureLoader::ClampColorChannel(color.has_r() ? color.r() : 255);
+    dst->g = XmlbArmatureLoader::ClampColorChannel(color.has_g() ? color.g() : 255);
+    dst->b = XmlbArmatureLoader::ClampColorChannel(color.has_b() ? color.b() : 255);
+    dst->a = XmlbArmatureLoader::ClampColorChannel(color.has_a() ? color.a() : 255);
 }
+#endif
 
 #endif // GCLIENT_ENABLE_COCOS2DX
 
 } // namespace
+
+uint8_t XmlbArmatureLoader::ClampColorChannel(int32_t value) {
+    return static_cast<uint8_t>(value <= 0 ? 0 : (value >= 255 ? 255 : value));
+}
+
+int32_t XmlbArmatureLoader::DecodeBitCacheTweenEasing(int8_t rawEasing) {
+    return (rawEasing == 2) ? 3 : static_cast<int32_t>(rawEasing);
+}
+
+void XmlbArmatureLoader::MapBlendTypeToGL(uint8_t rawBlend, uint32_t* outSrc, uint32_t* outDst) {
+    uint32_t src = 0x0001u, dst = 0x0303u; // GL_ONE, GL_ONE_MINUS_SRC_ALPHA
+    switch (rawBlend) {
+        case 1: case 8: src = 0x0001u; dst = 0x0001u; break; // Premultiplied ADD {GL_ONE, GL_ONE}
+        case 2:         src = 0x0306u; dst = 0x0303u; break; // MULTIPLY
+        case 3: case 5: src = 0x0001u; dst = 0x0301u; break; // SCREEN
+        default: break;
+    }
+    if (outSrc) *outSrc = src;
+    if (outDst) *outDst = dst;
+}
+
+bool XmlbArmatureLoader::DecodeBitCacheMovementHeader(const uint8_t* movHdr, size_t availBytes,
+                                                      XmlbDecodedMovementHeader* outMov,
+                                                      const XmlbBitCacheLayout& layout) {
+    if (!movHdr || !outMov || layout.movementDataStructSize < 74 || availBytes < layout.movementDataStructSize) {
+        return false;
+    }
+    outMov->name          = ReadFixedCString_Common(movHdr, 64);
+    outMov->duration      = static_cast<int32_t>(ReadLE16S_Common(movHdr + 64));
+    outMov->durationTo    = std::max(0, static_cast<int32_t>(ReadLE16S_Common(movHdr + 66)));
+    outMov->durationTween = std::max(0, static_cast<int32_t>(ReadLE16S_Common(movHdr + 68)));
+    outMov->loop          = (movHdr[70] != 0);
+    outMov->tweenEasing   = DecodeBitCacheTweenEasing(static_cast<int8_t>(movHdr[71]));
+    outMov->movBoneCount  = ReadLE16U(movHdr + 72);
+    return true;
+}
+
+bool XmlbArmatureLoader::DecodeBitCacheFrameRecord(const uint8_t* fr, size_t availBytes,
+                                                   bool* ioHasStickyBlend, uint32_t* ioStickyBlendSrc,
+                                                   uint32_t* ioStickyBlendDst, XmlbDecodedFrameRecord* outFrame,
+                                                   const XmlbBitCacheLayout& layout) {
+    if (!fr || !outFrame || layout.frameDataStructSize < 168 || availBytes < layout.frameDataStructSize) {
+        return false;
+    }
+    outFrame->x           = static_cast<float>(ReadLE16S_Common(fr + 0) + ReadLE16S_Common(fr + 4) * 0.001);
+    outFrame->y           = static_cast<float>(ReadLE16S_Common(fr + 2) + ReadLE16S_Common(fr + 6) * 0.001);
+    outFrame->scaleX      = static_cast<float>(ReadLE16S_Common(fr + 8) + ReadLE16S_Common(fr + 12) * 0.001);
+    outFrame->scaleY      = static_cast<float>(ReadLE16S_Common(fr + 10) + ReadLE16S_Common(fr + 14) * 0.001);
+    outFrame->skewX       = static_cast<float>(ReadLE16S_Common(fr + 16)) * 0.001f;
+    outFrame->skewY       = static_cast<float>(ReadLE16S_Common(fr + 18)) * 0.001f;
+    outFrame->tweenRotate = static_cast<float>(ReadLE16S_Common(fr + 20) + ReadLE16S_Common(fr + 22) * 0.001);
+    outFrame->duration    = std::max(0, static_cast<int32_t>(ReadLE16S_Common(fr + 24)));
+    outFrame->a           = ClampColorChannel(ReadLE16S_Common(fr + 26));
+    outFrame->r           = ClampColorChannel(ReadLE16S_Common(fr + 28));
+    outFrame->g           = ClampColorChannel(ReadLE16S_Common(fr + 30));
+    outFrame->b           = ClampColorChannel(ReadLE16S_Common(fr + 32));
+    outFrame->zOrder         = static_cast<int32_t>(static_cast<int8_t>(fr[34]));
+    outFrame->isUseColorInfo = (fr[35] != 0);
+    outFrame->tweenEasing    = DecodeBitCacheTweenEasing(static_cast<int8_t>(fr[36]));
+    outFrame->isTween        = (fr[37] != 0);
+    outFrame->rawBlendType   = fr[38];
+    outFrame->displayIndex   = static_cast<int32_t>(static_cast<int8_t>(fr[39]));
+    outFrame->strEvent       = ReadFixedCString_Common(fr + 40, 64);
+    outFrame->strMovement    = ReadFixedCString_Common(fr + 104, 64);
+
+    uint8_t effBlend = (outFrame->rawBlendType == 0 && outFrame->strEvent == "1") ? 1u : outFrame->rawBlendType;
+    if (effBlend != 0) {
+        MapBlendTypeToGL(effBlend, &outFrame->blendSrc, &outFrame->blendDst);
+        if (ioHasStickyBlend) *ioHasStickyBlend = true;
+        if (ioStickyBlendSrc) *ioStickyBlendSrc = outFrame->blendSrc;
+        if (ioStickyBlendDst) *ioStickyBlendDst = outFrame->blendDst;
+    } else if (ioHasStickyBlend && *ioHasStickyBlend && ioStickyBlendSrc && ioStickyBlendDst) {
+        outFrame->blendSrc = *ioStickyBlendSrc;
+        outFrame->blendDst = *ioStickyBlendDst;
+    } else {
+        MapBlendTypeToGL(0, &outFrame->blendSrc, &outFrame->blendDst);
+    }
+    return true;
+}
 
 bool XmlbArmatureLoader::ValidateBitCacheBuffer(const uint8_t* bitCacheData,
                                                 size_t bitCacheSize,
@@ -828,10 +922,12 @@ bool XmlbArmatureLoader::AddDataFromXmlbFileImpl(const std::string& imagePath,
         return false;
     }
 
+    const std::string requestedConfigPath = NormalizeAssetPath(filePath);
+    const std::string effectiveBase = baseFilePath.empty() ? normPath : baseFilePath;
     const bool ok = AddDataFromXmlbBuffer(rawData,
                                           static_cast<size_t>(fileSize),
-                                          normPath,
-                                          baseFilePath,
+                                          requestedConfigPath,
+                                          effectiveBase,
                                           asyncLock,
                                           plistPath,
                                           imagePath);
@@ -858,6 +954,7 @@ bool XmlbArmatureLoader::AddDataFromXmlbBuffer(const uint8_t* data,
         return false;
     }
 
+#if defined(GCLIENT_XMLB_HAS_PROTOBUF)
     ArmatureRoot root;
     if (root.ParseFromArray(data, static_cast<int>(size)) &&
         (root.armature_data_size() > 0 || root.animation_data_size() > 0 ||
@@ -866,6 +963,7 @@ bool XmlbArmatureLoader::AddDataFromXmlbBuffer(const uint8_t* data,
         return AddDataFromArmatureRoot(
             root, configFilePath, baseFilePath, asyncLock, plistPath, imagePath);
     }
+#endif
 
     const XmlbBitCacheLayout defaultLayout;
     if (!ValidateBitCacheBuffer(data, size, defaultLayout)) {
@@ -883,7 +981,8 @@ bool XmlbArmatureLoader::AddDataFromXmlbBuffer(const uint8_t* data,
                                asyncLock,
                                defaultLayout,
                                plistPath,
-                               imagePath);
+                               imagePath,
+                               baseFilePath);
 }
 
 bool XmlbArmatureLoader::AddDataFromXmlbBuffer(const uint8_t* data,
@@ -918,6 +1017,7 @@ bool XmlbArmatureLoader::AddDataFromProtobufBuffer(const uint8_t* data,
         return false;
     }
 
+#if defined(GCLIENT_XMLB_HAS_PROTOBUF)
     ArmatureRoot root;
     if (!root.ParseFromArray(data, static_cast<int>(size))) {
 #if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
@@ -926,9 +1026,12 @@ bool XmlbArmatureLoader::AddDataFromProtobufBuffer(const uint8_t* data,
 #endif
         return false;
     }
-
     return AddDataFromArmatureRoot(
         root, configFilePath, baseFilePath, asyncLock, plistPath, imagePath);
+#else
+    (void)configFilePath; (void)baseFilePath; (void)asyncLock; (void)plistPath; (void)imagePath;
+    return false;
+#endif
 }
 
 bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
@@ -937,7 +1040,7 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
                                                  bool asyncLock,
                                                  const std::string& plistPath,
                                                  const std::string& imagePath) {
-#if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
+#if (defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)) && defined(GCLIENT_XMLB_HAS_PROTOBUF)
     const std::string normConfigPath = NormalizeAssetPath(configFilePath);
     const std::string effectiveBase  =
         baseFilePath.empty() ? normConfigPath : NormalizeAssetPath(baseFilePath);
@@ -1085,7 +1188,7 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
             movData->loop          = pbMov.lp();
             movData->durationTo    = std::max(0, pbMov.to());
             movData->durationTween = std::max(0, pbMov.drtw());
-            movData->tweenEasing   = static_cast<cocos2d::extension::CCTweenType>(pbMov.twe());
+            movData->tweenEasing   = static_cast<cocos2d::extension::CCTweenType>(pbMov.twe() == 2 ? 3 : pbMov.twe());
             const float rawScale   = pbMov.has_sc() ? pbMov.sc() : 1.0f;
             movData->scale         = (std::isfinite(rawScale) && rawScale > 0.0f) ? rawScale : 1.0f;
 
@@ -1104,6 +1207,8 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
 
                 int cumulativeDuration    = 0;
                 int nextSequentialFrameId = 0;
+                bool hasStickyBlend       = false;
+                cocos2d::ccBlendFunc stickyBlend = { CC_BLEND_SRC, CC_BLEND_DST };
 
                 for (int f = 0; f < pbMovBone.frame_data_size(); ++f) {
                     const ArmatureFrameData& pbFrame = pbMovBone.frame_data(f);
@@ -1118,7 +1223,7 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
                     frameData->skewX        = pbFrame.kx();
                     frameData->skewY        = pbFrame.ky();
                     frameData->tweenEasing  =
-                        static_cast<cocos2d::extension::CCTweenType>(pbFrame.twe());
+                        static_cast<cocos2d::extension::CCTweenType>(pbFrame.twe() == 2 ? 3 : pbFrame.twe());
                     frameData->isTween =
                         pbFrame.has_tweenframe() ? pbFrame.tweenframe() : true;
 
@@ -1139,11 +1244,14 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
                     nextSequentialFrameId = static_cast<int>(
                         nextSeq64 > 0x7FFFFFFFLL ? 0x7FFFFFFFLL : nextSeq64);
 
+                    if (pbFrame.has_evt()) {
+                        frameData->strEvent = pbFrame.evt();
+                    }
                     if (pbFrame.has_bd()) {
                         switch (static_cast<cocos2d::extension::CCBlendType>(pbFrame.bd())) {
                             case cocos2d::extension::BLEND_LAYER:
                             case cocos2d::extension::BLEND_ADD:
-                                frameData->blendFunc = { GL_SRC_ALPHA, GL_ONE };
+                                frameData->blendFunc = { CC_BLEND_SRC, GL_ONE };
                                 break;
                             case cocos2d::extension::BLEND_MULTIPLY:
                                 frameData->blendFunc = { GL_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA };
@@ -1155,9 +1263,13 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
                                 frameData->blendFunc = { CC_BLEND_SRC, CC_BLEND_DST };
                                 break;
                         }
-                    }
-                    if (pbFrame.has_evt()) {
-                        frameData->strEvent = pbFrame.evt();
+                        if (pbFrame.bd() != 0) { hasStickyBlend = true; stickyBlend = frameData->blendFunc; }
+                    } else if (frameData->strEvent == "1") {
+                        frameData->blendFunc = { CC_BLEND_SRC, GL_ONE };
+                        hasStickyBlend = true;
+                        stickyBlend = frameData->blendFunc;
+                    } else if (hasStickyBlend) {
+                        frameData->blendFunc = stickyBlend;
                     }
                     if (pbFrame.has_color()) {
                         ApplyProtoColor(frameData, pbFrame.color());
@@ -1215,19 +1327,6 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
             LoadResolvedSpriteSheet(pbTex.plistfile(), effectiveBase, nullptr, loadedSheets);
         }
 
-        {
-            bool exists = false;
-            if (asyncLock) {
-                std::lock_guard<std::mutex> lock(g_armatureDataManagerMutex);
-                exists = (manager->getTextureData(pbTex.name().c_str()) != nullptr);
-            } else {
-                exists = (manager->getTextureData(pbTex.name().c_str()) != nullptr);
-            }
-            if (exists) {
-                continue;
-            }
-        }
-
         auto* texData   = new cocos2d::extension::CCTextureData();
         texData->init();
         texData->name   = pbTex.name();
@@ -1273,6 +1372,7 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
     (void)asyncLock;
     (void)plistPath;
     (void)imagePath;
+    (void)baseFilePath;
     return false;
 #endif
 }
@@ -1283,7 +1383,8 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
                                              bool asyncLock,
                                              const XmlbBitCacheLayout& layout,
                                              const std::string& plistPath,
-                                             const std::string& imagePath) {
+                                             const std::string& imagePath,
+                                             const std::string& baseFilePath) {
 #if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
     if (!ValidateBitCacheBuffer(bitCacheData, bitCacheSize, layout)) {
         return false;
@@ -1295,10 +1396,11 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
     }
 
     const std::string normConfigPath = NormalizeAssetPath(configFilePath);
-    if (!normConfigPath.empty() || !plistPath.empty() || !imagePath.empty()) {
+    const std::string effectiveBase  = baseFilePath.empty() ? normConfigPath : NormalizeAssetPath(baseFilePath);
+    if (!normConfigPath.empty() || !effectiveBase.empty() || !plistPath.empty() || !imagePath.empty()) {
         std::unordered_set<std::string> loadedSheets;
         PreloadArmatureSpriteSheets(
-            normConfigPath, normConfigPath, plistPath, imagePath, loadedSheets);
+            normConfigPath, effectiveBase, plistPath, imagePath, loadedSheets);
     }
 
     const uint8_t* end    = bitCacheData + bitCacheSize;
@@ -1413,15 +1515,22 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
                 animData->release();
                 return false;
             }
-            const uint8_t* movHdr       = cursor;
-            const uint16_t movBoneCount = ReadLE16U(movHdr + 72);
+            const uint8_t* movHdr = cursor;
+            XmlbDecodedMovementHeader decMov;
+            if (!DecodeBitCacheMovementHeader(movHdr, static_cast<size_t>(end - cursor), &decMov, layout)) {
+                animData->release();
+                return false;
+            }
             cursor += layout.movementDataStructSize;
 
-            auto* movData       = new cocos2d::extension::CCMovementData();
-            movData->name       = ReadFixedCString(movHdr, 64);
-            movData->duration   = ReadLE32S(movHdr + 64);
-            movData->durationTo = std::max(0, static_cast<int>(ReadLE16S(movHdr + 68)));
-            movData->loop       = (movHdr[70] != 0);
+            auto* movData          = new cocos2d::extension::CCMovementData();
+            movData->name          = decMov.name;
+            movData->duration      = decMov.duration;
+            movData->durationTo    = decMov.durationTo;
+            movData->durationTween = decMov.durationTween;
+            movData->loop          = decMov.loop;
+            movData->tweenEasing   = static_cast<cocos2d::extension::CCTweenType>(decMov.tweenEasing);
+            const uint16_t movBoneCount = decMov.movBoneCount;
             if (!std::isfinite(movData->scale) || movData->scale <= 0.0f) {
                 movData->scale = 1.0f;
             }
@@ -1443,6 +1552,8 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
                 movBoneData->name = ReadFixedCString(mbHdr, 64);
 
                 int cumulativeFrameId = 0;
+                bool hasStickyBlend = false;
+                uint32_t stickySrc = CC_BLEND_SRC, stickyDst = CC_BLEND_DST;
                 for (uint16_t f = 0; f < frameCount; ++f) {
                     if (cursor + layout.frameDataStructSize > end) {
                         movBoneData->release();
@@ -1451,39 +1562,42 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
                         return false;
                     }
                     const uint8_t* fr = cursor;
+                    XmlbDecodedFrameRecord decFrame;
+                    if (!DecodeBitCacheFrameRecord(fr, static_cast<size_t>(end - cursor),
+                                                   &hasStickyBlend, &stickySrc, &stickyDst,
+                                                   &decFrame, layout)) {
+                        movBoneData->release();
+                        movData->release();
+                        animData->release();
+                        return false;
+                    }
                     cursor += layout.frameDataStructSize;
 
-                    auto* frameData = new cocos2d::extension::CCFrameData();
-                    frameData->x = static_cast<float>(
-                        static_cast<double>(ReadLE16S(fr + 0)) +
-                        static_cast<double>(ReadLE16S(fr + 4)) * 0.001);
-                    frameData->y = static_cast<float>(
-                        static_cast<double>(ReadLE16S(fr + 2)) +
-                        static_cast<double>(ReadLE16S(fr + 6)) * 0.001);
-                    frameData->scaleX = static_cast<float>(
-                        static_cast<double>(ReadLE16S(fr + 8)) +
-                        static_cast<double>(ReadLE16S(fr + 12)) * 0.001);
-                    frameData->scaleY = static_cast<float>(
-                        static_cast<double>(ReadLE16S(fr + 10)) +
-                        static_cast<double>(ReadLE16S(fr + 14)) * 0.001);
-
-                    frameData->skewX          = static_cast<float>(ReadLE16S(fr + 16)) * 0.001f;
-                    frameData->skewY          = static_cast<float>(ReadLE16S(fr + 18)) * 0.001f;
+                    auto* frameData           = new cocos2d::extension::CCFrameData();
+                    frameData->x              = decFrame.x;
+                    frameData->y              = decFrame.y;
+                    frameData->scaleX         = decFrame.scaleX;
+                    frameData->scaleY         = decFrame.scaleY;
+                    frameData->skewX          = decFrame.skewX;
+                    frameData->skewY          = decFrame.skewY;
+                    frameData->tweenRotate    = decFrame.tweenRotate;
+                    frameData->duration       = decFrame.duration;
+                    frameData->a              = decFrame.a;
+                    frameData->r              = decFrame.r;
+                    frameData->g              = decFrame.g;
+                    frameData->b              = decFrame.b;
+                    frameData->zOrder         = decFrame.zOrder;
+                    frameData->isUseColorInfo = decFrame.isUseColorInfo;
                     frameData->tweenEasing    =
-                        static_cast<cocos2d::extension::CCTweenType>(ReadLE16S(fr + 20));
-                    frameData->duration       = std::max(0, static_cast<int>(ReadLE16S(fr + 24)));
-                    frameData->a              = static_cast<unsigned char>(ReadLE16S(fr + 26));
-                    frameData->r              = static_cast<unsigned char>(ReadLE16S(fr + 28));
-                    frameData->g              = static_cast<unsigned char>(ReadLE16S(fr + 30));
-                    frameData->b              = static_cast<unsigned char>(ReadLE16S(fr + 32));
-                    frameData->zOrder         = static_cast<int>(static_cast<int8_t>(fr[34]));
-                    frameData->isTween        = (fr[35] != 0);
-                    frameData->displayIndex   = static_cast<int>(static_cast<int8_t>(fr[36]));
-                    frameData->isUseColorInfo = (fr[37] != 0);
-                    frameData->blendFunc      = MapBitCacheBlendType(fr[38]);
-
-                    frameData->strEvent    = ReadFixedCString(fr + 40, 64);
-                    frameData->strMovement = ReadFixedCString(fr + 104, 64);
+                        static_cast<cocos2d::extension::CCTweenType>(decFrame.tweenEasing);
+                    frameData->isTween        = decFrame.isTween;
+                    frameData->displayIndex   = decFrame.displayIndex;
+                    frameData->blendFunc      = {
+                        static_cast<GLenum>(decFrame.blendSrc),
+                        static_cast<GLenum>(decFrame.blendDst)
+                    };
+                    frameData->strEvent    = decFrame.strEvent;
+                    frameData->strMovement = decFrame.strMovement;
 
                     frameData->frameID = cumulativeFrameId;
                     cumulativeFrameId += frameData->duration;
@@ -1534,19 +1648,6 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
         cursor += layout.textureDataStructSize;
 
         const std::string texName = ReadFixedCString(texHdr, 64);
-        {
-            bool exists = false;
-            if (asyncLock) {
-                std::lock_guard<std::mutex> lock(g_armatureDataManagerMutex);
-                exists = (manager->getTextureData(texName.c_str()) != nullptr);
-            } else {
-                exists = (manager->getTextureData(texName.c_str()) != nullptr);
-            }
-            if (exists) {
-                continue;
-            }
-        }
-
         auto* texData   = new cocos2d::extension::CCTextureData();
         texData->init();
         texData->name   = texName;
@@ -1562,6 +1663,7 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
         texData->release();
     }
 
+    (void)ReadLE32S; (void)MapBitCacheBlendType;
     return true;
 #else
     (void)bitCacheData;
@@ -1571,6 +1673,7 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
     (void)layout;
     (void)plistPath;
     (void)imagePath;
+    (void)baseFilePath;
     return false;
 #endif
 }
