@@ -32,6 +32,8 @@ constexpr int SOCKET_ERROR = -1;
 #include <string>
 #include <vector>
 
+struct lua_State;
+
 namespace gclient::net {
 
 class CNetwork;
@@ -145,6 +147,9 @@ public:
     void registerBodyFunc(int luaHandler);
     void registerCloseFunc(int luaHandler);
 
+    // Optional standalone Lua VM binding for headless/Linux regression testing without CCLuaEngine.
+    void setStandaloneLuaState(lua_State* L) noexcept { standaloneLuaState_ = L; }
+
     void setHeadCallback(HeadCallback cb);
     void setBodyCallback(BodyCallback cb);
     void setCloseCallback(CloseCallback cb);
@@ -180,6 +185,14 @@ private:
 
     void releaseAllScriptHandlers();
     static void removeLuaScriptHandler(int& handlerSlot);
+    void invokeProtectedLuaHandler(int luaHandler,
+                                   const char* contextLabel,
+                                   const char* traceErrorEvent,
+                                   const char* bodyData,
+                                   size_t bodyLength,
+                                   const char* headerData,
+                                   size_t headerLength,
+                                   bool pushPacketArgs);
 
     bool tryStartNextEndpointLocked(int& outLastErr, bool& outConnectedImmediately);
     uint32_t getBodyLength(const char* headerPtr, bool& outZeroBodyOk);
@@ -220,6 +233,7 @@ private:
     int headLuaHandler_ = 0;
     int bodyLuaHandler_ = 0;
     int closeLuaHandler_ = 0;
+    lua_State* standaloneLuaState_ = nullptr;
     bool closeNotified_ = false;
 
     HeadCallback headCallback_;

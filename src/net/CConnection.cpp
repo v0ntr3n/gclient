@@ -21,7 +21,13 @@
 #if defined(GCLIENT_USE_COCOS2DX)
 #include "CCLuaEngine.h"
 #include "cocos2d.h"
+#include "tolua_fix.h"
 #endif
+
+extern "C" {
+#include "lauxlib.h"
+#include "lua.h"
+}
 
 namespace gclient::net {
 
@@ -58,6 +64,98 @@ void logMessage(const char* msg) {
 #else
     (void)msg;
 #endif
+}
+
+lua_State* resolveActiveConnectionLuaState(lua_State* standaloneFallback) {
+#if defined(GCLIENT_USE_COCOS2DX)
+    // Check CCScriptEngineManager rather than CCLuaEngine::defaultEngine() so late
+    // shutdown never resurrects a brand-new Lua VM after purgeSharedManager()!
+    if (auto* mgr = cocos2d::CCScriptEngineManager::sharedManager()) {
+        if (auto* engine = dynamic_cast<cocos2d::CCLuaEngine*>(mgr->getScriptEngine())) {
+            if (auto* stack = engine->getLuaStack()) {
+                if (lua_State* liveL = stack->getLuaState()) {
+                    return liveL;
+                }
+            }
+        }
+    }
+#endif
+    return standaloneFallback;
+}
+
+int pushLuaTracebackErrorHandler(lua_State* L) {
+    lua_getglobal(L, "__GCLIENT_NATIVE_TRACKBACK__");
+    if (lua_isfunction(L, -1)) {
+        return lua_gettop(L);
+    }
+    lua_pop(L, 1);
+
+    lua_getglobal(L, "debug");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "traceback");
+        lua_remove(L, -2);
+        if (lua_isfunction(L, -1)) {
+            return lua_gettop(L);
+        }
+        lua_pop(L, 1);
+    } else {
+        lua_pop(L, 1);
+    }
+    return 0;
+}
+
+bool pushRegisteredLuaFunction(lua_State* L, int luaHandler) {
+    if (L == nullptr || luaHandler <= 0) {
+        return false;
+    }
+
+#if defined(GCLIENT_USE_COCOS2DX)
+    toluafix_get_function_by_refid(L, luaHandler);
+    if (lua_isfunction(L, -1)) {
+        return true;
+    }
+    lua_pop(L, 1);
+#endif
+
+    lua_pushliteral(L, "toluafix_refid_function_mapping");
+    lua_rawget(L, LUA_REGISTRYINDEX);
+    if (lua_istable(L, -1)) {
+        lua_rawgeti(L, -1, luaHandler);
+        lua_remove(L, -2);
+        if (lua_isfunction(L, -1)) {
+            return true;
+        }
+        lua_pop(L, 1);
+    } else {
+        lua_pop(L, 1);
+    }
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, luaHandler);
+    if (lua_isfunction(L, -1)) {
+        return true;
+    }
+    lua_pop(L, 1);
+    return false;
+}
+
+void logLuaErrorViaCCLuaLog(lua_State* L, const std::string& formattedError) {
+    bool loggedViaLua = false;
+    if (L != nullptr) {
+        lua_getglobal(L, "CCLuaLog");
+        if (lua_isfunction(L, -1)) {
+            lua_pushlstring(L, formattedError.data(), formattedError.size());
+            if (lua_pcall(L, 1, 0, 0) == 0) {
+                loggedViaLua = true;
+            } else {
+                lua_pop(L, 1);
+            }
+        } else {
+            lua_pop(L, 1);
+        }
+    }
+    if (!loggedViaLua) {
+        logMessage(formattedError.c_str());
+    }
 }
 
 } // namespace
@@ -191,6 +289,73 @@ void CConnection::releaseAllScriptHandlers() {
     removeLuaScriptHandler(headLuaHandler_);
     removeLuaScriptHandler(bodyLuaHandler_);
     removeLuaScriptHandler(closeLuaHandler_);
+}
+
+void CConnection::invokeProtectedLuaHandler(int luaHandler,
+                                            const char* contextLabel,
+                                            const char* traceErrorEvent,
+                                            const char* bodyData,
+                                            size_t bodyLength,
+                                            const char* headerData,
+                                            size_t headerLength,
+                                            bool pushPacketArgs) {
+    if (luaHandler <= 0) {
+        return;
+    }
+
+    lua_State* L = resolveActiveConnectionLuaState(standaloneLuaState_);
+    if (L == nullptr) {
+        return;
+    }
+
+    const int savedTop = lua_gettop(L);
+    if (!lua_checkstack(L, 8)) {
+        trace_.record(traceErrorEvent != nullptr ? traceErrorEvent : "LUA_STACK_OVERFLOW",
+                      LUA_ERRMEM,
+                      static_cast<uint32_t>(bodyLength),
+                      static_cast<uint32_t>(headerLength));
+        return;
+    }
+
+    const int errFuncIdx = pushLuaTracebackErrorHandler(L);
+    if (!pushRegisteredLuaFunction(L, luaHandler)) {
+        trace_.record("LUA_HANDLER_INVALID",
+                      0,
+                      static_cast<uint32_t>(bodyLength),
+                      static_cast<uint32_t>(luaHandler));
+        lua_settop(L, savedTop);
+        return;
+    }
+
+    int nargs = 0;
+    if (pushPacketArgs) {
+        lua_pushlstring(L, bodyData != nullptr ? bodyData : "", bodyLength);
+        lua_pushlstring(L, headerData != nullptr ? headerData : "", headerLength);
+        nargs = 2;
+    }
+
+    const int rc = lua_pcall(L, nargs, 0, errFuncIdx);
+    if (rc != 0) {
+        const char* errText = lua_tostring(L, -1);
+        const std::string traceMsg =
+            std::string("[CConnection::") + (contextLabel != nullptr ? contextLabel : "lua") +
+            "] Uncaught Lua error: " + (errText != nullptr ? errText : "(non-string Lua error)");
+
+        trace_.record(traceErrorEvent != nullptr ? traceErrorEvent : "LUA_CALLBACK_ERROR",
+                      rc,
+                      static_cast<uint32_t>(bodyLength),
+                      static_cast<uint32_t>(headerLength));
+
+        if (resolveActiveConnectionLuaState(standaloneLuaState_) == L) {
+            logLuaErrorViaCCLuaLog(L, traceMsg);
+        } else {
+            logMessage(traceMsg.c_str());
+        }
+    }
+
+    if (resolveActiveConnectionLuaState(standaloneLuaState_) == L) {
+        lua_settop(L, savedTop);
+    }
 }
 
 int CConnection::getLastSocketError() noexcept {
@@ -684,21 +849,17 @@ void CConnection::doPacketBody(const char* body, size_t bodyLength) {
         return;
     }
 
-#if defined(GCLIENT_USE_COCOS2DX)
     if (bodyLuaHandler_ > 0) {
-        if (auto* mgr = cocos2d::CCScriptEngineManager::sharedManager()) {
-            if (auto* engine = dynamic_cast<cocos2d::CCLuaEngine*>(mgr->getScriptEngine())) {
-                auto* stack = engine->getLuaStack();
-                stack->pushString(body, static_cast<int>(bodyLength));
-                stack->pushString(currentHeader_.data(), static_cast<int>(currentHeader_.size()));
-                stack->executeFunctionByHandler(bodyLuaHandler_, 2);
-            }
-        }
+        invokeProtectedLuaHandler(
+            bodyLuaHandler_,
+            "doPacketBody",
+            "BODY_SCRIPT_ERROR",
+            body,
+            bodyLength,
+            currentHeader_.empty() ? "" : currentHeader_.data(),
+            currentHeader_.size(),
+            true);
     }
-#else
-    (void)body;
-    (void)bodyLength;
-#endif
 }
 
 bool CConnection::pollCompleteConnect(int& outSoError) {
@@ -911,18 +1072,17 @@ void CConnection::notifyClosedOnMainThread(int wsaError, const char* reason) {
         return;
     }
 
-#if defined(GCLIENT_USE_COCOS2DX)
     if (closeLuaHandler_ > 0) {
-        // Check CCScriptEngineManager rather than CCLuaEngine::defaultEngine() so late
-        // shutdown never resurrects a brand-new Lua VM after purgeSharedManager()!
-        if (auto* mgr = cocos2d::CCScriptEngineManager::sharedManager()) {
-            if (auto* engine = dynamic_cast<cocos2d::CCLuaEngine*>(mgr->getScriptEngine())) {
-                auto* stack = engine->getLuaStack();
-                stack->executeFunctionByHandler(closeLuaHandler_, 0);
-            }
-        }
+        invokeProtectedLuaHandler(
+            closeLuaHandler_,
+            "notifyClosedOnMainThread",
+            "CLOSE_SCRIPT_ERROR",
+            nullptr,
+            0,
+            nullptr,
+            0,
+            false);
     }
-#endif
 }
 
 } // namespace gclient::net

@@ -45,6 +45,7 @@ CLIPPING_MARKER = "GCLIENT_CLIPPING_STENCIL_GUARD"
 UIWIDGET_ADDCHILD_MARKER = "GCLIENT_UIWIDGET_ADDCHILD_GUARD"
 UIWIDGET_LIFECYCLE_V2_MARKER = "GCLIENT_UIWIDGET_LIFECYCLE_V2"
 UIIMAGEVIEW_FALLBACK_MARKER = "GCLIENT_UIIMAGEVIEW_TEXTURE_FALLBACK"
+GUI_TEX_FALLBACK_V2_MARKER = "GCLIENT_GUI_TEX_FALLBACK_PARITY_V2"
 UITOUCHGROUP_MARKER = "GCLIENT_UITOUCHGROUP_GUARD"
 UIHELPER_MARKER = "GCLIENT_UIHELPER_GUARD"
 CCNODE_GUARD_MARKER = "GCLIENT_CCNODE_NDEBUG_GUARD"
@@ -2126,19 +2127,35 @@ def patch_clipping_node(cocos_root: str) -> None:
         print(f"[skip] Already patched CCClippingNode.cpp: {clip_cpp}")
 
 
-GUI_TEX_FALLBACK_HELPER_CPP = """
+GUI_TEX_FALLBACK_HELPER_CPP = r"""
 // GCLIENT_UIIMAGEVIEW_TEXTURE_FALLBACK
+// GCLIENT_GUI_TEX_FALLBACK_PARITY_V2
 namespace {
 static std::string gclientGuiNormPath(const char* raw) {
     if (!raw || !raw[0]) return std::string();
     std::string s(raw);
     for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '\\\\') s[i] = '/';
+        if (s[i] == '\\') s[i] = '/';
     }
     while (!s.empty() && s[0] == '#') {
         s.erase(0, 1);
     }
     return s;
+}
+
+static cocos2d::CCSpriteFrame* gclientGuiTrySpriteFrameWithPngSuffix(
+    cocos2d::CCSpriteFrameCache* cache,
+    const std::string& key)
+{
+    if (!cache || key.empty()) return NULL;
+    if (cocos2d::CCSpriteFrame* f = cache->spriteFrameByName(key.c_str())) return f;
+    const size_t slashPos = key.find_last_of('/');
+    const size_t dotPos = key.find_last_of('.');
+    if (dotPos == std::string::npos || (slashPos != std::string::npos && dotPos < slashPos)) {
+        const std::string withPng = key + ".png";
+        if (cocos2d::CCSpriteFrame* f = cache->spriteFrameByName(withPng.c_str())) return f;
+    }
+    return NULL;
 }
 
 static cocos2d::CCSpriteFrame* gclientGuiFindSpriteFrame(const char* name) {
@@ -2152,18 +2169,54 @@ static cocos2d::CCSpriteFrame* gclientGuiFindSpriteFrame(const char* name) {
     if (s != name) {
         if (cocos2d::CCSpriteFrame* f = cache->spriteFrameByName(s.c_str())) return f;
     }
+    if (cocos2d::CCSpriteFrame* f = gclientGuiTrySpriteFrameWithPngSuffix(cache, s)) return f;
+
     if (s.compare(0, 11, "res/jsonUI/") == 0 && s.size() > 11) {
-        const std::string stripped = s.substr(11);
-        if (cocos2d::CCSpriteFrame* f = cache->spriteFrameByName(stripped.c_str())) return f;
+        if (cocos2d::CCSpriteFrame* f = gclientGuiTrySpriteFrameWithPngSuffix(cache, s.substr(11))) return f;
     }
     if (s.compare(0, 4, "res/") == 0 && s.size() > 4) {
-        const std::string stripped = s.substr(4);
-        if (cocos2d::CCSpriteFrame* f = cache->spriteFrameByName(stripped.c_str())) return f;
+        if (cocos2d::CCSpriteFrame* f = gclientGuiTrySpriteFrameWithPngSuffix(cache, s.substr(4))) return f;
+    }
+    if (s.compare(0, 10, "gameImage/") == 0 && s.size() > 10) {
+        if (cocos2d::CCSpriteFrame* f = gclientGuiTrySpriteFrameWithPngSuffix(cache, std::string("images/") + s.substr(10))) return f;
     }
     const size_t slash = s.find_last_of('/');
     if (slash != std::string::npos && slash + 1 < s.size()) {
-        const std::string base = s.substr(slash + 1);
-        if (cocos2d::CCSpriteFrame* f = cache->spriteFrameByName(base.c_str())) return f;
+        if (cocos2d::CCSpriteFrame* f = gclientGuiTrySpriteFrameWithPngSuffix(cache, s.substr(slash + 1))) return f;
+    }
+    return NULL;
+}
+
+static std::string gclientGuiExtractAssetStem(const std::string& candidate) {
+    if (candidate.size() > 8 &&
+        candidate.compare(candidate.size() - 8, 8, ".pvr.ccz") == 0) {
+        return candidate.substr(0, candidate.size() - 8);
+    }
+    const size_t slashPos = candidate.find_last_of('/');
+    const size_t dotPos = candidate.find_last_of('.');
+    if (dotPos != std::string::npos && (slashPos == std::string::npos || dotPos > slashPos)) {
+        return candidate.substr(0, dotPos);
+    }
+    return candidate;
+}
+
+static cocos2d::CCTexture2D* gclientGuiTryTextureWithExts(
+    cocos2d::CCTextureCache* tc,
+    const std::string& candidate)
+{
+    if (!tc || candidate.empty()) return NULL;
+    if (cocos2d::CCTexture2D* tex = tc->addImage(candidate.c_str())) return tex;
+    const size_t slashPos = candidate.find_last_of('/');
+    const size_t dotPos = candidate.find_last_of('.');
+    if (dotPos == std::string::npos || (slashPos != std::string::npos && dotPos < slashPos)) {
+        const std::string withPng = candidate + ".png";
+        if (cocos2d::CCTexture2D* tex = tc->addImage(withPng.c_str())) return tex;
+    }
+    const std::string stem = gclientGuiExtractAssetStem(candidate);
+    static const char* const kAltExts[6] = {".pvr.ccz", ".pkm", ".png", ".webp", ".jpg", ".jpeg"};
+    for (size_t i = 0; i < 6; ++i) {
+        const std::string altPath = stem + kAltExts[i];
+        if (cocos2d::CCTexture2D* tex = tc->addImage(altPath.c_str())) return tex;
     }
     return NULL;
 }
@@ -2173,9 +2226,22 @@ static cocos2d::CCTexture2D* gclientGuiLoadTexture(const char* name) {
     cocos2d::CCTextureCache* tc = cocos2d::CCTextureCache::sharedTextureCache();
     if (!tc) return NULL;
     if (cocos2d::CCTexture2D* tex = tc->addImage(name)) return tex;
+
     const std::string s = gclientGuiNormPath(name);
-    if (!s.empty() && s != name) {
+    if (s.empty()) return NULL;
+    if (s != name) {
         if (cocos2d::CCTexture2D* tex = tc->addImage(s.c_str())) return tex;
+    }
+    if (cocos2d::CCTexture2D* tex = gclientGuiTryTextureWithExts(tc, s)) return tex;
+
+    if (s.compare(0, 11, "res/jsonUI/") == 0 && s.size() > 11) {
+        if (cocos2d::CCTexture2D* tex = gclientGuiTryTextureWithExts(tc, s.substr(11))) return tex;
+    }
+    if (s.compare(0, 4, "res/") == 0 && s.size() > 4) {
+        if (cocos2d::CCTexture2D* tex = gclientGuiTryTextureWithExts(tc, s.substr(4))) return tex;
+    }
+    if (s.compare(0, 10, "gameImage/") == 0 && s.size() > 10) {
+        if (cocos2d::CCTexture2D* tex = gclientGuiTryTextureWithExts(tc, std::string("images/") + s.substr(10))) return tex;
     }
     return NULL;
 }
@@ -2224,304 +2290,346 @@ static bool gclientGuiApplyToRenderer(
 """
 
 
+def _ensure_or_upgrade_gui_tex_fallback(txt: str) -> str:
+    if UIIMAGEVIEW_FALLBACK_MARKER not in txt:
+        return _insert_before_ns_cc_begin(txt, GUI_TEX_FALLBACK_HELPER_CPP)
+    if GUI_TEX_FALLBACK_V2_MARKER not in txt:
+        upgraded, n_sub = re.subn(
+            r"\n?//[ \t]*" + re.escape(UIIMAGEVIEW_FALLBACK_MARKER)
+            + r"(?:\s*\n//[ \t]*[A-Za-z0-9_]+)?"
+            + r"\s*\nnamespace\s*\{.*?\}[ \t]*//[ \t]*anonymous namespace[ \t]*\n?",
+            lambda _m: GUI_TEX_FALLBACK_HELPER_CPP + "\n",
+            txt,
+            count=1,
+            flags=re.DOTALL,
+        )
+        if n_sub > 0:
+            return upgraded
+    return txt
+
+
 def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
     # 1. UIWidget.cpp: full lifecycle synchronization between CCNode::m_pChildren, _widgetChildren, and _nodes,
     #    re-entrancy-safe removeAllChildrenWithCleanup / removeAllNodes, getNodes() stale-pointer pruning,
     #    null-parent guards in setSize/updateSizeAndPosition, and CCNodeRGBA opacity/color sync.
+    #    Per-method marker checks ensure 100% idempotency even on V1 / partially patched Cocos2d-x trees.
     widget_cpp = os.path.join(cocos_root, "extensions", "CocoStudio", "GUI", "BaseClasses", "UIWidget.cpp")
     if os.path.exists(widget_cpp):
         txt = _read_text_closed(widget_cpp)
         orig_txt = txt
-        if UIWIDGET_LIFECYCLE_V2_MARKER not in txt:
-            if "#include <vector>" not in txt:
-                txt = _insert_before_ns_cc_begin(txt, f"#include <vector> // {UIWIDGET_LIFECYCLE_V2_MARKER}")
+        if "#include <vector>" not in txt:
+            txt = _insert_before_ns_cc_begin(txt, f"#include <vector> // {UIWIDGET_LIFECYCLE_V2_MARKER}")
 
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::addChild")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                c_var = _extract_param_ident(params[0], "child") if len(params) >= 1 else "child"
-                if len(params) == 1:
-                    new_body = (
-                        "{\n"
-                        f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                        f"    if (!{c_var} || {c_var} == this) return;\n"
-                        f"    this->addChild({c_var}, {c_var}->getZOrder(), {c_var}->getTag());\n"
-                        "}"
-                    )
-                elif len(params) == 2:
-                    z_var = _extract_param_ident(params[1], "zOrder")
-                    new_body = (
-                        "{\n"
-                        f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                        f"    if (!{c_var} || {c_var} == this) return;\n"
-                        f"    this->addChild({c_var}, {z_var}, {c_var}->getTag());\n"
-                        "}"
-                    )
-                else:
-                    z_var = _extract_param_ident(params[1], "zOrder") if len(params) >= 2 else "zOrder"
-                    t_var = _extract_param_ident(params[2], "tag") if len(params) >= 3 else "tag"
-                    new_body = (
-                        "{\n"
-                        f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                        f"    if (!{c_var} || {c_var} == this) return;\n"
-                        f"    if (dynamic_cast<Widget*>({c_var}) == NULL)\n"
-                        "    {\n"
-                        f"        this->addNode({c_var}, {z_var}, {t_var});\n"
-                        "        return;\n"
-                        "    }\n"
-                        f"    if ({c_var}->getParent() == this)\n"
-                        "    {\n"
-                        f"        this->reorderChild({c_var}, {z_var});\n"
-                        f"        {c_var}->setTag({t_var});\n"
-                        f"        if (_widgetChildren && !_widgetChildren->containsObject({c_var})) {{ _widgetChildren->addObject({c_var}); }}\n"
-                        "        return;\n"
-                        "    }\n"
-                        f"    CCNode::addChild({c_var}, {z_var}, {t_var});\n"
-                        f"    if (_widgetChildren && !_widgetChildren->containsObject({c_var})) {{ _widgetChildren->addObject({c_var}); }}\n"
-                        "}"
-                    )
-                txt = txt[:b_start] + new_body + txt[b_end:]
-
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::addNode")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                n_var = _extract_param_ident(params[0], "node") if len(params) >= 1 else "node"
-                if len(params) == 1:
-                    new_body = (
-                        "{\n"
-                        f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                        f"    if (!{n_var} || {n_var} == this) return;\n"
-                        f"    this->addNode({n_var}, {n_var}->getZOrder(), {n_var}->getTag());\n"
-                        "}"
-                    )
-                elif len(params) == 2:
-                    z_var = _extract_param_ident(params[1], "zOrder")
-                    new_body = (
-                        "{\n"
-                        f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                        f"    if (!{n_var} || {n_var} == this) return;\n"
-                        f"    this->addNode({n_var}, {z_var}, {n_var}->getTag());\n"
-                        "}"
-                    )
-                else:
-                    z_var = _extract_param_ident(params[1], "zOrder")
-                    t_var = _extract_param_ident(params[2], "tag")
-                    new_body = (
-                        "{\n"
-                        f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                        f"    if (!{n_var} || {n_var} == this) return;\n"
-                        f"    if (dynamic_cast<Widget*>({n_var}) != NULL)\n"
-                        "    {\n"
-                        f"        this->addChild({n_var}, {z_var}, {t_var});\n"
-                        "        return;\n"
-                        "    }\n"
-                        f"    if ({n_var}->getParent() == this)\n"
-                        "    {\n"
-                        f"        this->reorderChild({n_var}, {z_var});\n"
-                        f"        {n_var}->setTag({t_var});\n"
-                        f"        if (_nodes && !_nodes->containsObject({n_var})) {{ _nodes->addObject({n_var}); }}\n"
-                        "        return;\n"
-                        "    }\n"
-                        f"    CCNode::addChild({n_var}, {z_var}, {t_var});\n"
-                        f"    if (_nodes && !_nodes->containsObject({n_var})) {{ _nodes->addObject({n_var}); }}\n"
-                        "}"
-                    )
-                txt = txt[:b_start] + new_body + txt[b_end:]
-
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::removeChild")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                c_var = _extract_param_ident(params[0], "child") if params else "child"
-                if len(params) == 1:
-                    new_rm = (
-                        "{\n"
-                        f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                        f"    if (!{c_var}) return;\n"
-                        f"    this->removeChild({c_var}, true);\n"
-                        "}"
-                    )
-                    txt = txt[:b_start] + new_rm + txt[b_end:]
-                elif len(params) == 2:
-                    cl_var = _extract_param_ident(params[1], "cleanup")
-                    new_rm = (
-                        "{\n"
-                        f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                        f"    if (!{c_var}) return;\n"
-                        f"    {c_var}->retain();\n"
-                        f"    CCNode::removeChild({c_var}, {cl_var});\n"
-                        f"    if (_widgetChildren) {{ _widgetChildren->removeObject({c_var}); }}\n"
-                        f"    if (_nodes) {{ _nodes->removeObject({c_var}); }}\n"
-                        f"    {c_var}->release();\n"
-                        "}"
-                    )
-                    txt = txt[:b_start] + new_rm + txt[b_end:]
-
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::removeNode")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                if len(params) == 1:
-                    n_var = _extract_param_ident(params[0], "node")
-                    new_rm_node = (
-                        "{\n"
-                        f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                        f"    if (!{n_var}) return;\n"
-                        f"    {n_var}->retain();\n"
-                        f"    CCNode::removeChild({n_var}, true);\n"
-                        f"    if (_nodes) {{ _nodes->removeObject({n_var}); }}\n"
-                        f"    if (_widgetChildren) {{ _widgetChildren->removeObject({n_var}); }}\n"
-                        f"    {n_var}->release();\n"
-                        "}"
-                    )
-                    txt = txt[:b_start] + new_rm_node + txt[b_end:]
-
-            for b_start, b_end in reversed(_find_method_body_spans(txt, "Widget::removeAllNodes")):
-                new_rm_all_nodes = (
+        for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::addChild")):
+            body = txt[b_start:b_end]
+            if UIWIDGET_LIFECYCLE_V2_MARKER in body:
+                continue
+            params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+            c_var = _extract_param_ident(params[0], "child") if len(params) >= 1 else "child"
+            if len(params) == 1:
+                new_body = (
                     "{\n"
-                    f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                    "    if (_nodes && _nodes->data && _nodes->data->num > 0)\n"
-                    "    {\n"
-                    "        std::vector<CCNode*> snapshot;\n"
-                    "        snapshot.reserve((size_t)_nodes->data->num);\n"
-                    "        for (unsigned int i = 0; i < _nodes->data->num; ++i)\n"
-                    "        {\n"
-                    "            CCNode* pNode = static_cast<CCNode*>(_nodes->data->arr[i]);\n"
-                    "            if (pNode) { pNode->retain(); snapshot.push_back(pNode); }\n"
-                    "        }\n"
-                    "        _nodes->removeAllObjects();\n"
-                    "        for (size_t i = 0; i < snapshot.size(); ++i)\n"
-                    "        {\n"
-                    "            CCNode::removeChild(snapshot[i], true);\n"
-                    "            snapshot[i]->release();\n"
-                    "        }\n"
-                    "    }\n"
+                    f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                    f"    if (!{c_var} || {c_var} == this) return;\n"
+                    f"    this->addChild({c_var}, {c_var}->getZOrder(), {c_var}->getTag());\n"
                     "}"
                 )
-                txt = txt[:b_start] + new_rm_all_nodes + txt[b_end:]
-
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::removeAllChildrenWithCleanup")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                cl_var = _extract_param_ident(params[0], "cleanup") if params else "cleanup"
-                new_rm_all_children = (
+            elif len(params) == 2:
+                z_var = _extract_param_ident(params[1], "zOrder")
+                new_body = (
                     "{\n"
-                    f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                    "    std::vector<CCNode*> snapshot;\n"
-                    "    size_t cap = 0;\n"
-                    "    if (_widgetChildren && _widgetChildren->data && _widgetChildren->data->num > 0) cap += (size_t)_widgetChildren->data->num;\n"
-                    "    if (_nodes && _nodes->data && _nodes->data->num > 0) cap += (size_t)_nodes->data->num;\n"
-                    "    if (cap > 0) snapshot.reserve(cap);\n"
-                    "    if (_widgetChildren && _widgetChildren->data && _widgetChildren->data->num > 0)\n"
-                    "    {\n"
-                    "        for (unsigned int i = 0; i < _widgetChildren->data->num; ++i)\n"
-                    "        {\n"
-                    "            CCNode* pNode = static_cast<CCNode*>(_widgetChildren->data->arr[i]);\n"
-                    "            if (pNode) { pNode->retain(); snapshot.push_back(pNode); }\n"
-                    "        }\n"
-                    "        _widgetChildren->removeAllObjects();\n"
-                    "    }\n"
-                    "    if (_nodes && _nodes->data && _nodes->data->num > 0)\n"
-                    "    {\n"
-                    "        for (unsigned int i = 0; i < _nodes->data->num; ++i)\n"
-                    "        {\n"
-                    "            CCNode* pNode = static_cast<CCNode*>(_nodes->data->arr[i]);\n"
-                    "            if (pNode) { pNode->retain(); snapshot.push_back(pNode); }\n"
-                    "        }\n"
-                    "        _nodes->removeAllObjects();\n"
-                    "    }\n"
-                    "    for (size_t i = 0; i < snapshot.size(); ++i)\n"
-                    "    {\n"
-                    f"        CCNode::removeChild(snapshot[i], {cl_var});\n"
-                    "        snapshot[i]->release();\n"
-                    "    }\n"
+                    f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                    f"    if (!{c_var} || {c_var} == this) return;\n"
+                    f"    this->addChild({c_var}, {z_var}, {c_var}->getTag());\n"
                     "}"
                 )
-                txt = txt[:b_start] + new_rm_all_children + txt[b_end:]
-
-            for b_start, b_end in reversed(_find_method_body_spans(txt, "Widget::getNodes")):
-                new_get_nodes = (
+            else:
+                z_var = _extract_param_ident(params[1], "zOrder") if len(params) >= 2 else "zOrder"
+                t_var = _extract_param_ident(params[2], "tag") if len(params) >= 3 else "tag"
+                new_body = (
                     "{\n"
-                    f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                    "    if (_nodes && _nodes->data)\n"
+                    f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                    f"    if (!{c_var} || {c_var} == this) return;\n"
+                    f"    if (dynamic_cast<Widget*>({c_var}) == NULL)\n"
                     "    {\n"
-                    "        for (int i = (int)_nodes->data->num - 1; i >= 0; --i)\n"
-                    "        {\n"
-                    "            CCNode* pNode = static_cast<CCNode*>(_nodes->data->arr[i]);\n"
-                    "            if (!pNode || pNode->getParent() != this)\n"
-                    "            {\n"
-                    "                _nodes->removeObjectAtIndex((unsigned int)i);\n"
-                    "            }\n"
-                    "        }\n"
+                    f"        this->addNode({c_var}, {z_var}, {t_var});\n"
+                    "        return;\n"
                     "    }\n"
-                    "    return _nodes;\n"
+                    f"    if ({c_var}->getParent() == this)\n"
+                    "    {\n"
+                    f"        this->reorderChild({c_var}, {z_var});\n"
+                    f"        {c_var}->setTag({t_var});\n"
+                    f"        if (_widgetChildren && !_widgetChildren->containsObject({c_var})) {{ _widgetChildren->addObject({c_var}); }}\n"
+                    "        return;\n"
+                    "    }\n"
+                    f"    CCNode::addChild({c_var}, {z_var}, {t_var});\n"
+                    f"    if (_widgetChildren && !_widgetChildren->containsObject({c_var})) {{ _widgetChildren->addObject({c_var}); }}\n"
                     "}"
                 )
-                txt = txt[:b_start] + new_get_nodes + txt[b_end:]
+            txt = txt[:b_start] + new_body + txt[b_end:]
 
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::getNodeByTag")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                t_var = _extract_param_ident(params[0], "tag") if params else "tag"
-                new_get_node_tag = (
+        for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::addNode")):
+            body = txt[b_start:b_end]
+            if UIWIDGET_LIFECYCLE_V2_MARKER in body:
+                continue
+            params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+            n_var = _extract_param_ident(params[0], "node") if len(params) >= 1 else "node"
+            if len(params) == 1:
+                new_body = (
                     "{\n"
-                    f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                    f"    if ({t_var} == kCCNodeTagInvalid) return NULL;\n"
-                    "    CCArray* liveNodes = this->getNodes();\n"
-                    "    if (liveNodes && liveNodes->count() > 0)\n"
-                    "    {\n"
-                    "        CCObject* renderer = NULL;\n"
-                    "        CCARRAY_FOREACH(liveNodes, renderer)\n"
-                    "        {\n"
-                    "            CCNode* pNode = (CCNode*)renderer;\n"
-                    f"            if (pNode && pNode->getTag() == {t_var}) return pNode;\n"
-                    "        }\n"
-                    "    }\n"
-                    "    return NULL;\n"
+                    f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                    f"    if (!{n_var} || {n_var} == this) return;\n"
+                    f"    this->addNode({n_var}, {n_var}->getZOrder(), {n_var}->getTag());\n"
                     "}"
                 )
-                txt = txt[:b_start] + new_get_node_tag + txt[b_end:]
+            elif len(params) == 2:
+                z_var = _extract_param_ident(params[1], "zOrder")
+                new_body = (
+                    "{\n"
+                    f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                    f"    if (!{n_var} || {n_var} == this) return;\n"
+                    f"    this->addNode({n_var}, {z_var}, {n_var}->getTag());\n"
+                    "}"
+                )
+            else:
+                z_var = _extract_param_ident(params[1], "zOrder")
+                t_var = _extract_param_ident(params[2], "tag")
+                new_body = (
+                    "{\n"
+                    f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                    f"    if (!{n_var} || {n_var} == this) return;\n"
+                    f"    if (dynamic_cast<Widget*>({n_var}) != NULL)\n"
+                    "    {\n"
+                    f"        this->addChild({n_var}, {z_var}, {t_var});\n"
+                    "        return;\n"
+                    "    }\n"
+                    f"    if ({n_var}->getParent() == this)\n"
+                    "    {\n"
+                    f"        this->reorderChild({n_var}, {z_var});\n"
+                    f"        {n_var}->setTag({t_var});\n"
+                    f"        if (_nodes && !_nodes->containsObject({n_var})) {{ _nodes->addObject({n_var}); }}\n"
+                    "        return;\n"
+                    "    }\n"
+                    f"    CCNode::addChild({n_var}, {z_var}, {t_var});\n"
+                    f"    if (_nodes && !_nodes->containsObject({n_var})) {{ _nodes->addObject({n_var}); }}\n"
+                    "}"
+                )
+            txt = txt[:b_start] + new_body + txt[b_end:]
 
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::getChildByTag")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                t_var = _extract_param_ident(params[0], "aTag") if params else "aTag"
-                body = txt[b_start:b_end]
-                if UIWIDGET_ADDCHILD_MARKER not in body:
-                    body = re.sub(
-                        r"return\s+NULL\s*;\s*\}$",
-                        f"return this->getNodeByTag({t_var}); /* {UIWIDGET_ADDCHILD_MARKER} */\n}}",
-                        body,
-                    )
-                    txt = txt[:b_start] + body + txt[b_end:]
+        for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::removeChild")):
+            body = txt[b_start:b_end]
+            if UIWIDGET_LIFECYCLE_V2_MARKER in body:
+                continue
+            params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+            c_var = _extract_param_ident(params[0], "child") if params else "child"
+            if len(params) == 1:
+                new_rm = (
+                    "{\n"
+                    f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                    f"    if (!{c_var}) return;\n"
+                    f"    this->removeChild({c_var}, true);\n"
+                    "}"
+                )
+                txt = txt[:b_start] + new_rm + txt[b_end:]
+            elif len(params) == 2:
+                cl_var = _extract_param_ident(params[1], "cleanup")
+                new_rm = (
+                    "{\n"
+                    f"    // {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                    f"    if (!{c_var}) return;\n"
+                    f"    {c_var}->retain();\n"
+                    f"    CCNode::removeChild({c_var}, {cl_var});\n"
+                    f"    if (_widgetChildren) {{ _widgetChildren->removeObject({c_var}); }}\n"
+                    f"    if (_nodes) {{ _nodes->removeObject({c_var}); }}\n"
+                    f"    {c_var}->release();\n"
+                    "}"
+                )
+                txt = txt[:b_start] + new_rm + txt[b_end:]
 
-            # Guard m_pParent == NULL when m_bRunning is true on root widgets
-            txt = txt.replace(
-                "        else\n        {\n            pSize = m_pParent->getContentSize();\n        }",
-                f"        else if (m_pParent) /* {UIWIDGET_LIFECYCLE_V2_MARKER} */\n        {{\n            pSize = m_pParent->getContentSize();\n        }}",
+        for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::removeNode")):
+            body = txt[b_start:b_end]
+            if UIWIDGET_LIFECYCLE_V2_MARKER in body:
+                continue
+            params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+            if len(params) == 1:
+                n_var = _extract_param_ident(params[0], "node")
+                new_rm_node = (
+                    "{\n"
+                    f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                    f"    if (!{n_var}) return;\n"
+                    f"    {n_var}->retain();\n"
+                    f"    CCNode::removeChild({n_var}, true);\n"
+                    f"    if (_nodes) {{ _nodes->removeObject({n_var}); }}\n"
+                    f"    if (_widgetChildren) {{ _widgetChildren->removeObject({n_var}); }}\n"
+                    f"    {n_var}->release();\n"
+                    "}"
+                )
+                txt = txt[:b_start] + new_rm_node + txt[b_end:]
+
+        for b_start, b_end in reversed(_find_method_body_spans(txt, "Widget::removeAllNodes")):
+            if UIWIDGET_LIFECYCLE_V2_MARKER in txt[b_start:b_end]:
+                continue
+            new_rm_all_nodes = (
+                "{\n"
+                f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                "    if (_nodes && _nodes->data && _nodes->data->num > 0)\n"
+                "    {\n"
+                "        std::vector<CCNode*> snapshot;\n"
+                "        snapshot.reserve((size_t)_nodes->data->num);\n"
+                "        for (unsigned int i = 0; i < _nodes->data->num; ++i)\n"
+                "        {\n"
+                "            CCNode* pNode = static_cast<CCNode*>(_nodes->data->arr[i]);\n"
+                "            if (pNode) { pNode->retain(); snapshot.push_back(pNode); }\n"
+                "        }\n"
+                "        _nodes->removeAllObjects();\n"
+                "        for (size_t i = 0; i < snapshot.size(); ++i)\n"
+                "        {\n"
+                "            CCNode::removeChild(snapshot[i], true);\n"
+                "            snapshot[i]->release();\n"
+                "        }\n"
+                "    }\n"
+                "}"
             )
-            txt = txt.replace(
-                "        else\n        {\n            cSize = CCSize(m_pParent->getContentSize().width * percent.x , m_pParent->getContentSize().height * percent.y);\n        }",
-                f"        else if (m_pParent) /* {UIWIDGET_LIFECYCLE_V2_MARKER} */\n        {{\n            cSize = CCSize(m_pParent->getContentSize().width * percent.x , m_pParent->getContentSize().height * percent.y);\n        }}",
+            txt = txt[:b_start] + new_rm_all_nodes + txt[b_end:]
+
+        for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::removeAllChildrenWithCleanup")):
+            if UIWIDGET_LIFECYCLE_V2_MARKER in txt[b_start:b_end]:
+                continue
+            params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+            cl_var = _extract_param_ident(params[0], "cleanup") if params else "cleanup"
+            new_rm_all_children = (
+                "{\n"
+                f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                "    std::vector<CCNode*> snapshot;\n"
+                "    size_t cap = 0;\n"
+                "    if (_widgetChildren && _widgetChildren->data && _widgetChildren->data->num > 0) cap += (size_t)_widgetChildren->data->num;\n"
+                "    if (_nodes && _nodes->data && _nodes->data->num > 0) cap += (size_t)_nodes->data->num;\n"
+                "    if (cap > 0) snapshot.reserve(cap);\n"
+                "    if (_widgetChildren && _widgetChildren->data && _widgetChildren->data->num > 0)\n"
+                "    {\n"
+                "        for (unsigned int i = 0; i < _widgetChildren->data->num; ++i)\n"
+                "        {\n"
+                "            CCNode* pNode = static_cast<CCNode*>(_widgetChildren->data->arr[i]);\n"
+                "            if (pNode) { pNode->retain(); snapshot.push_back(pNode); }\n"
+                "        }\n"
+                "        _widgetChildren->removeAllObjects();\n"
+                "    }\n"
+                "    if (_nodes && _nodes->data && _nodes->data->num > 0)\n"
+                "    {\n"
+                "        for (unsigned int i = 0; i < _nodes->data->num; ++i)\n"
+                "        {\n"
+                "            CCNode* pNode = static_cast<CCNode*>(_nodes->data->arr[i]);\n"
+                "            if (pNode) { pNode->retain(); snapshot.push_back(pNode); }\n"
+                "        }\n"
+                "        _nodes->removeAllObjects();\n"
+                "    }\n"
+                "    for (size_t i = 0; i < snapshot.size(); ++i)\n"
+                "    {\n"
+                f"        CCNode::removeChild(snapshot[i], {cl_var});\n"
+                "        snapshot[i]->release();\n"
+                "    }\n"
+                "}"
             )
+            txt = txt[:b_start] + new_rm_all_children + txt[b_end:]
 
-            # Synchronize CCNodeRGBA::_realOpacity / _displayedOpacity & _realColor / _displayedColor
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::setOpacity")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                o_var = _extract_param_ident(params[0], "opacity") if params else "opacity"
-                new_opa = (
-                    "{\n"
-                    f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                    f"    _opacity = {o_var};\n"
-                    f"    CCNodeRGBA::setOpacity({o_var});\n"
-                    "    updateTextureOpacity();\n"
-                    "}"
-                )
-                txt = txt[:b_start] + new_opa + txt[b_end:]
+        for b_start, b_end in reversed(_find_method_body_spans(txt, "Widget::getNodes")):
+            if UIWIDGET_LIFECYCLE_V2_MARKER in txt[b_start:b_end]:
+                continue
+            new_get_nodes = (
+                "{\n"
+                f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                "    if (_nodes && _nodes->data)\n"
+                "    {\n"
+                "        for (int i = (int)_nodes->data->num - 1; i >= 0; --i)\n"
+                "        {\n"
+                "            CCNode* pNode = static_cast<CCNode*>(_nodes->data->arr[i]);\n"
+                "            if (!pNode || pNode->getParent() != this)\n"
+                "            {\n"
+                "                _nodes->removeObjectAtIndex((unsigned int)i);\n"
+                "            }\n"
+                "        }\n"
+                "    }\n"
+                "    return _nodes;\n"
+                "}"
+            )
+            txt = txt[:b_start] + new_get_nodes + txt[b_end:]
 
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::setColor")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                col_var = _extract_param_ident(params[0], "color") if params else "color"
-                new_col = (
-                    "{\n"
-                    f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                    f"    _color = {col_var};\n"
-                    f"    CCNodeRGBA::setColor({col_var});\n"
-                    "    updateTextureColor();\n"
-                    "}"
+        for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::getNodeByTag")):
+            if UIWIDGET_LIFECYCLE_V2_MARKER in txt[b_start:b_end]:
+                continue
+            params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+            t_var = _extract_param_ident(params[0], "tag") if params else "tag"
+            new_get_node_tag = (
+                "{\n"
+                f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                f"    if ({t_var} == kCCNodeTagInvalid) return NULL;\n"
+                "    CCArray* liveNodes = this->getNodes();\n"
+                "    if (liveNodes && liveNodes->count() > 0)\n"
+                "    {\n"
+                "        CCObject* renderer = NULL;\n"
+                "        CCARRAY_FOREACH(liveNodes, renderer)\n"
+                "        {\n"
+                "            CCNode* pNode = (CCNode*)renderer;\n"
+                f"            if (pNode && pNode->getTag() == {t_var}) return pNode;\n"
+                "        }\n"
+                "    }\n"
+                "    return NULL;\n"
+                "}"
+            )
+            txt = txt[:b_start] + new_get_node_tag + txt[b_end:]
+
+        for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::getChildByTag")):
+            params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+            t_var = _extract_param_ident(params[0], "aTag") if params else "aTag"
+            body = txt[b_start:b_end]
+            if UIWIDGET_ADDCHILD_MARKER not in body and UIWIDGET_LIFECYCLE_V2_MARKER not in body:
+                body = re.sub(
+                    r"return\s+NULL\s*;\s*\}$",
+                    f"return this->getNodeByTag({t_var}); /* {UIWIDGET_ADDCHILD_MARKER} {UIWIDGET_LIFECYCLE_V2_MARKER} */\n}}",
+                    body,
                 )
-                txt = txt[:b_start] + new_col + txt[b_end:]
+                txt = txt[:b_start] + body + txt[b_end:]
+
+        # Guard m_pParent == NULL when m_bRunning is true on root widgets
+        txt = txt.replace(
+            "        else\n        {\n            pSize = m_pParent->getContentSize();\n        }",
+            f"        else if (m_pParent) /* {UIWIDGET_LIFECYCLE_V2_MARKER} */\n        {{\n            pSize = m_pParent->getContentSize();\n        }}",
+        )
+        txt = txt.replace(
+            "        else\n        {\n            cSize = CCSize(m_pParent->getContentSize().width * percent.x , m_pParent->getContentSize().height * percent.y);\n        }",
+            f"        else if (m_pParent) /* {UIWIDGET_LIFECYCLE_V2_MARKER} */\n        {{\n            cSize = CCSize(m_pParent->getContentSize().width * percent.x , m_pParent->getContentSize().height * percent.y);\n        }}",
+        )
+
+        # Synchronize CCNodeRGBA::_realOpacity / _displayedOpacity & _realColor / _displayedColor
+        for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::setOpacity")):
+            if UIWIDGET_LIFECYCLE_V2_MARKER in txt[b_start:b_end]:
+                continue
+            params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+            o_var = _extract_param_ident(params[0], "opacity") if params else "opacity"
+            new_opa = (
+                "{\n"
+                f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                f"    _opacity = {o_var};\n"
+                f"    CCNodeRGBA::setOpacity({o_var});\n"
+                "    updateTextureOpacity();\n"
+                "}"
+            )
+            txt = txt[:b_start] + new_opa + txt[b_end:]
+
+        for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Widget::setColor")):
+            if UIWIDGET_LIFECYCLE_V2_MARKER in txt[b_start:b_end]:
+                continue
+            params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+            col_var = _extract_param_ident(params[0], "color") if params else "color"
+            new_col = (
+                "{\n"
+                f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                f"    _color = {col_var};\n"
+                f"    CCNodeRGBA::setColor({col_var});\n"
+                "    updateTextureColor();\n"
+                "}"
+            )
+            txt = txt[:b_start] + new_col + txt[b_end:]
 
         if txt != orig_txt:
             _write_text_closed(widget_cpp, txt)
@@ -2529,85 +2637,92 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
         else:
             print(f"[skip] Already patched UIWidget.cpp lifecycle/ownership/RGBA guards: {widget_cpp}")
 
-    # 1b. UILayout.cpp: safe dynamic_cast<Widget*> in addChild, getClippingRect .origin.y fix, and setBackGroundImage fallback
+    # 1b. UILayout.cpp: unified idempotent pass for Layout::addChild (carrying BOTH UIWIDGET_LIFECYCLE_V2_MARKER
+    #     and UILAYOUT_ADDCHILD_MARKER), getClippingRect .origin.y fix, and setBackGroundImage parity fallback.
     layout_cpp = os.path.join(cocos_root, "extensions", "CocoStudio", "GUI", "Layouts", "UILayout.cpp")
     if os.path.exists(layout_cpp):
         txt = _read_text_closed(layout_cpp)
         orig_txt = txt
-        if UIWIDGET_LIFECYCLE_V2_MARKER not in txt:
-            if UIIMAGEVIEW_FALLBACK_MARKER not in txt:
-                txt = _insert_before_ns_cc_begin(txt, GUI_TEX_FALLBACK_HELPER_CPP)
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Layout::addChild")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                c_var = _extract_param_ident(params[0], "child") if params else "child"
-                if len(params) == 1:
-                    new_l_add = (
-                        "{\n"
-                        f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                        f"    if (!{c_var} || {c_var} == this) return;\n"
-                        f"    addChild({c_var}, {c_var}->getZOrder(), {c_var}->getTag());\n"
-                        "}"
-                    )
-                elif len(params) == 2:
-                    z_var = _extract_param_ident(params[1], "zOrder")
-                    new_l_add = (
-                        "{\n"
-                        f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                        f"    if (!{c_var} || {c_var} == this) return;\n"
-                        f"    addChild({c_var}, {z_var}, {c_var}->getTag());\n"
-                        "}"
-                    )
-                else:
-                    z_var = _extract_param_ident(params[1], "zOrder")
-                    t_var = _extract_param_ident(params[2], "tag")
-                    new_l_add = (
-                        "{\n"
-                        f"    // {UIWIDGET_LIFECYCLE_V2_MARKER} GCLIENT_UILAYOUT_ADDCHILD_GUARD\n"
-                        f"    if (!{c_var} || {c_var} == this) return;\n"
-                        f"    if (Widget* wChild = dynamic_cast<Widget*>({c_var}))\n"
-                        "    {\n"
-                        "        supplyTheLayoutParameterLackToChild(wChild);\n"
-                        "    }\n"
-                        "    else\n"
-                        "    {\n"
-                        f"        this->addNode({c_var}, {z_var}, {t_var});\n"
-                        "        return;\n"
-                        "    }\n"
-                        f"    Widget::addChild({c_var}, {z_var}, {t_var});\n"
-                        "    _doLayoutDirty = true;\n"
-                        "}"
-                    )
-                txt = txt[:b_start] + new_l_add + txt[b_end:]
+        txt = _ensure_or_upgrade_gui_tex_fallback(txt)
 
+        for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Layout::addChild")):
+            body = txt[b_start:b_end]
+            if UIWIDGET_LIFECYCLE_V2_MARKER in body and UILAYOUT_ADDCHILD_MARKER in body:
+                continue
+            params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+            c_var = _extract_param_ident(params[0], "child") if params else "child"
+            if len(params) == 1:
+                new_l_add = (
+                    "{\n"
+                    f"    // {UIWIDGET_LIFECYCLE_V2_MARKER} {UILAYOUT_ADDCHILD_MARKER}\n"
+                    f"    if (!{c_var} || {c_var} == this) return;\n"
+                    f"    addChild({c_var}, {c_var}->getZOrder(), {c_var}->getTag());\n"
+                    "}"
+                )
+            elif len(params) == 2:
+                z_var = _extract_param_ident(params[1], "zOrder")
+                new_l_add = (
+                    "{\n"
+                    f"    // {UIWIDGET_LIFECYCLE_V2_MARKER} {UILAYOUT_ADDCHILD_MARKER}\n"
+                    f"    if (!{c_var} || {c_var} == this) return;\n"
+                    f"    addChild({c_var}, {z_var}, {c_var}->getTag());\n"
+                    "}"
+                )
+            else:
+                z_var = _extract_param_ident(params[1], "zOrder")
+                t_var = _extract_param_ident(params[2], "tag")
+                new_l_add = (
+                    "{\n"
+                    f"    // {UIWIDGET_LIFECYCLE_V2_MARKER} {UILAYOUT_ADDCHILD_MARKER}\n"
+                    f"    if (!{c_var} || {c_var} == this) return;\n"
+                    f"    if (Widget* wChild = dynamic_cast<Widget*>({c_var}))\n"
+                    "    {\n"
+                    "        supplyTheLayoutParameterLackToChild(wChild);\n"
+                    "    }\n"
+                    "    else\n"
+                    "    {\n"
+                    f"        this->addNode({c_var}, {z_var}, {t_var});\n"
+                    "        return;\n"
+                    "    }\n"
+                    f"    Widget::addChild({c_var}, {z_var}, {t_var});\n"
+                    "    _doLayoutDirty = true;\n"
+                    "}"
+                )
+            txt = txt[:b_start] + new_l_add + txt[b_end:]
+
+        if "finalY = parentClippingRect.origin.x;" in txt:
             txt = txt.replace(
                 "            if (bottomOffset < 0.0f)\n            {\n                finalY = parentClippingRect.origin.x;",
                 f"            if (bottomOffset < 0.0f) /* {UIWIDGET_LIFECYCLE_V2_MARKER} */\n            {{\n                finalY = parentClippingRect.origin.y;",
                 1,
             )
 
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Layout::setBackGroundImage")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                if len(params) == 2:
-                    f_var = _extract_param_ident(params[0], "fileName")
-                    t_var = _extract_param_ident(params[1], "texType")
-                    new_bg = (
-                        "{\n"
-                        f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
-                        f"    if (!{f_var} || strcmp({f_var}, \"\") == 0) return;\n"
-                        "    if (_backGroundImage == NULL) { addBackGroundImage(); }\n"
-                        f"    _backGroundImageFileName = {f_var};\n"
-                        f"    _bgImageTexType = {t_var};\n"
-                        f"    gclientGuiApplyToRenderer(_backGroundImage, _backGroundScale9Enabled, {f_var}, {t_var}, _backGroundImageCapInsets, _backGroundScale9Enabled);\n"
-                        "    if (_backGroundScale9Enabled && _backGroundImage)\n"
-                        "    {\n"
-                        "        static_cast<extension::CCScale9Sprite*>(_backGroundImage)->setPreferredSize(_size);\n"
-                        "    }\n"
-                        "    _backGroundImageTextureSize = _backGroundImage ? _backGroundImage->getContentSize() : CCSizeZero;\n"
-                        "    if (_backGroundImage) { _backGroundImage->setPosition(CCPoint(_size.width / 2.0f, _size.height / 2.0f)); }\n"
-                        "    updateBackGroundImageRGBA();\n"
-                        "}"
-                    )
-                    txt = txt[:b_start] + new_bg + txt[b_end:]
+        for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Layout::setBackGroundImage")):
+            body = txt[b_start:b_end]
+            if UIWIDGET_LIFECYCLE_V2_MARKER in body and "gclientGuiApplyToRenderer" in body:
+                continue
+            params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+            if len(params) == 2:
+                f_var = _extract_param_ident(params[0], "fileName")
+                t_var = _extract_param_ident(params[1], "texType")
+                new_bg = (
+                    "{\n"
+                    f"    // {UIWIDGET_LIFECYCLE_V2_MARKER}\n"
+                    f"    if (!{f_var} || strcmp({f_var}, \"\") == 0) return;\n"
+                    "    if (_backGroundImage == NULL) { addBackGroundImage(); }\n"
+                    f"    _backGroundImageFileName = {f_var};\n"
+                    f"    _bgImageTexType = {t_var};\n"
+                    f"    gclientGuiApplyToRenderer(_backGroundImage, _backGroundScale9Enabled, {f_var}, {t_var}, _backGroundImageCapInsets, _backGroundScale9Enabled);\n"
+                    "    if (_backGroundScale9Enabled && _backGroundImage)\n"
+                    "    {\n"
+                    "        static_cast<extension::CCScale9Sprite*>(_backGroundImage)->setPreferredSize(_size);\n"
+                    "    }\n"
+                    "    _backGroundImageTextureSize = _backGroundImage ? _backGroundImage->getContentSize() : CCSizeZero;\n"
+                    "    if (_backGroundImage) { _backGroundImage->setPosition(CCPoint(_size.width / 2.0f, _size.height / 2.0f)); }\n"
+                    "    updateBackGroundImageRGBA();\n"
+                    "}"
+                )
+                txt = txt[:b_start] + new_bg + txt[b_end:]
 
         if txt != orig_txt:
             _write_text_closed(layout_cpp, txt)
@@ -2620,14 +2735,15 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
     if os.path.exists(scroll_cpp):
         txt = _read_text_closed(scroll_cpp)
         orig_txt = txt
-        if UIWIDGET_LIFECYCLE_V2_MARKER not in txt:
-            for m_name, def_var in (("ScrollView::addChild", "child"), ("ScrollView::addNode", "node")):
-                for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, m_name)):
-                    params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                    v = _extract_param_ident(params[0], def_var) if params else def_var
-                    body = txt[b_start:b_end]
-                    guard = f"if (!{v} || {v} == this || !_innerContainer) return; // {UIWIDGET_LIFECYCLE_V2_MARKER}"
-                    txt = txt[:b_start] + _inject_after_open_brace(body, guard) + txt[b_end:]
+        for m_name, def_var in (("ScrollView::addChild", "child"), ("ScrollView::addNode", "node")):
+            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, m_name)):
+                body = txt[b_start:b_end]
+                if UIWIDGET_LIFECYCLE_V2_MARKER in body:
+                    continue
+                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+                v = _extract_param_ident(params[0], def_var) if params else def_var
+                guard = f"if (!{v} || {v} == this || !_innerContainer) return; // {UIWIDGET_LIFECYCLE_V2_MARKER}"
+                txt = txt[:b_start] + _inject_after_open_brace(body, guard) + txt[b_end:]
         if txt != orig_txt:
             _write_text_closed(scroll_cpp, txt)
             print(f"[ok] Patched UIScrollView.cpp: {scroll_cpp}")
@@ -2638,54 +2754,57 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
     if os.path.exists(listview_cpp):
         txt = _read_text_closed(listview_cpp)
         orig_txt = txt
-        if UIWIDGET_LIFECYCLE_V2_MARKER not in txt:
-            for m_name in ("ListView::pushBackCustomItem", "ListView::insertCustomItem"):
-                for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, m_name)):
-                    params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                    v = _extract_param_ident(params[0], "item") if params else "item"
-                    body = txt[b_start:b_end]
-                    guard = f"if (!{v} || {v} == this) return; // {UIWIDGET_LIFECYCLE_V2_MARKER}"
-                    txt = txt[:b_start] + _inject_after_open_brace(body, guard) + txt[b_end:]
+        for m_name in ("ListView::pushBackCustomItem", "ListView::insertCustomItem"):
+            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, m_name)):
+                body = txt[b_start:b_end]
+                if UIWIDGET_LIFECYCLE_V2_MARKER in body:
+                    continue
+                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+                v = _extract_param_ident(params[0], "item") if params else "item"
+                guard = f"if (!{v} || {v} == this) return; // {UIWIDGET_LIFECYCLE_V2_MARKER}"
+                txt = txt[:b_start] + _inject_after_open_brace(body, guard) + txt[b_end:]
         if txt != orig_txt:
             _write_text_closed(listview_cpp, txt)
             print(f"[ok] Patched UIListView.cpp: {listview_cpp}")
         else:
             print(f"[skip] Already patched UIListView.cpp: {listview_cpp}")
 
-    # 1d. UIImageView.cpp, UIButton.cpp, UILoadingBar.cpp: unified SpriteFrame + multi-extension local texture fallback
+    # 1d. UIImageView.cpp, UIButton.cpp, UILoadingBar.cpp: unified SpriteFrame + multi-extension + gameImage/ fallback
     imgview_cpp = os.path.join(cocos_root, "extensions", "CocoStudio", "GUI", "UIWidgets", "UIImageView.cpp")
     if os.path.exists(imgview_cpp):
         txt = _read_text_closed(imgview_cpp)
         orig_txt = txt
-        if UIIMAGEVIEW_FALLBACK_MARKER not in txt:
-            txt = _insert_before_ns_cc_begin(txt, GUI_TEX_FALLBACK_HELPER_CPP)
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "ImageView::loadTexture")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                f_var = _extract_param_ident(params[0], "fileName") if len(params) >= 1 else "fileName"
-                t_var = _extract_param_ident(params[1], "texType") if len(params) >= 2 else "texType"
-                new_load_tex = (
-                    "{\n"
-                    f"    // {UIIMAGEVIEW_FALLBACK_MARKER}\n"
-                    f"    if (!{f_var} || strcmp({f_var}, \"\") == 0)\n"
-                    "    {\n"
-                    "        return;\n"
-                    "    }\n"
-                    f"    _textureFile = {f_var};\n"
-                    f"    _imageTexType = {t_var};\n"
-                    f"    if (!gclientGuiApplyToRenderer(_imageRenderer, _scale9Enabled, {f_var}, {t_var}, _capInsets, true))\n"
-                    "    {\n"
-                    "        return;\n"
-                    "    }\n"
-                    "    _imageTextureSize = _imageRenderer->getContentSize();\n"
-                    "    imageTextureScaleChangedWithSize();\n"
-                    "    updateAnchorPoint();\n"
-                    "    updateFlippedX();\n"
-                    "    updateFlippedY();\n"
-                    "    updateRGBAToRenderer(_imageRenderer);\n"
-                    "}"
-                )
-                txt = txt[:b_start] + new_load_tex + txt[b_end:]
+        txt = _ensure_or_upgrade_gui_tex_fallback(txt)
+        for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "ImageView::loadTexture")):
+            if UIIMAGEVIEW_FALLBACK_MARKER in txt[b_start:b_end]:
+                continue
+            params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+            f_var = _extract_param_ident(params[0], "fileName") if len(params) >= 1 else "fileName"
+            t_var = _extract_param_ident(params[1], "texType") if len(params) >= 2 else "texType"
+            new_load_tex = (
+                "{\n"
+                f"    // {UIIMAGEVIEW_FALLBACK_MARKER}\n"
+                f"    if (!{f_var} || strcmp({f_var}, \"\") == 0)\n"
+                "    {\n"
+                "        return;\n"
+                "    }\n"
+                f"    _textureFile = {f_var};\n"
+                f"    _imageTexType = {t_var};\n"
+                f"    if (!gclientGuiApplyToRenderer(_imageRenderer, _scale9Enabled, {f_var}, {t_var}, _capInsets, true))\n"
+                "    {\n"
+                "        return;\n"
+                "    }\n"
+                "    _imageTextureSize = _imageRenderer->getContentSize();\n"
+                "    imageTextureScaleChangedWithSize();\n"
+                "    updateAnchorPoint();\n"
+                "    updateFlippedX();\n"
+                "    updateFlippedY();\n"
+                "    updateRGBAToRenderer(_imageRenderer);\n"
+                "}"
+            )
+            txt = txt[:b_start] + new_load_tex + txt[b_end:]
 
+        if "    loadTexture(_textureFile.c_str(),_imageTexType);" in txt:
             txt = txt.replace(
                 "    loadTexture(_textureFile.c_str(),_imageTexType);",
                 f"    if (!_textureFile.empty()) {{ loadTexture(_textureFile.c_str(), _imageTexType); }} /* {UIIMAGEVIEW_FALLBACK_MARKER} */",
@@ -2701,35 +2820,36 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
     if os.path.exists(uibtn_cpp):
         txt = _read_text_closed(uibtn_cpp)
         orig_txt = txt
-        if UIIMAGEVIEW_FALLBACK_MARKER not in txt:
-            txt = _insert_before_ns_cc_begin(txt, GUI_TEX_FALLBACK_HELPER_CPP)
-            btn_specs = (
-                ("Button::loadTextureNormal", "normal", "_normalFileName", "_normalTexType", "_buttonNormalRenderer", "_capInsetsNormal", "_normalTextureSize", "normalTextureScaleChangedWithSize", "_normalTextureLoaded"),
-                ("Button::loadTexturePressed", "selected", "_clickedFileName", "_pressedTexType", "_buttonClickedRenderer", "_capInsetsPressed", "_pressedTextureSize", "pressedTextureScaleChangedWithSize", "_pressedTextureLoaded"),
-                ("Button::loadTextureDisabled", "disabled", "_disabledFileName", "_disabledTexType", "_buttonDisableRenderer", "_capInsetsDisabled", "_disabledTextureSize", "disabledTextureScaleChangedWithSize", "_disabledTextureLoaded"),
-            )
-            for q_name, def_p, fn_mem, tt_mem, rend_mem, cap_mem, sz_mem, sc_fn, ld_mem in btn_specs:
-                for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, q_name)):
-                    params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                    p_var = _extract_param_ident(params[0], def_p) if len(params) >= 1 else def_p
-                    t_var = _extract_param_ident(params[1], "texType") if len(params) >= 2 else "texType"
-                    new_btn_lt = (
-                        "{\n"
-                        f"    // {UIIMAGEVIEW_FALLBACK_MARKER}\n"
-                        f"    if (!{p_var} || strcmp({p_var}, \"\") == 0) return;\n"
-                        f"    {fn_mem} = {p_var};\n"
-                        f"    {tt_mem} = {t_var};\n"
-                        f"    if (!gclientGuiApplyToRenderer({rend_mem}, _scale9Enabled, {p_var}, {t_var}, {cap_mem}, true)) return;\n"
-                        f"    {sz_mem} = {rend_mem}->getContentSize();\n"
-                        "    updateAnchorPoint();\n"
-                        "    updateFlippedX();\n"
-                        "    updateFlippedY();\n"
-                        f"    updateRGBAToRenderer({rend_mem});\n"
-                        f"    {sc_fn}();\n"
-                        f"    {ld_mem} = true;\n"
-                        "}"
-                    )
-                    txt = txt[:b_start] + new_btn_lt + txt[b_end:]
+        txt = _ensure_or_upgrade_gui_tex_fallback(txt)
+        btn_specs = (
+            ("Button::loadTextureNormal", "normal", "_normalFileName", "_normalTexType", "_buttonNormalRenderer", "_capInsetsNormal", "_normalTextureSize", "normalTextureScaleChangedWithSize", "_normalTextureLoaded"),
+            ("Button::loadTexturePressed", "selected", "_clickedFileName", "_pressedTexType", "_buttonClickedRenderer", "_capInsetsPressed", "_pressedTextureSize", "pressedTextureScaleChangedWithSize", "_pressedTextureLoaded"),
+            ("Button::loadTextureDisabled", "disabled", "_disabledFileName", "_disabledTexType", "_buttonDisableRenderer", "_capInsetsDisabled", "_disabledTextureSize", "disabledTextureScaleChangedWithSize", "_disabledTextureLoaded"),
+        )
+        for q_name, def_p, fn_mem, tt_mem, rend_mem, cap_mem, sz_mem, sc_fn, ld_mem in btn_specs:
+            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, q_name)):
+                if UIIMAGEVIEW_FALLBACK_MARKER in txt[b_start:b_end]:
+                    continue
+                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
+                p_var = _extract_param_ident(params[0], def_p) if len(params) >= 1 else def_p
+                t_var = _extract_param_ident(params[1], "texType") if len(params) >= 2 else "texType"
+                new_btn_lt = (
+                    "{\n"
+                    f"    // {UIIMAGEVIEW_FALLBACK_MARKER}\n"
+                    f"    if (!{p_var} || strcmp({p_var}, \"\") == 0) return;\n"
+                    f"    {fn_mem} = {p_var};\n"
+                    f"    {tt_mem} = {t_var};\n"
+                    f"    if (!gclientGuiApplyToRenderer({rend_mem}, _scale9Enabled, {p_var}, {t_var}, {cap_mem}, true)) return;\n"
+                    f"    {sz_mem} = {rend_mem}->getContentSize();\n"
+                    "    updateAnchorPoint();\n"
+                    "    updateFlippedX();\n"
+                    "    updateFlippedY();\n"
+                    f"    updateRGBAToRenderer({rend_mem});\n"
+                    f"    {sc_fn}();\n"
+                    f"    {ld_mem} = true;\n"
+                    "}"
+                )
+                txt = txt[:b_start] + new_btn_lt + txt[b_end:]
         if txt != orig_txt:
             _write_text_closed(uibtn_cpp, txt)
             print(f"[ok] Patched UIButton.cpp: {uibtn_cpp}")
@@ -2740,8 +2860,8 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
     if os.path.exists(uibar_cpp):
         txt = _read_text_closed(uibar_cpp)
         orig_txt = txt
-        if UIIMAGEVIEW_FALLBACK_MARKER not in txt:
-            txt = _insert_before_ns_cc_begin(txt, GUI_TEX_FALLBACK_HELPER_CPP)
+        txt = _ensure_or_upgrade_gui_tex_fallback(txt)
+        if "gclientGuiApplyToRenderer(_barRenderer" not in txt:
             txt = re.sub(
                 r"switch\s*\(\s*_renderBarTexType\s*\)\s*\{.*?\n\s*updateRGBAToRenderer\s*\(\s*_barRenderer\s*\)\s*;",
                 f"if (!gclientGuiApplyToRenderer(_barRenderer, _scale9Enabled, _textureFile.c_str(), _renderBarTexType, _capInsets, true)) return; /* {UIIMAGEVIEW_FALLBACK_MARKER} */\n    updateRGBAToRenderer(_barRenderer);",
@@ -2881,41 +3001,6 @@ def patch_gui_widget_and_touchgroup(cocos_root: str) -> None:
             print(f"[ok] Patched UIHelper.cpp: {helper_cpp}")
         else:
             print(f"[skip] Already patched UIHelper.cpp: {helper_cpp}")
-
-    # 4. UILayout.cpp: guard Layout::addChild against non-Widget CCNode* before supplyTheLayoutParameterLackToChild
-    layout_cpp = os.path.join(cocos_root, "extensions", "CocoStudio", "GUI", "Layouts", "UILayout.cpp")
-    if os.path.exists(layout_cpp):
-        txt = _read_text_closed(layout_cpp)
-        orig_txt = txt
-        if UILAYOUT_ADDCHILD_MARKER not in txt:
-            for p_open, p_close, b_start, b_end in reversed(_find_method_spans_with_sig(txt, "Layout::addChild")):
-                params = _split_top_level_params(txt[p_open + 1:p_close - 1])
-                if len(params) == 3:
-                    c_var = _extract_param_ident(params[0], "child")
-                    z_var = _extract_param_ident(params[1], "zOrder")
-                    t_var = _extract_param_ident(params[2], "tag")
-                    new_lbody = (
-                        "{\n"
-                        f"    // {UILAYOUT_ADDCHILD_MARKER}\n"
-                        f"    if (!{c_var}) return;\n"
-                        f"    Widget* _gclientWidgetChild = dynamic_cast<Widget*>({c_var});\n"
-                        "    if (!_gclientWidgetChild)\n"
-                        "    {\n"
-                        f"        this->addNode({c_var}, {z_var}, {t_var});\n"
-                        "        return;\n"
-                        "    }\n"
-                        "    supplyTheLayoutParameterLackToChild(_gclientWidgetChild);\n"
-                        f"    Widget::addChild({c_var}, {z_var}, {t_var});\n"
-                        "    _doLayoutDirty = true;\n"
-                        "}"
-                    )
-                    txt = txt[:b_start] + new_lbody + txt[b_end:]
-        if txt != orig_txt:
-            _write_text_closed(layout_cpp, txt)
-            print(f"[ok] Patched UILayout.cpp: {layout_cpp}")
-        else:
-            print(f"[skip] Already patched UILayout.cpp: {layout_cpp}")
-
 
 def patch_spine_atlas_and_cocos2dx(cocos_root: str) -> None:
     spine_dir = os.path.join(cocos_root, "extensions", "spine")

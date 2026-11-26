@@ -1321,6 +1321,145 @@ NS_CC_EXT_END
             self.assertEqual(skin_cpp, (cocos_root / "extensions/CocoStudio/Armature/display/CCSkin.cpp").read_text(encoding="utf-8"))
             self.assertEqual(arm, (cocos_root / "extensions/CocoStudio/Armature/CCArmature.cpp").read_text(encoding="utf-8"))
 
+    def test_uilayout_and_lifecycle_v2_upgrade_idempotency_and_gui_tex_fallback_parity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cocos_root = Path(tmp) / "cocos2d-x-2.2.6"
+            create_mock_cocos2dx_226_tree(cocos_root)
+
+            # Add UIButton.cpp and UILoadingBar.cpp fixtures alongside UIImageView.cpp and UILayout.cpp
+            uibtn_path = cocos_root / "extensions/CocoStudio/GUI/UIWidgets/UIButton.cpp"
+            uibtn_path.parent.mkdir(parents=True, exist_ok=True)
+            uibtn_path.write_text(
+                """#include "UIButton.h"
+NS_CC_BEGIN
+namespace ui {
+void Button::loadTextureNormal(const char* normal, TextureResType texType) { _normalFileName = normal; }
+void Button::loadTexturePressed(const char* selected, TextureResType texType) { _clickedFileName = selected; }
+void Button::loadTextureDisabled(const char* disabled, TextureResType texType) { _disabledFileName = disabled; }
+}
+NS_CC_END
+""",
+                encoding="utf-8",
+            )
+            uibar_path = cocos_root / "extensions/CocoStudio/GUI/UIWidgets/UILoadingBar.cpp"
+            uibar_path.write_text(
+                """#include "UILoadingBar.h"
+NS_CC_BEGIN
+namespace ui {
+void LoadingBar::loadTexture(const char* texture, TextureResType texType)
+{
+    _textureFile = texture;
+    _renderBarTexType = texType;
+    switch (_renderBarTexType)
+    {
+    case UI_TEX_TYPE_LOCAL:
+        break;
+    default:
+        break;
+    }
+    updateRGBAToRenderer(_barRenderer);
+}
+}
+NS_CC_END
+""",
+                encoding="utf-8",
+            )
+
+            # Simulate a previously patched tree containing:
+            #  - PR #11 legacy UILAYOUT_ADDCHILD_MARKER-only Layout::addChild (missing UIWIDGET_LIFECYCLE_V2_MARKER & self-guard)
+            #  - Legacy V1 GUI_TEX_FALLBACK_HELPER_CPP (missing .png suffix append and gameImage/ -> images/ fallback)
+            #  - Legacy V1 UIWidget.cpp with UIWIDGET_ADDCHILD_MARKER only
+            legacy_v1_helper = """// GCLIENT_UIIMAGEVIEW_TEXTURE_FALLBACK
+namespace {
+static cocos2d::CCSpriteFrame* gclientGuiFindSpriteFrame(const char* name) { return NULL; }
+static cocos2d::CCTexture2D* gclientGuiLoadTexture(const char* name) { return NULL; }
+static bool gclientGuiApplyToRenderer(cocos2d::CCNode*, bool, const char*, cocos2d::ui::TextureResType, const cocos2d::CCRect&, bool) { return false; }
+} // anonymous namespace
+"""
+            layout_path = cocos_root / "extensions/CocoStudio/GUI/Layouts/UILayout.cpp"
+            layout_path.write_text(
+                '#include "UILayout.h"\n'
+                + legacy_v1_helper
+                + """NS_CC_BEGIN
+namespace ui {
+void Layout::addChild(CCNode *child) { addChild(child, child->getZOrder(), child->getTag()); }
+void Layout::addChild(CCNode * child, int zOrder) { addChild(child, zOrder, child->getTag()); }
+void Layout::addChild(CCNode *child, int zOrder, int tag)
+{
+    // GCLIENT_UILAYOUT_ADDCHILD_GUARD
+    if (!child) return;
+    Widget* _gclientWidgetChild = dynamic_cast<Widget*>(child);
+    if (!_gclientWidgetChild) { this->addNode(child, zOrder, tag); return; }
+    supplyTheLayoutParameterLackToChild(_gclientWidgetChild);
+    Widget::addChild(child, zOrder, tag);
+    _doLayoutDirty = true;
+}
+const CCRect& Layout::getClippingRect()
+{
+    if (_clippingRectDirty)
+    {
+        if (_clippingParent)
+        {
+            if (bottomOffset < 0.0f)
+            {
+                finalY = parentClippingRect.origin.x;
+            }
+        }
+    }
+    return _clippingRect;
+}
+void Layout::setBackGroundImage(const char* fileName,TextureResType texType)
+{
+    _backGroundImageFileName = fileName;
+}
+}
+NS_CC_END
+""",
+                encoding="utf-8",
+            )
+
+            imgview_path = cocos_root / "extensions/CocoStudio/GUI/UIWidgets/UIImageView.cpp"
+            orig_imgview = imgview_path.read_text(encoding="utf-8")
+            imgview_path.write_text(
+                orig_imgview.replace("NS_CC_BEGIN", legacy_v1_helper + "\nNS_CC_BEGIN", 1),
+                encoding="utf-8",
+            )
+
+            # Pass 1: upgrades previously patched files in-place without duplicate helpers or ping-pong overwrites
+            self.assertEqual(patch_cocos2dx.main([str(cocos_root)]), 0)
+
+            for gui_cpp_path in (layout_path, imgview_path, uibtn_path, uibar_path):
+                content = gui_cpp_path.read_text(encoding="utf-8")
+                self.assertEqual(content.count("GCLIENT_GUI_TEX_FALLBACK_PARITY_V2"), 1)
+                self.assertEqual(content.count("gclientGuiFindSpriteFrame("), 3)  # 1 def + 2 calls
+                # Verify full parity with LuaHelpers.cpp: extensionless .png append + gameImage/ -> images/ fallback
+                self.assertIn('const std::string withPng = key + ".png";', content)
+                self.assertIn('const std::string withPng = candidate + ".png";', content)
+                self.assertIn('s.compare(0, 10, "gameImage/") == 0', content)
+                self.assertIn('std::string("images/") + s.substr(10)', content)
+                self.assertIn('".pvr.ccz", ".pkm", ".png", ".webp", ".jpg", ".jpeg"', content)
+
+            upgraded_layout = layout_path.read_text(encoding="utf-8")
+            self.assertIn("GCLIENT_UIWIDGET_LIFECYCLE_V2", upgraded_layout)
+            self.assertIn("GCLIENT_UILAYOUT_ADDCHILD_GUARD", upgraded_layout)
+            self.assertIn("child == this", upgraded_layout)
+            self.assertIn("finalY = parentClippingRect.origin.y;", upgraded_layout)
+            self.assertNotIn("_gclientWidgetChild", upgraded_layout)
+
+            upgraded_widget = (cocos_root / "extensions/CocoStudio/GUI/BaseClasses/UIWidget.cpp").read_text(encoding="utf-8")
+            upgraded_imgview = imgview_path.read_text(encoding="utf-8")
+            upgraded_uibtn = uibtn_path.read_text(encoding="utf-8")
+            upgraded_uibar = uibar_path.read_text(encoding="utf-8")
+
+            # Pass 2 & Pass 3: strictly byte-for-byte idempotent
+            self.assertEqual(patch_cocos2dx.main([str(cocos_root)]), 0)
+            self.assertEqual(upgraded_layout, layout_path.read_text(encoding="utf-8"))
+            self.assertEqual(upgraded_widget, (cocos_root / "extensions/CocoStudio/GUI/BaseClasses/UIWidget.cpp").read_text(encoding="utf-8"))
+            self.assertEqual(upgraded_imgview, imgview_path.read_text(encoding="utf-8"))
+            self.assertEqual(upgraded_uibtn, uibtn_path.read_text(encoding="utf-8"))
+            self.assertEqual(upgraded_uibar, uibar_path.read_text(encoding="utf-8"))
+
+
 class TestPeDependencyAuditor(unittest.TestCase):
     LUA_REQUIRED_EXPORTS = sorted(audit_pe.REQUIRED_LUA51_EXPORTS)
 

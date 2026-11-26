@@ -15,7 +15,9 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 #endif
+#include "bindings/NetworkResilienceHook.h"
 #include "diagnostics/CrashAndTelemetry.h"
+#include "net/Amf3Module.h"
 #include "net/CConnection.h"
 #include "net/CNetwork.h"
 #include "net/LCPacket.h"
@@ -2639,6 +2641,812 @@ bool testStarburstSeamAndGlowRingOffscreenPixelVerification() {
     return true;
 }
 
+
+// ============================================================================
+// Scenario 17: Layer 1 CConnection lua_pcall + Layer 2 Network/DataLoading/BindableData Resilience
+// ============================================================================
+
+bool testLayer1CConnectionProtectedLuaCallbacks() {
+    const fs::path tempRoot = fs::temp_directory_path() / "kestrel_net_layer1_test";
+    std::error_code ec;
+    fs::remove_all(tempRoot, ec);
+
+    gclient::diagnostics::DiagnosticsConfig cfg;
+    cfg.logDirectory = (tempRoot / "logs").u8string();
+    cfg.dumpDirectory = (tempRoot / "dumps").u8string();
+    cfg.appName = "kestrel_layer1";
+    REQUIRE_TRUE(gclient::diagnostics::CrashAndTelemetry::install(cfg));
+
+    lua_State* L = luaL_newstate();
+    REQUIRE_TRUE(L != nullptr);
+    luaL_openlibs(L);
+    gclient::diagnostics::CrashAndTelemetry::installLuaHooks(L);
+
+    REQUIRE_EQ(luaL_dostring(L, R"LUA(
+        _G.__CAPTURED_CCLUALOG = {}
+        _G.CCLuaLog = function(msg)
+            table.insert(_G.__CAPTURED_CCLUALOG, tostring(msg))
+        end
+        _G.__PKT2_RECEIVED = false
+        function _testCrashingBodyHandler(body, head)
+            if body == "CRASH_PACKET_1" then
+                local nilTbl = nil
+                return nilTbl.boom_field
+            end
+            if body == "VALID_PACKET_2" then
+                _G.__PKT2_RECEIVED = (#head == 8)
+            end
+        end
+        function _testCrashingCloseHandler()
+            local nilConn = nil
+            return nilConn.on_close_crash
+        end
+    )LUA"), 0);
+
+    lua_getglobal(L, "_testCrashingBodyHandler");
+    const int bodyRef = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_getglobal(L, "_testCrashingCloseHandler");
+    const int closeRef = luaL_ref(L, LUA_REGISTRYINDEX);
+    REQUIRE_TRUE(bodyRef > 0 && closeRef > 0);
+
+    // Push two sentinel values onto the Lua stack so savedTop == 2 before CConnection dispatches
+    lua_pushinteger(L, 12345);
+    lua_pushstring(L, "stack_sentinel");
+    const int savedTop = lua_gettop(L);
+    REQUIRE_EQ(savedTop, 2);
+
+    // Subcase 1A: With __GCLIENT_NATIVE_TRACKBACK__ active, feed two framed packets back-to-back over loopback
+    {
+        gclient::net::WinsockSession ws;
+        REQUIRE_TRUE(ws.isInitialized());
+
+        SOCKET listenSock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        REQUIRE_TRUE(listenSock != INVALID_SOCKET);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(0);
+        REQUIRE_EQ(::bind(listenSock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)), 0);
+        REQUIRE_EQ(::listen(listenSock, 4), 0);
+#ifdef _WIN32
+        int addrLen = sizeof(addr);
+#else
+        socklen_t addrLen = sizeof(addr);
+#endif
+        REQUIRE_EQ(::getsockname(listenSock, reinterpret_cast<sockaddr*>(&addr), &addrLen), 0);
+        const unsigned int port = ntohs(addr.sin_port);
+
+        auto conn = std::make_unique<gclient::net::CConnection>();
+        conn->setStandaloneLuaState(L);
+        conn->registerBodyFunc(bodyRef);
+        conn->registerCloseFunc(closeRef);
+        REQUIRE_TRUE(conn->connect("127.0.0.1", port));
+
+        SOCKET serverClient = ::accept(listenSock, nullptr, nullptr);
+        REQUIRE_TRUE(serverClient != INVALID_SOCKET);
+
+        auto makeRawFrame = [](const std::string& payload) {
+            std::string f(8 + payload.size(), '\0');
+            const uint32_t beLen = htonl(static_cast<uint32_t>(payload.size()));
+            std::memcpy(&f[0], &beLen, 4);
+            std::memcpy(&f[8], payload.data(), payload.size());
+            return f;
+        };
+        const std::string wire = makeRawFrame("CRASH_PACKET_1") + makeRawFrame("VALID_PACKET_2");
+        REQUIRE_TRUE(::send(serverClient, wire.data(), static_cast<int>(wire.size()), 0) == static_cast<int>(wire.size()));
+
+        auto* netMgr = gclient::net::CNetwork::sharedNetwork();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        bool pkt2Done = false;
+        while (std::chrono::steady_clock::now() < deadline && !pkt2Done) {
+            netMgr->update(0.016f);
+            lua_getglobal(L, "__PKT2_RECEIVED");
+            pkt2Done = lua_toboolean(L, -1) != 0;
+            lua_pop(L, 1);
+            if (!pkt2Done) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        REQUIRE_TRUE(pkt2Done);
+        REQUIRE_EQ(lua_gettop(L), savedTop);
+
+        // Close must also catch closeLuaHandler_ error via lua_pcall, record trace, and restore stack
+        conn->close();
+        REQUIRE_EQ(lua_gettop(L), savedTop);
+
+        bool sawBodyErrTrace = false;
+        bool sawCloseErrTrace = false;
+        for (const auto& entry : conn->traceBuffer().snapshot()) {
+            if ( std::strcmp(entry.event, "BODY_SCRIPT_ERROR") == 0 ) sawBodyErrTrace = true;
+            if ( std::strcmp(entry.event, "CLOSE_SCRIPT_ERROR") == 0 ) sawCloseErrTrace = true;
+        }
+        REQUIRE_TRUE(sawBodyErrTrace);
+        REQUIRE_TRUE(sawCloseErrTrace);
+
+        conn.reset();
+        gclient::net::CNetwork::destroySharedNetwork();
+#ifdef _WIN32
+        ::closesocket(serverClient);
+        ::closesocket(listenSock);
+#else
+        ::close(serverClient);
+        ::close(listenSock);
+#endif
+    }
+
+    // Subcase 1B: Fallback to debug.traceback when __GCLIENT_NATIVE_TRACKBACK__ is absent
+    lua_pushnil(L);
+    lua_setglobal(L, "__GCLIENT_NATIVE_TRACKBACK__");
+    {
+        gclient::net::CConnection directConn;
+        directConn.setStandaloneLuaState(L);
+        directConn.registerBodyFunc(bodyRef);
+        const char* crashBody = "CRASH_PACKET_1";
+        directConn.doPacketBody(crashBody, std::strlen(crashBody));
+        REQUIRE_EQ(lua_gettop(L), savedTop);
+    }
+
+    if (luaL_dostring(L, R"LUA(
+        assert(#_G.__CAPTURED_CCLUALOG >= 3, "Expected >= 3 CCLuaLog entries, got " .. tostring(#_G.__CAPTURED_CCLUALOG))
+        assert(string.find(_G.__CAPTURED_CCLUALOG[1], "nilTbl", 1, true) ~= nil, "log1=" .. tostring(_G.__CAPTURED_CCLUALOG[1]))
+        assert(string.find(_G.__CAPTURED_CCLUALOG[1], "stack traceback:", 1, true) ~= nil, "tb1=" .. tostring(_G.__CAPTURED_CCLUALOG[1]))
+        assert(string.find(_G.__CAPTURED_CCLUALOG[2], "nilConn", 1, true) ~= nil, "log2=" .. tostring(_G.__CAPTURED_CCLUALOG[2]))
+        assert(string.find(_G.__CAPTURED_CCLUALOG[3], "nilTbl", 1, true) ~= nil, "log3=" .. tostring(_G.__CAPTURED_CCLUALOG[3]))
+        assert(string.find(_G.__CAPTURED_CCLUALOG[3], "stack traceback:", 1, true) ~= nil, "tb3=" .. tostring(_G.__CAPTURED_CCLUALOG[3]))
+    )LUA") != 0) {
+        std::fprintf(stderr, "[Layer1 Assert Err] %s\n", lua_tostring(L, -1));
+        return false;
+    }
+
+    REQUIRE_EQ(lua_gettop(L), savedTop);
+    REQUIRE_EQ(static_cast<int>(lua_tointeger(L, 1)), 12345);
+    REQUIRE_EQ(std::string(lua_tostring(L, 2)), "stack_sentinel");
+    lua_pop(L, 2);
+
+    luaL_unref(L, LUA_REGISTRYINDEX, bodyRef);
+    luaL_unref(L, LUA_REGISTRYINDEX, closeRef);
+    gclient::diagnostics::CrashAndTelemetry::clearLuaState();
+    lua_close(L);
+    gclient::diagnostics::CrashAndTelemetry::shutdown();
+    fs::remove_all(tempRoot, ec);
+    return true;
+}
+
+bool testNetworkDataLoadingResilienceAndBindableDataRecovery() {
+    if (!testLayer1CConnectionProtectedLuaCallbacks()) {
+        return false;
+    }
+
+    // Layer 2: Test InstallNetworkResilienceHookImpl against clean APK-equivalent modules + real C++ Amf3Module
+    {
+        lua_State* L = luaL_newstate();
+        REQUIRE_TRUE(L != nullptr);
+        luaL_openlibs(L);
+        luaopen_amf3_extensions(L);
+
+        // Install C++-injected Lua resilience hook BEFORE requiring Network / BindableData / BaseProxy
+        gclient::bindings::InstallNetworkResilienceHookImpl(L);
+
+        static const char* const kCleanHarnessChunks[] = {
+            R"LUA(
+                _G.amf3 = require("amf3")
+                _G.__LOGS = {}
+                _G.__MSGBOXES = {}
+                _G.CCLuaLog = function(msg)
+                    table.insert(_G.__LOGS, tostring(msg))
+                end
+                _G.CCMessageBox = function(msg, title)
+                    table.insert(_G.__MSGBOXES, { msg = tostring(msg), title = tostring(title) })
+                end
+                _G.lang = function(k) return "ERR_PREFIX:" end
+                _G.Logger = {
+                    showTrace = function() end,
+                    showWarning = function() end,
+                    showFatal = function() end,
+                }
+                _G.sendNotification = function() end
+
+                -- Preload minimal lib.Class, LoadingManager, DataLoading, ReconnectLoading, ReconnectProxy,
+                -- system.Network, core.BindableData, and core.BaseProxy matching clean main_apk scripts.
+                package.preload["lib.Class"] = function()
+                    local Class = { __type = "class" }
+                    function Class:extend_table(name, t)
+                        for k, v in pairs(self) do t[k] = v end
+                        t.super = self
+                        t._NAME = name
+                        return t
+                    end
+                    function Class:_dealGetterAndSetterMap()
+                        self._getterAndSetterMap = {}
+                    end
+                    function Class:new(...)
+                        local inst = {}
+                        setmetatable(inst, { __index = self })
+                        inst.__type = "object"
+                        if inst.ctor then inst:ctor(...) end
+                        return inst
+                    end
+                    return Class
+                end
+
+                package.preload["game.modules.loading.DataLoading"] = function()
+                    local DL = {}
+                    function DL:new()
+                        local o = { visible = false, hiddenCount = 0 }
+                        function o:show() self.visible = true end
+                        function o:hide() self.visible = false; self.hiddenCount = self.hiddenCount + 1 end
+                        return o
+                    end
+                    return DL
+                end
+
+                package.preload["game.modules.loading.ReconnectLoading"] = function()
+                    local RL = {}
+                    function RL:new()
+                        local o = { shown = false }
+                        function o:show() self.shown = true end
+                        function o:hide() self.shown = false end
+                        return o
+                    end
+                    return RL
+                end
+
+                package.preload["game.modules.reconnect.ReconnectProxy"] = function()
+                    local RP = { _ins = { startedReasons = {}, banned = false } }
+                    function RP._ins:isBanSendMsg() return self.banned end
+                    function RP._ins:start(des) table.insert(self.startedReasons, tostring(des)) end
+                    function RP._ins:showReconnectPanel() end
+                    function RP:ins() return self._ins end
+                    return RP
+                end
+            )LUA",
+            R"LUA(
+                package.preload["game.modules.loading.LoadingManager"] = function()
+                    local Class = require("lib.Class")
+                    local M = Class:extend_table("LoadingManager", {})
+                    M.NONE_LOADING_TYPE = 0
+                    M.DATA_LOADING_TYPE = 1
+                    M.SWITCH_LOADING_TYPE = 2
+                    M.BLANK_LOADING_TYPE = 3
+                    M.MAIN_LOADING_TYPE = 4
+                    function M:ctor()
+                        self._mainLoading = nil
+                        self._blankLoading = nil
+                        self._switchLoading = nil
+                        self._dataLoading = nil
+                        self._reconnectLoading = nil
+                        self._dataLoadingShowCount = 0
+                        self._dataLoadingKeyMap = {}
+                        self._curLoadingType = M.NONE_LOADING_TYPE
+                        self._hideHistory = {}
+                    end
+                    function M:ins()
+                        self._ins = self._ins or self:new()
+                        return self._ins
+                    end
+                    function M:_checkCanShowLoading(t) return self._curLoadingType < t end
+                    function M:_addLoadingKey(key)
+                        self._dataLoadingKeyMap[key] = (self._dataLoadingKeyMap[key] or 0) + 1
+                    end
+                    function M:_delLoadingKey(key)
+                        local v = self._dataLoadingKeyMap[key]
+                        if v then
+                            self._dataLoadingKeyMap[key] = v - 1
+                            if self._dataLoadingKeyMap[key] <= 0 then
+                                self._dataLoadingKeyMap[key] = nil
+                            end
+                        end
+                    end
+                    function M:_checkHasLoadingKey()
+                        for _, v in pairs(self._dataLoadingKeyMap) do
+                            if v and v > 0 then return true end
+                        end
+                        return false
+                    end
+                    function M:_forceClearDataLoading()
+                        self._dataLoadingShowCount = 0
+                        self._dataLoadingKeyMap = {}
+                        if self._dataLoading then self._dataLoading:hide() end
+                        self._dataLoading = nil
+                        self._curLoadingType = M.NONE_LOADING_TYPE
+                    end
+                    function M:showDataLoading(key)
+                        if self._curLoadingType ~= M.DATA_LOADING_TYPE and not self:_checkCanShowLoading(M.DATA_LOADING_TYPE) then
+                            return
+                        end
+                        if key then
+                            self:_addLoadingKey(key)
+                        else
+                            self._dataLoadingShowCount = self._dataLoadingShowCount + 1
+                        end
+                        if not self._dataLoading then
+                            self._dataLoading = require("game.modules.loading.DataLoading"):new()
+                            self._dataLoading:show()
+                            self._curLoadingType = M.DATA_LOADING_TYPE
+                        end
+                    end
+                    function M:hideDataLoading(key)
+                        table.insert(self._hideHistory, tostring(key))
+                        if self._curLoadingType ~= M.DATA_LOADING_TYPE then return end
+                        if key then
+                            self:_delLoadingKey(key)
+                        else
+                            self._dataLoadingShowCount = self._dataLoadingShowCount - 1
+                        end
+                        if self._dataLoadingShowCount <= 0 and self:_checkHasLoadingKey() == false then
+                            self:_forceClearDataLoading()
+                        end
+                    end
+                    function M:hideSwitchLoading() end
+                    function M:showReconnectLoading()
+                        if self._reconnectLoading then return end
+                        if self._curLoadingType == M.NONE_LOADING_TYPE then
+                            self._reconnectLoading = require("game.modules.loading.ReconnectLoading"):new()
+                            self._reconnectLoading:show()
+                        end
+                    end
+                    return M
+                end
+            )LUA",
+            R"LUA(
+                package.preload["system.Network"] = function()
+                    local Class = require("lib.Class")
+                    local M = Class:extend_table("Network", {})
+                    M.kETClosedEvent = "Network.onClosed"
+                    function M:ins()
+                        M._ins = M._ins or M:new()
+                        return M._ins
+                    end
+                    function M:ctor()
+                        self.mToken = "0"
+                        self.mOffset = 0
+                        self.mId = 1
+                        self.mContext = {}
+                        self._timestamp_map = {}
+                        self.log_print = {}
+                    end
+                    -- Unpatched baseline methods (to be hardened by InstallNetworkResilienceHook)
+                    function M:onClosed()
+                        error("unpatched Network:onClosed should have been replaced")
+                    end
+                    function M:onBodyData(body, head)
+                        error("unpatched Network:onBodyData should have been replaced")
+                    end
+                    function M:sendMsg(method, callback, args, isNotShowLoading)
+                        error("unpatched Network:sendMsg should have been replaced")
+                    end
+                    function M:goReconnect(des)
+                        local RP = require("game.modules.reconnect.ReconnectProxy")
+                        g.loadingManager:showReconnectLoading()
+                        RP:ins():start(des)
+                    end
+                    function M:regPushCallback(method, callback, isForce)
+                        self.mContext[method] = { callback, {}, true }
+                    end
+                    return M
+                end
+
+                package.preload["core.BindableData"] = function()
+                    local Class = require("lib.Class")
+                    local BD = Class:extend_table("BindableData", {})
+                    BD.network = require("system.Network")
+                    function BD:toString() return "BindableData" end
+                    function BD:methodName() return "" end
+                    function BD:methodArgs() return {} end
+                    function BD:parseData(data) end
+                    function BD:dobindCallback(prop, val) end
+                    -- Unpatched buggy initdata / onReceiveData from clean APK
+                    function BD:initdata(callback)
+                        self._onReceiveData = callback
+                        if self._isloading == true then return end
+                        self.network:ins():sendMsg(self:methodName(), function(ret, args) self:onReceiveData(ret, args) end, self:methodArgs())
+                        self._isloading = true
+                    end
+                    function BD:onReceiveData(ret, args)
+                        self:parseData(ret)
+                        self._isloading = false
+                        self.isok = true
+                        if self._onReceiveData ~= nil then
+                            self._onReceiveData()
+                            self._onReceiveData = nil
+                        end
+                    end
+                    function BD:new(options)
+                        local instance = {}
+                        setmetatable(instance, { __index = self })
+                        instance.__type = "object"
+                        instance._bindPropertyMap = {}
+                        instance._isloading = false
+                        instance.isok = false
+                        instance:_dealGetterAndSetterMap()
+                        local index = {}
+                        local mt = {
+                            __index = function(t, k) return t[index][k] end,
+                            __newindex = function(t, k, v)
+                                t[index][k] = v
+                                t[index]:dobindCallback(k, v)
+                            end
+                        }
+                        local proxy = {}
+                        proxy[index] = instance
+                        setmetatable(proxy, mt)
+                        if proxy.ctor then proxy:ctor(options) end
+                        return proxy
+                    end
+                    return BD
+                end
+            )LUA",
+            R"LUA(
+                _G.GameUtil = {
+                    unzipMode = "empty",
+                    unzipData = function(self, raw)
+                        if self.unzipMode == "empty" then return "" end
+                        if self.unzipMode == "throw" then error("zlib inflate error") end
+                        return raw
+                    end
+                }
+
+                local LoadingManager = require("game.modules.loading.LoadingManager")
+                local Network = require("system.Network")
+                local BindableData = require("core.BindableData")
+
+                _G.g = {
+                    loadingManager = LoadingManager:ins(),
+                    network = Network:ins(),
+                    networkUtil = { start = function() end, stop = function() end },
+                    mainData = { networkCloseResetDatas = function() end },
+                    noteConst = { NETWORK_CLOSE = "NETWORK_CLOSE" },
+                    timeManager = { setOffset = function() end },
+                    host = "127.0.0.1",
+                    pid = "p1001",
+                }
+
+                local sentPayloads = {}
+                local mockConn = {
+                    shouldFailSend = false,
+                    shouldThrowSend = false,
+                    send = function(self, data, wrap)
+                        if self.shouldThrowSend then error("socket broken pipe") end
+                        if self.shouldFailSend then return false end
+                        table.insert(sentPayloads, data)
+                        return true
+                    end,
+                    close = function() end,
+                }
+                g.network.mConn = mockConn
+
+                -- =====================================================================
+                -- TEST 1: Network:onBodyData when callback(ret.ret, args) throws
+                --   `attempt to index local 'reward' (a nil value)` ->
+                --   hideDataLoading(callbackName) still runs, _dataLoadingKeyMap is empty,
+                --   traceback is logged, AND sub-packet #2 in a multi=1 batch still executes!
+                --   (Also includes a malformed binary sub-packet between them to test (b),
+                --   and tests (a) zipped=1 empty unzip + orphaned key reconciliation!)
+                -- =====================================================================
+                local cb1Key = g.network:sendMsg("copy.getReward", function(ret, args)
+                    local reward = ret and ret.reward -- nil!
+                    return reward.itemId              -- throws: attempt to index local 'reward' (a nil value)
+                end, { copyId = 101 })
+
+                local sub2Ran = false
+                local sub2Arg = nil
+                local cb2Key = g.network:sendMsg("bag.syncBag", function(ret, args)
+                    sub2Ran = (ret and ret.gold == 888)
+                    sub2Arg = args and args.tab
+                end, { tab = 2 })
+
+                assert(type(cb1Key) == "string" and type(cb2Key) == "string")
+                assert(g.loadingManager._dataLoadingKeyMap[cb1Key] == 1)
+                assert(g.loadingManager._dataLoadingKeyMap[cb2Key] == 1)
+                assert(g.loadingManager._curLoadingType == g.loadingManager.DATA_LOADING_TYPE)
+
+                local subPkt1 = amf3.encode({
+                    err = "ok",
+                    callback = { callbackName = cb1Key },
+                    ret = { status = 1 } -- no .reward field!
+                })
+                local malformedSubPkt = "\255\000\254corrupt_sub_amf3"
+                local subPkt2 = amf3.encode({
+                    err = "ok",
+                    callback = { callbackName = cb2Key },
+                    ret = { gold = 888 }
+                })
+                local batchOuter = amf3.encode({
+                    token = "tok_batch_1",
+                    ret = { subPkt1, malformedSubPkt, subPkt2 }
+                })
+                local headMulti1 = "\0\0\0\0\0\0\1\0" -- byte 6 = 0 (unzipped), byte 7 = 1 (multi=1)
+
+                g.network:onBodyData(batchOuter, headMulti1)
+
+                assert(sub2Ran == true and sub2Arg == 2, "Sub-packet #2 in multi=1 batch failed to execute!")
+                assert(next(g.loadingManager._dataLoadingKeyMap) == nil, "_dataLoadingKeyMap must be empty after finally path!")
+                assert(g.loadingManager._curLoadingType == g.loadingManager.NONE_LOADING_TYPE, "DataLoading must be cleared!")
+                assert(g.loadingManager._dataLoading == nil, "_dataLoading instance must be hidden/cleared!")
+
+                local foundRewardNilTb = false
+                for _, line in ipairs(_G.__LOGS) do
+                    if string.find(line, "attempt to index local 'reward'", 1, true)
+                       and string.find(line, "stack traceback:", 1, true) then
+                        foundRewardNilTb = true
+                        break
+                    end
+                end
+                assert(foundRewardNilTb, "Expected full Lua traceback for nil 'reward' in CCLuaLog!")
+
+                -- Test (a): zipped=1 with GameUtil:unzipData returning "" + orphaned _dataLoadingKeyMap key
+                g.loadingManager:showDataLoading("orphan.stale_77")
+                assert(g.loadingManager._dataLoadingKeyMap["orphan.stale_77"] == 1)
+                local logsBeforeZip = #_G.__LOGS
+                local headZipped = "\0\0\0\0\0\1\0\0" -- byte 6 = 1 (zipped)
+                g.network:onBodyData("compressed_bytes", headZipped)
+                assert(#_G.__LOGS > logsBeforeZip, "Empty unzipData must log traceback via CCLuaLog!")
+                assert(g.loadingManager._dataLoadingKeyMap["orphan.stale_77"] == nil, "Orphaned loading key must be reconciled!")
+                assert(g.loadingManager._curLoadingType == g.loadingManager.NONE_LOADING_TYPE)
+            )LUA",
+            R"LUA(
+                -- =====================================================================
+                -- TEST 2: Network:onBodyData when ret.err = "some_error" and g.host == nil
+                --   -> no string.format crash, mContext[callbackName] cleared,
+                --   hideDataLoading called, and BindableData _isloading reset!
+                --   Also verify sendMsg immediate cleanup on encode/send failure!
+                -- =====================================================================
+                g.host = nil
+                g.pid = nil
+                g.network.mToken = { nested = true } -- table token would also crash unpatched string.format!
+
+                local ErrBindable = BindableData:extend_table("ErrBindable", {})
+                function ErrBindable:methodName() return "arena.enter" end
+                function ErrBindable:parseData(d) self.parsed = d end
+                local errBd = ErrBindable:new()
+
+                local errBdWaiterCalled = false
+                errBd:initdata(function() errBdWaiterCalled = true end)
+                assert(errBd._isloading == true, "BindableData should be loading while RPC is in flight")
+
+                local errCbKey = g.network._lastSentCbKey
+                assert(type(errCbKey) == "string" and g.network.mContext[errCbKey] ~= nil)
+                assert(g.loadingManager._dataLoadingKeyMap[errCbKey] == 1)
+
+                local errPkt = amf3.encode({
+                    err = "some_error",
+                    callback = { callbackName = errCbKey }
+                })
+                g.network:onBodyData(errPkt, "\0\0\0\0\0\0\0\0")
+
+                assert(g.network.mContext[errCbKey] == nil, "mContext[callbackName] must be cleared on ret.err ~= 'ok'")
+                assert(next(g.loadingManager._dataLoadingKeyMap) == nil, "hideDataLoading(callbackName) must clear key on ret.err ~= 'ok'")
+                assert(g.loadingManager._curLoadingType == g.loadingManager.NONE_LOADING_TYPE)
+                assert(#_G.__MSGBOXES >= 1 and string.find(_G.__MSGBOXES[#_G.__MSGBOXES].msg, "host:nil", 1, true) ~= nil)
+                assert(string.find(_G.__MSGBOXES[#_G.__MSGBOXES].msg, "err: some_error", 1, true) ~= nil)
+                assert(errBd._isloading == false and errBd.isok == false, "BindableData _isloading must reset to false on ret.err ~= 'ok'")
+                assert(errBdWaiterCalled == true, "Waiter must wake so BaseProxy does not hang forever")
+
+                -- Also verify ret.callback == nil and non-string ret.err in onBodyData does not crash
+                g.network.mToken = "tok_valid"
+                g.network:onBodyData(amf3.encode({ err = { bad = 500 } }), "\0\0\0\0\0\0\0\0")
+
+                -- Also verify Network:sendMsg immediate cleanup when mConn:send fails
+                mockConn.shouldFailSend = true
+                local failedSendKey = g.network:sendMsg("shop.buy", function() end, { id = 1 })
+                mockConn.shouldFailSend = false
+                assert(failedSendKey == nil)
+                for k, v in pairs(g.network.mContext) do
+                    assert(type(v) == "table" and v[3] ~= nil, "Failed sendMsg leaked pending mContext entry: " .. tostring(k))
+                end
+                assert(next(g.loadingManager._dataLoadingKeyMap) == nil, "Failed sendMsg leaked _dataLoadingKeyMap key!")
+
+                -- =====================================================================
+                -- TEST 3: Network:onClosed() with active keyed callbackName in _dataLoadingKeyMap
+                --   -> clears keyed spinner and unblocks showReconnectLoading()!
+                -- =====================================================================
+                local pendingCloseKey = g.network:sendMsg("hero.strengthen", function() end, { hid = 99 })
+                g.loadingManager:showDataLoading("orphan.key_88")
+                assert(g.loadingManager._dataLoadingKeyMap[pendingCloseKey] == 1)
+                assert(g.loadingManager._dataLoadingKeyMap["orphan.key_88"] == 1)
+                assert(g.loadingManager._curLoadingType == g.loadingManager.DATA_LOADING_TYPE)
+
+                g.network:onClosed()
+
+                assert(g.loadingManager._dataLoadingKeyMap[pendingCloseKey] == nil, "onClosed must clear active RPC key!")
+                assert(g.loadingManager._dataLoadingKeyMap["orphan.key_88"] == nil, "onClosed must clear orphan key!")
+                assert(g.loadingManager._dataLoading == nil, "onClosed must hide DataLoading!")
+                assert(g.loadingManager._curLoadingType == g.loadingManager.NONE_LOADING_TYPE)
+                assert(g.loadingManager._reconnectLoading ~= nil and g.loadingManager._reconnectLoading.shown == true,
+                       "showReconnectLoading() must succeed after clearing keyed RPC spinners!")
+
+                -- Re-attach mockConn and verify showLoginProtect is preserved by onClosed()
+                g.loadingManager._reconnectLoading = nil
+                g.network.mContext = {}
+                g.network.mConn = mockConn
+                g.loadingManager:showDataLoading("showLoginProtect")
+                local rpcDuringLogin = g.network:sendMsg("user.loginSub", function() end, {})
+                assert(g.loadingManager._dataLoadingKeyMap["showLoginProtect"] == 1)
+                assert(g.loadingManager._dataLoadingKeyMap[rpcDuringLogin] == 1)
+                g.network:onClosed()
+                assert(g.loadingManager._dataLoadingKeyMap[rpcDuringLogin] == nil)
+                assert(g.loadingManager._dataLoadingKeyMap["showLoginProtect"] == 1, "showLoginProtect must be preserved!")
+                g.loadingManager:hideDataLoading("showLoginProtect")
+                assert(next(g.loadingManager._dataLoadingKeyMap) == nil)
+                g.network.mContext = {}
+                g.network.mConn = mockConn
+
+                -- =====================================================================
+                -- TEST 4: BindableData:initdata concurrent waiters + parseData error recovery!
+                -- =====================================================================
+                local HeroData = BindableData:extend_table("HeroData", {})
+                function HeroData:methodName() return "hero.getAllHeros" end
+                function HeroData:methodArgs() return { page = 1 } end
+                HeroData.shouldThrowInParse = true
+                function HeroData:parseData(data)
+                    if self.shouldThrowInParse then
+                        local badHero = nil
+                        self.totalAtk = badHero.atk + 10 -- throws!
+                    end
+                    self.heroCount = data and data.count or 0
+                end
+
+                local hd = HeroData:new()
+                local sentBefore = #sentPayloads
+                local waiterOrder = {}
+                hd:initdata(function() table.insert(waiterOrder, "W1") end)
+                hd:initdata(function() table.insert(waiterOrder, "W2") end)
+                hd:initdata(function() table.insert(waiterOrder, "W3") end)
+
+                assert(hd._isloading == true)
+                assert(#sentPayloads == sentBefore + 1, "Concurrent initdata calls must coalesce into 1 RPC!")
+                local hdKey1 = g.network._lastSentCbKey
+                assert(type(hdKey1) == "string")
+
+                -- Deliver response #1: parseData throws!
+                local logsBeforeParseErr = #_G.__LOGS
+                g.network:onBodyData(amf3.encode({
+                    err = "ok",
+                    callback = { callbackName = hdKey1 },
+                    ret = { count = 5 }
+                }), "\0\0\0\0\0\0\0\0")
+
+                assert(hd._isloading == false, "parseData error must still reset _isloading = false!")
+                assert(hd.isok == false, "Failed initial parseData must leave isok = false for clean retry!")
+                assert(#waiterOrder == 3 and waiterOrder[1] == "W1" and waiterOrder[2] == "W2" and waiterOrder[3] == "W3",
+                       "All 3 concurrent waiters must run in FIFO order without overwriting _onReceiveData!")
+                assert(#_G.__LOGS > logsBeforeParseErr, "parseData error must log full traceback via CCLuaLog!")
+
+                -- Re-open panel retry: now parseData succeeds!
+                hd.shouldThrowInParse = false
+                local retryWaiterRan = false
+                hd:initdata(function() retryWaiterRan = true end)
+                assert(hd._isloading == true)
+                assert(#sentPayloads == sentBefore + 2, "Retry after failed parseData must send a fresh RPC!")
+                local hdKey2 = g.network._lastSentCbKey
+                g.network:onBodyData(amf3.encode({
+                    err = "ok",
+                    callback = { callbackName = hdKey2 },
+                    ret = { count = 42 }
+                }), "\0\0\0\0\0\0\0\0")
+
+                assert(hd._isloading == false and hd.isok == true and hd.heroCount == 42)
+                assert(retryWaiterRan == true)
+            )LUA"
+        };
+
+        std::string fullTestScript;
+        for (const char* part : kCleanHarnessChunks) {
+            fullTestScript.append(part);
+        }
+        if (luaL_dostring(L, fullTestScript.c_str()) != 0) {
+            const char* err = lua_tostring(L, -1);
+            std::fprintf(stderr, "[LuaCleanHarness FAIL] %s\n", err ? err : "(null)");
+            lua_close(L);
+            return false;
+        }
+        lua_close(L);
+    }
+
+    // Optional integration check against real decrypted_scripts (V12/V15) if present on local test machine
+    const fs::path realScriptsDir = "/working_dir/c_bcf9b7da4ae73030/decrypted_scripts/scripts";
+    if (fs::exists(realScriptsDir / "system/Network.lua") &&
+        fs::exists(realScriptsDir / "core/BaseProxy.lua") &&
+        fs::exists(realScriptsDir / "core/BindableData.lua")) {
+        lua_State* L = luaL_newstate();
+        REQUIRE_TRUE(L != nullptr);
+        luaL_openlibs(L);
+        luaopen_amf3_extensions(L);
+        gclient::bindings::InstallNetworkResilienceHookImpl(L);
+
+        const std::string bootRealScripts =
+            "package.path = '" + realScriptsDir.string() + "/?.lua;' .. package.path\n" +
+            R"LUA(
+                _G.amf3 = require("amf3")
+                _G.__REAL_LOGS = {}
+                _G.CCLuaLog = function(m) table.insert(_G.__REAL_LOGS, tostring(m)) end
+                _G.CCMessageBox = function() end
+                _G.lang = function() return "ERR:" end
+                _G.Logger = { showTrace = function() end, showWarning = function() end, showFatal = function() end, showError = function() end }
+                _G.sendNotification = function() end
+                function _G.seeall(parentName)
+                    local parent = require(parentName)
+                    return function(modTbl)
+                        parent:extend_table(modTbl._NAME, modTbl)
+                    end
+                end
+                package.preload["game.modules.safetyRadar.SafetyRadarProxy"] = function()
+                    return { ins = function() return { isCaptureMsg = false } end }
+                end
+                package.preload["game.modules.loading.DataLoading"] = function()
+                    return { new = function() return { show = function() end, hide = function() end } end }
+                end
+                package.preload["game.modules.loading.ReconnectLoading"] = function()
+                    return { new = function() local o = { shown = false }; function o:show() self.shown = true end; function o:hide() end; return o end }
+                end
+                package.preload["game.modules.reconnect.ReconnectProxy"] = function()
+                    local rp = { isBanSendMsg = function() return false end, start = function() end, showReconnectPanel = function() end }
+                    return { ins = function() return rp end }
+                end
+
+                local LoadingManager = require("game.modules.loading.LoadingManager")
+                local Network = require("system.Network")
+                local BindableData = require("core.BindableData")
+                local BaseProxy = require("core.BaseProxy")
+
+                _G.g = {
+                    loadingManager = LoadingManager:ins(),
+                    network = Network:ins(),
+                    networkUtil = { start = function() end, stop = function() end },
+                    mainData = { networkCloseResetDatas = function() end },
+                    noteConst = { NETWORK_CLOSE = "NETWORK_CLOSE" },
+                    timeManager = { setOffset = function() end },
+                    host = nil,
+                    pid = nil,
+                }
+                if type(_G.__ensureStuck99LoadingFlowGuardsV11) == "function" then
+                    _G.__ensureStuck99LoadingFlowGuardsV11()
+                end
+
+                g.network.mConn = { send = function() return true end, close = function() end }
+
+                -- Verify V15 + InstallNetworkResilienceHookImpl coexist seamlessly!
+                local k1 = g.network:sendMsg("copy.enter", function(ret)
+                    local reward = nil
+                    return reward.x
+                end, {})
+                local secondOk = false
+                local k2 = g.network:sendMsg("bag.info", function(ret)
+                    secondOk = (ret.v == 7)
+                end, {})
+
+                local batch = amf3.encode({
+                    ret = {
+                        amf3.encode({ err = "ok", callback = { callbackName = k1 }, ret = {} }),
+                        amf3.encode({ err = "ok", callback = { callbackName = k2 }, ret = { v = 7 } }),
+                    }
+                })
+                g.network:onBodyData(batch, "\0\0\0\0\0\0\1\0")
+                assert(secondOk == true, "V15 coexistence: sub-packet #2 must still run!")
+                assert(next(g.loadingManager._dataLoadingKeyMap) == nil, "V15 coexistence: _dataLoadingKeyMap must be empty!")
+                assert(#_G.__REAL_LOGS >= 1 and string.find(_G.__REAL_LOGS[1], "reward", 1, true) ~= nil,
+                       "V15 coexistence: callback error must log full traceback via CCLuaLog!")
+
+                -- Verify onClosed clears keyed spinner even under V15 LoadingManager
+                local k3 = g.network:sendMsg("arena.rank", function() end, {})
+                assert(g.loadingManager._dataLoadingKeyMap[k3] == 1)
+                g.network:onClosed()
+                assert(g.loadingManager._dataLoadingKeyMap[k3] == nil)
+                assert(g.loadingManager._reconnectLoading ~= nil and g.loadingManager._reconnectLoading.shown == true)
+            )LUA";
+
+        if (luaL_dostring(L, bootRealScripts.c_str()) != 0) {
+            const char* err = lua_tostring(L, -1);
+            std::fprintf(stderr, "[RealDecryptedScripts V15 FAIL] %s\n", err ? err : "(null)");
+            lua_close(L);
+            return false;
+        }
+        lua_close(L);
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -2678,6 +3486,8 @@ int main() {
                 testIssue8GainItemPanelLifecycleAndImageViewRendering);
     runTestCase("16_Win32MouseRouting_DpiViewport_And_FuncMenuTouchGroupCycles",
                 testWin32MouseRoutingDpiViewportAndFuncMenuCycles);
+    runTestCase("17_NetworkAndDataLoading_CrashResilience_And_BindableDataRecovery",
+                testNetworkDataLoadingResilienceAndBindableDataRecovery);
 
     std::printf("======================================================================\n");
     std::printf("Summary: %d passed, %d failed\n", g_passedTests, g_failedTests);
