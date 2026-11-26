@@ -2697,17 +2697,24 @@ bool testLayer1CConnectionProtectedLuaCallbacks() {
 
     // Subcase 1A: With __GCLIENT_NATIVE_TRACKBACK__ active, feed two framed packets back-to-back over loopback
     {
+        gclient::net::WinsockSession ws;
+        REQUIRE_TRUE(ws.isInitialized());
+
         SOCKET listenSock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         REQUIRE_TRUE(listenSock != INVALID_SOCKET);
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0;
-        REQUIRE_EQ(::bind(listenSock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+        addr.sin_port = htons(0);
+        REQUIRE_EQ(::bind(listenSock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)), 0);
+        REQUIRE_EQ(::listen(listenSock, 4), 0);
+#ifdef _WIN32
+        int addrLen = sizeof(addr);
+#else
         socklen_t addrLen = sizeof(addr);
+#endif
         REQUIRE_EQ(::getsockname(listenSock, reinterpret_cast<sockaddr*>(&addr), &addrLen), 0);
         const unsigned int port = ntohs(addr.sin_port);
-        REQUIRE_EQ(::listen(listenSock, 1), 0);
 
         auto conn = std::make_unique<gclient::net::CConnection>();
         conn->setStandaloneLuaState(L);
@@ -2756,6 +2763,8 @@ bool testLayer1CConnectionProtectedLuaCallbacks() {
         REQUIRE_TRUE(sawBodyErrTrace);
         REQUIRE_TRUE(sawCloseErrTrace);
 
+        conn.reset();
+        gclient::net::CNetwork::destroySharedNetwork();
 #ifdef _WIN32
         ::closesocket(serverClient);
         ::closesocket(listenSock);
