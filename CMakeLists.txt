@@ -477,6 +477,9 @@ if(GCLIENT_BUILD_TESTS)
             src/net/LCPacket.cpp
             src/net/CConnection.cpp
             src/net/CNetwork.cpp
+            src/platform/AccountAuthProvider.cpp
+            src/platform/BtPlatformWin32.cpp
+            src/platform/tolua_Platform.cpp
             src/update/AtomicHotUpdater.cpp
             src/diagnostics/CrashAndTelemetry.cpp
         )
@@ -500,12 +503,16 @@ if(GCLIENT_BUILD_TESTS)
             lua51
             ZLIB::ZLIB
             SQLite::SQLite3
+            CURL::libcurl
+            OpenSSL::SSL
+            OpenSSL::Crypto
             $<$<PLATFORM_ID:Windows>:ws2_32>
             $<$<PLATFORM_ID:Windows>:bcrypt>
             $<$<PLATFORM_ID:Windows>:crypt32>
             $<$<PLATFORM_ID:Windows>:dbghelp>
             $<$<PLATFORM_ID:Windows>:psapi>
             $<$<PLATFORM_ID:Windows>:user32>
+            $<$<PLATFORM_ID:Windows>:gdi32>
             $<$<PLATFORM_ID:Windows>:advapi32>
             $<$<PLATFORM_ID:Windows>:shell32>
         )

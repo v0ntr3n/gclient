@@ -1034,6 +1034,52 @@ public:
         }
     }
 
+    S2cDecodedMsg callRpcRawArgs(const std::string& method, Amf3Value rawArgs,
+                                 bool compressLCPacket = true) {
+        ++seq_;
+        const bool isTelemetry = (method == "user.stat" || method == "user.guideEvent");
+        const std::string cbName =
+            isTelemetry ? method : (method + "_" + std::to_string(seq_));
+
+        Amf3Value reqObj = Amf3Value::makeMap({
+            {"method", Amf3Value::makeString(method)},
+            {"args", std::move(rawArgs)},
+            {"token", Amf3Value::makeString(token_)},
+            {"callback", Amf3Value::makeMap({{"callbackName", Amf3Value::makeString(cbName)}})},
+        });
+
+        Amf3Encoder enc;
+        const std::string rawAmf = enc.encode(reqObj);
+
+        if (compressLCPacket) {
+            if (!conn_->send(rawAmf, true)) {
+                throw std::runtime_error("CConnection::send(wrapLCPacket=true) failed");
+            }
+        } else {
+            const std::string framed = gclient::net::LCPacket::makeLCPacket(rawAmf, false);
+            if (!conn_->send(framed, false)) {
+                throw std::runtime_error("CConnection::send(uncompressed LCPacket) failed");
+            }
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            gclient::net::CNetwork::sharedNetwork()->update(0.016f);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                for (auto it = inbox_.begin(); it != inbox_.end(); ++it) {
+                    if (it->callbackName == cbName) {
+                        S2cDecodedMsg found = std::move(*it);
+                        inbox_.erase(it);
+                        return found;
+                    }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        }
+        throw std::runtime_error("Timed out waiting for S2C callback: " + cbName);
+    }
+
     S2cDecodedMsg callRpc(const std::string& method, std::vector<Amf3Value> args,
                           bool compressLCPacket = true) {
         ++seq_;
@@ -2696,6 +2742,205 @@ int main(int argc, char** argv) {
         REQUIRE_EQ(clientC.callRpc("eatChicken.eat", {}).err, std::string("ok"));
 
         clientC.disconnect();
+        return true;
+    });
+
+    runCase("CrossRepo_18_ActiveEventsAndOneClickInstantBuy", [&]() {
+        const auto tkD = strictGuestHandshake(httpHost, httpPort, "kestrel_cpp_instant_buy_d", true);
+        RealKestrelWireClient clientD;
+        REQUIRE_TRUE(clientD.connectToRelay(tcpHost, tcpPort));
+        REQUIRE_EQ(
+            clientD
+                .callRpc("user.login",
+                         {Amf3Value::makeMap({
+                             {"AMF", Amf3Value::makeInt(3)},
+                             {"pid", Amf3Value::makeString(tkD.pid)},
+                             {"qid", Amf3Value::makeString(tkD.pid)},
+                             {"hash", Amf3Value::makeString(tkD.hash)},
+                             {"serverID", Amf3Value::makeString("game2900161")},
+                         })})
+                .err,
+            std::string("ok"));
+        REQUIRE_EQ(
+            clientD
+                .callRpc("user.createUser",
+                         {Amf3Value::makeInt(1), Amf3Value::makeString("VạnSựNhưÝ")})
+                .err,
+            std::string("ok"));
+        const int64_t uidD =
+            clientD.callRpc("user.getUserBeforLogin", {}).ret.get("uid")->asInt();
+        REQUIRE_EQ(clientD.callRpc("user.userLogin", {Amf3Value::makeInt(uidD)}).ret.asString(),
+                   std::string("ok"));
+        REQUIRE_EQ(
+            clientD
+                .callRpc("chat.sendWorld",
+                         {Amf3Value::makeInt(1), Amf3Value::makeString("/level 60")})
+                .err,
+            std::string("ok"));
+        (void)clientD.drainPushes(30);
+
+        // 1. activity.getActivityConf
+        auto actConf = clientD.callRpc("activity.getActivityConf", {});
+        REQUIRE_EQ(actConf.err, std::string("ok"));
+        REQUIRE_TRUE(!actConf.ret.fields.empty() || !actConf.ret.dense.empty());
+
+        // 2. dailyDiscount.getInfo & dailyDiscount.receive (0 VND free, id=1)
+        auto ddInit = clientD.callRpc("dailyDiscount.getInfo", {});
+        REQUIRE_EQ(ddInit.err, std::string("ok"));
+        REQUIRE_TRUE(ddInit.ret.get("productBuy") != nullptr);
+
+        auto preUser0 = clientD.callRpc("user.getUser", {}).ret;
+        const int64_t gold0 = preUser0.get("gold")->asInt();
+        auto preBag0 = clientD.callRpc("bag.bagInfo", {}).ret;
+        const int64_t pre22102 = sumBagTemplateCount(preBag0, "item", 22102);
+
+        auto ddFree = clientD.callRpc("dailyDiscount.receive", {Amf3Value::makeInt(1)});
+        REQUIRE_EQ(ddFree.err, std::string("ok"));
+        REQUIRE_TRUE(ddFree.ret.asString() == "ok" ||
+                     (ddFree.ret.get("ret") != nullptr &&
+                      ddFree.ret.get("ret")->asString() == "ok"));
+
+        auto userAfterFree = clientD.callRpc("user.getUser", {}).ret;
+        REQUIRE_TRUE(userAfterFree.get("gold")->asInt() >= gold0 + 20);
+        auto bagAfterFree = clientD.callRpc("bag.bagInfo", {}).ret;
+        REQUIRE_TRUE(sumBagTemplateCount(bagAfterFree, "item", 22102) >= pre22102 + 1);
+
+        // Helper matching SDKUtil.pay -> net:sendMsg("pay.instantBuy", cb, payload)
+        auto sendInstantBuy = [&](int64_t payId, int64_t payPrice, const std::string& payType,
+                                  const std::string& productName, int64_t buyType, int64_t itemId,
+                                  Amf3Value payRow = Amf3Value::makeNull()) {
+            std::map<std::string, Amf3Value> m{
+                {"pay_id", Amf3Value::makeInt(payId)},
+                {"pay_id_str", Amf3Value::makeString(std::to_string(payId))},
+                {"pay_price", Amf3Value::makeInt(payPrice)},
+                {"pay_type", Amf3Value::makeString(payType)},
+                {"product_name", Amf3Value::makeString(productName)},
+                {"buy_type", Amf3Value::makeInt(buyType)},
+                {"item_id", Amf3Value::makeInt(itemId)},
+            };
+            if (buyType > 0 || itemId > 0) {
+                m["extra_data"] = Amf3Value::makeArray({
+                    Amf3Value::makeInt(buyType),
+                    Amf3Value::makeInt(itemId),
+                    Amf3Value::makeInt(payId),
+                });
+            }
+            if (payRow.kind == Amf3Value::Kind::Map) {
+                m["pay_row"] = std::move(payRow);
+            }
+            Amf3Value mapVal;
+            mapVal.kind = Amf3Value::Kind::Map;
+            mapVal.fields = std::move(m);
+            return clientD.callRpcRawArgs("pay.instantBuy", std::move(mapVal));
+        };
+
+        // 3a. pay.instantBuy: 5000 VND daily discount (buy_type=4, item_id=2, pay_id=1603)
+        (void)clientD.drainPushes(20);
+        const int64_t pre14374 = sumBagTemplateCount(bagAfterFree, "item", 14374);
+        auto buy5k = sendInstantBuy(1603, 5000, "04", "Quà 5000 VND", 4, 2);
+        REQUIRE_EQ(buy5k.err, std::string("ok"));
+        auto pushes5k = clientD.drainPushes(60);
+        REQUIRE_TRUE(hasPush(pushes5k, "dailyDiscount.normalUpdate") ||
+                     hasPush(pushes5k, "user.updateUser"));
+
+        // 3b. pay.instantBuy: 249000 VND 8-day pre-buy (buy_type=4, item_id=5, pay_id=1606)
+        auto buyPre8 = sendInstantBuy(1606, 249000, "04", "249000 VND mua 8 ngày", 4, 5);
+        REQUIRE_EQ(buyPre8.err, std::string("ok"));
+        auto pushesPre8 = clientD.drainPushes(60);
+        REQUIRE_TRUE(hasPush(pushesPre8, "dailyDiscount.preBuyUpdate") ||
+                     hasPush(pushesPre8, "user.updateUser"));
+
+        // Ensure >= 2 tokens of 14374 for dailyDiscount.redeem (claim pre-buy tier 3 or buy 9000 VND tier 3)
+        auto bagMid = clientD.callRpc("bag.bagInfo", {}).ret;
+        if (sumBagTemplateCount(bagMid, "item", 14374) < pre14374 + 2) {
+            auto rec3 = clientD.callRpc("dailyDiscount.receive", {Amf3Value::makeInt(3)});
+            if (rec3.err != "ok") {
+                REQUIRE_EQ(sendInstantBuy(1604, 9000, "04", "Quà 9000 VND", 4, 3).err,
+                           std::string("ok"));
+            }
+            (void)clientD.drainPushes(40);
+        }
+
+        // 3c. pay.instantBuy: Quà Ngày (buy_type=12, item_id=1, pay_id=1620)
+        auto buyQuaNgay = sendInstantBuy(1620, 25000, "04", "Quà Ngày", 12, 1);
+        REQUIRE_EQ(buyQuaNgay.err, std::string("ok"));
+        auto pushesQN = clientD.drainPushes(60);
+        REQUIRE_TRUE(hasPush(pushesQN, "activityDailyRecharge2.update") ||
+                     hasPush(pushesQN, "user.updateUser"));
+
+        // 3d. pay.instantBuy: Tam Quốc Chí Tôn Lệnh (buy_type=8, item_id=1, pay_id=1619)
+        auto buyQuarter = sendInstantBuy(1619, 249000, "04", "Tam Quốc Chí Tôn Lệnh", 8, 1);
+        REQUIRE_EQ(buyQuarter.err, std::string("ok"));
+        auto pushesQt = clientD.drainPushes(60);
+        REQUIRE_TRUE(hasPush(pushesQt, "activityQuarter.update") ||
+                     hasPush(pushesQt, "user.updateUser"));
+
+        // 3e. pay.instantBuy: MonthCard (PayType="01", pay_id=1001)
+        auto preCardUser = clientD.callRpc("user.getUser", {}).ret;
+        const int64_t goldBeforeCard = preCardUser.get("gold")->asInt();
+        auto buyMonthCard = sendInstantBuy(
+            1001, 109000, "01", "Thẻ Tháng", 0, 0,
+            Amf3Value::makeMap({
+                {"id", Amf3Value::makeInt(1001)},
+                {"recharge_type", Amf3Value::makeInt(2)},
+                {"consume_money", Amf3Value::makeInt(109000)},
+                {"Stall", Amf3Value::makeInt(30)},
+                {"days", Amf3Value::makeInt(30)},
+                {"vip_exp", Amf3Value::makeInt(300)},
+                {"base_reward", Amf3Value::makeInt(300)},
+                {"daily_reward", Amf3Value::makeInt(100)},
+            }));
+        REQUIRE_EQ(buyMonthCard.err, std::string("ok"));
+        (void)clientD.drainPushes(40);
+
+        // 3f. pay.instantBuy: Gold (PayType="00", pay_id=1004)
+        auto buyGold = sendInstantBuy(
+            1004, 25000, "00", "60 Nguyên Bảo", 0, 0,
+            Amf3Value::makeMap({
+                {"id", Amf3Value::makeInt(1004)},
+                {"recharge_type", Amf3Value::makeInt(1)},
+                {"consume_money", Amf3Value::makeInt(25000)},
+                {"Stall", Amf3Value::makeInt(6)},
+                {"days", Amf3Value::makeInt(0)},
+                {"vip_exp", Amf3Value::makeInt(60)},
+                {"base_reward", Amf3Value::makeInt(60)},
+                {"first_reward", Amf3Value::makeInt(60)},
+                {"general_reward", Amf3Value::makeInt(0)},
+            }));
+        REQUIRE_EQ(buyGold.err, std::string("ok"));
+        (void)clientD.drainPushes(40);
+        auto postGoldUser = clientD.callRpc("user.getUser", {}).ret;
+        REQUIRE_TRUE(postGoldUser.get("gold")->asInt() > goldBeforeCard);
+
+        // 4. dailyDiscount.redeem (shop id=15: 2x 14374 -> 1x 28623)
+        auto preRedeemBag = clientD.callRpc("bag.bagInfo", {}).ret;
+        const int64_t pre28623 = sumBagTemplateCount(preRedeemBag, "item", 28623);
+        auto redeemRes =
+            clientD.callRpc("dailyDiscount.redeem", {Amf3Value::makeInt(15), Amf3Value::makeInt(1)});
+        REQUIRE_EQ(redeemRes.err, std::string("ok"));
+        (void)clientD.drainPushes(40);
+        auto postRedeemBag = clientD.callRpc("bag.bagInfo", {}).ret;
+        REQUIRE_TRUE(sumBagTemplateCount(postRedeemBag, "item", 28623) >= pre28623 + 1);
+
+        // 5. dailyDiscount.recRechargeReward (point id=1: 300 points -> 1x 21079)
+        const int64_t pre21079 = sumBagTemplateCount(postRedeemBag, "item", 21079);
+        auto recPtRes =
+            clientD.callRpc("dailyDiscount.recRechargeReward", {Amf3Value::makeInt(1)});
+        REQUIRE_EQ(recPtRes.err, std::string("ok"));
+        (void)clientD.drainPushes(40);
+        auto postPtBag = clientD.callRpc("bag.bagInfo", {}).ret;
+        REQUIRE_TRUE(sumBagTemplateCount(postPtBag, "item", 21079) >= pre21079 + 1);
+
+        // 6. firstGift.receiveReward (tier 1: 60 gold -> 1x 27501)
+        const int64_t pre27501 = sumBagTemplateCount(postPtBag, "item", 27501);
+        auto firstGiftRes =
+            clientD.callRpc("firstGift.receiveReward", {Amf3Value::makeInt(1)});
+        REQUIRE_EQ(firstGiftRes.err, std::string("ok"));
+        (void)clientD.drainPushes(40);
+        auto postFirstBag = clientD.callRpc("bag.bagInfo", {}).ret;
+        REQUIRE_TRUE(sumBagTemplateCount(postFirstBag, "item", 27501) >= pre27501 + 1);
+
+        clientD.disconnect();
         return true;
     });
 

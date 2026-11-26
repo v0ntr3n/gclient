@@ -21,6 +21,8 @@
 #include "net/CConnection.h"
 #include "net/CNetwork.h"
 #include "net/LCPacket.h"
+#include "platform/BtPlatformWin32.h"
+#include "platform/tolua_Platform.h"
 #include "update/AtomicHotUpdater.h"
 
 extern "C" {
@@ -3447,6 +3449,474 @@ bool testNetworkDataLoadingResilienceAndBindableDataRecovery() {
     return true;
 }
 
+// ============================================================================
+// Scenario 19: BtPlatformWin32 "pay" Shim, VNG Platform Key Normalization,
+// PayReader Nil/+100/Synthetic Fallback, & Universal 1-Click Instant Buy
+// (pay.instantBuy + tmPay.instantBuy + Platform:pay JSON + reload() survival)
+// ============================================================================
+
+bool testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim() {
+    using gclient::net::CConnection;
+    using gclient::net::CNetwork;
+    using gclient::net::LCPacket;
+    using gclient::net::WinsockSession;
+
+    // Mandatory WinsockSession initialization BEFORE any ::socket() call on Win32!
+    WinsockSession ws;
+    REQUIRE_TRUE(ws.isInitialized());
+
+    // 1. Verify C++ BtPlatformWin32 "pay" capability shim returns kHttpSuccess + errornu="0"
+    const bt::CapabilityShimEntry* payShim = bt::Platform::findCapabilityShim("pay");
+    REQUIRE_TRUE(payShim != nullptr);
+    REQUIRE_TRUE(payShim->emitCallback);
+    REQUIRE_EQ(payShim->callbackEventId, bt::kPay);
+    REQUIRE_EQ(payShim->defaultStatusCode, bt::kHttpSuccess);
+    REQUIRE_TRUE(payShim->defaultPayloadJson != nullptr);
+    REQUIRE_TRUE(std::string(payShim->defaultPayloadJson).find("\"errornu\":\"0\"") != std::string::npos);
+
+    bt::Platform* plat = bt::Platform::getInstance();
+    REQUIRE_TRUE(plat != nullptr);
+    plat->setAuthProvider(std::make_shared<bt::LocalStubAuthProvider>());
+
+    lua_State* L = luaL_newstate();
+    REQUIRE_TRUE(L != nullptr);
+    luaL_openlibs(L);
+    luaopen_amf3_extensions(L);
+    REQUIRE_EQ(tolua_Platform_open(L), 1);
+    lua_pop(L, 1);
+    gclient::bindings::InstallNetworkResilienceHookImpl(L);
+
+    // Exercise Platform:initSDK + Platform::pay -> tickLoop -> SDKUtil SDKhandler check (zero CCMessageBox!)
+    const char* partAScript = R"LUA(
+        _G.__MSG_BOX_CALLS = 0
+        _G.CCMessageBox = function(title, msg)
+            _G.__MSG_BOX_CALLS = _G.__MSG_BOX_CALLS + 1
+        end
+        _G.__SDK_EVENTS = {}
+        local okCodes = { ["0"] = true, ["102"] = true, ["104"] = true }
+        local function sdkHandler(eventType, statusCodeOrPayload, maybePayload)
+            local payload = type(maybePayload) == "string" and maybePayload or tostring(statusCodeOrPayload or "")
+            local hasErrZero = string.find(payload, '"errornu"%s*:%s*"0"') ~= nil
+            local errNu = hasErrZero and "0" or nil
+            table.insert(_G.__SDK_EVENTS, { ev = eventType, payload = payload, errNu = errNu })
+            if not okCodes[errNu] then
+                _G.CCMessageBox("msg", payload)
+            end
+        end
+        Platform:getInstance():initSDK("{}", sdkHandler)
+    )LUA";
+    if (luaL_dostring(L, partAScript) != 0) {
+        std::fprintf(stderr, "[PartA init FAIL] %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return false;
+    }
+    plat->tickLoop(); // drains kInit
+    plat->pay("{\"ProductId\":\"1001\"}");
+    plat->tickLoop(); // drains kPay
+
+    const char* partAVerify = R"LUA(
+        assert(_G.__MSG_BOX_CALLS == 0, "Platform::pay must NOT trigger blocking CCMessageBox!")
+        local sawPayOk = false
+        for _, item in ipairs(_G.__SDK_EVENTS) do
+            if item.ev == kPay and item.errNu == "0" then
+                sawPayOk = true
+            end
+        end
+        assert(sawPayOk, "Expected kPay callback with errornu='0'!")
+    )LUA";
+    if (luaL_dostring(L, partAVerify) != 0) {
+        std::fprintf(stderr, "[PartA verify FAIL] %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return false;
+    }
+
+    // 2. Verify VNG Platform Key Normalization (SDKUtil.getPL + userdata.platform),
+    //    PayReader:getRowById(nil / VN ID pairs / synthetic fallback),
+    //    SDKUtil.pay + Platform:pay (pay.instantBuy & tmPay.instantBuy + show_gain_popup),
+    //    and survival across reload()!
+    const char* partBAndCScript = R"LUA(
+        _G.__FATAL_LOGS = 0
+        _G.Logger = {
+            showFatal = function() _G.__FATAL_LOGS = _G.__FATAL_LOGS + 1 end,
+            showWarning = function() end,
+            showTrace = function() end,
+        }
+
+        local mockPlValue = "android"
+        local function makeSdkModule()
+            return {
+                getPL = function() return mockPlValue end,
+                pay = function() error("legacy SDKUtil.pay should be intercepted when network is active") end,
+            }
+        end
+
+        local rawPayRows = {
+            [1703] = setmetatable({
+                id = 1703, is_open = 1, recharge_type = 5, consume_money = 5000,
+                Stall = 10, days = 0, vip_exp = 10,
+                base_reward = { {4, 14374, 1} },
+                first_reward = {},
+                general_reward = { {2, 0, 100} },
+                daily_reward = 0,
+                currency_name = "VND", title = "Qua 5000 VND", des = "Uu Dai",
+            }, { __index = { marker = "proxy_mt" } }),
+            [1606] = {
+                id = 1606, is_open = 1, recharge_type = 5, consume_money = 249000,
+                Stall = 600, days = 8, vip_exp = 600,
+                currency_name = "VND", title = "249000 VND 8 ngay", des = "",
+            },
+            [1959] = {
+                id = 1959, is_open = 1, recharge_type = 5, consume_money = 99000,
+                Stall = 240, days = 0, vip_exp = 240,
+                base_reward = { {4, 19133, 1} },
+                currency_name = "VND", title = "TM Gift", des = "TM",
+            },
+            [1101] = {
+                id = 1101, is_open = 1, recharge_type = 2, consume_money = 109000,
+                Stall = 30, days = 30, vip_exp = 300, base_reward = 300, daily_reward = 100,
+                currency_name = "VND", title = "MonthCard", des = "",
+            },
+            [1202] = {
+                id = 1202, is_open = 1, recharge_type = 1, consume_money = 25000,
+                Stall = 6, days = 0, vip_exp = 60, base_reward = 60, first_reward = 60,
+                currency_name = "VND", title = "60 NB", des = "",
+            },
+        }
+
+        local function makePayReaderModule()
+            local pr = {}
+            pr.__index = pr
+            function pr:new()
+                return setmetatable({}, pr)
+            end
+            function pr:getRowById(id)
+                if id == nil then
+                    _G.Logger.showFatal("id cannot be nil")
+                    error("nil id crash")
+                end
+                return rawPayRows[tonumber(id)]
+            end
+            return pr
+        end
+
+        local function makeUserDataModule()
+            local ud = { platform = "android" }
+            ud.__index = ud
+            function ud:new()
+                local o = setmetatable({ platform = nil }, ud)
+                o:ctor()
+                return o
+            end
+            function ud:ctor() end
+            function ud:parseData(d)
+                self.platform = d and d.platform or nil
+            end
+            function ud:onUpdateUser(d)
+                if d and d.platform ~= nil then
+                    self.platform = d.platform
+                end
+            end
+            return ud
+        end
+
+        package.preload["utils.SDKUtil"] = makeSdkModule
+        package.preload["game.dbReader.PayReader"] = makePayReaderModule
+        package.preload["game.gamedata.UserData"] = makeUserDataModule
+        package.preload["game.game_TM.gamedata_TM.UserData"] = makeUserDataModule
+
+        local sentNormal = {}
+        local sentTM = {}
+        local openedPopups = {}
+
+        local PayReader = require("game.dbReader.PayReader")
+        local UserData = require("game.gamedata.UserData")
+        local UserDataTM = require("game.game_TM.gamedata_TM.UserData")
+        local SDKUtil = require("utils.SDKUtil")
+
+        local udInst = UserData:new()
+        local udTmInst = UserDataTM:new()
+
+        _G.g = {
+            isSDK = true,
+            isTM = false,
+            SDKUtil = SDKUtil,
+            databaseManager = { payReader = PayReader:new() },
+            mainData = { userdata = udInst },
+            mainData_TM = { userdata = udTmInst },
+            panelNameConst = { gainItemListInfoPanel = "gainItemListInfoPanel" },
+            panelNameConst_TM = { gainItemListInfoPanel = "tmGainItemListInfoPanel" },
+            moduleManager = {
+                open = function(name, reward)
+                    table.insert(openedPopups, { name = name, reward = reward })
+                    return true
+                end
+            },
+            network = {
+                sendMsg = function(self, method, cb, args)
+                    table.insert(sentNormal, { method = method, cb = cb, args = args })
+                end
+            },
+            network_TM = {
+                sendMsg = function(self, method, cb, args)
+                    table.insert(sentTM, { method = method, cb = cb, args = args })
+                end
+            },
+        }
+        _G.__gclient_apply_net_resilience_sweep()
+
+        -- 2a. SDKUtil.getPL() normalization
+        mockPlValue = "android"
+        assert(g.SDKUtil.getPL() == "vngandroid", "android -> vngandroid")
+        mockPlValue = ""
+        assert(g.SDKUtil.getPL() == "vngandroid", "empty -> vngandroid")
+        mockPlValue = nil
+        assert(g.SDKUtil.getPL() == "vngandroid", "nil -> vngandroid")
+        mockPlValue = "vnsg2"
+        assert(g.SDKUtil.getPL() == "vngandroid", "vnsg2 -> vngandroid")
+        mockPlValue = "vngios"
+        assert(g.SDKUtil.getPL() == "vngios", "vngios must be preserved")
+        mockPlValue = "vngandroid"
+        assert(g.SDKUtil.getPL() == "vngandroid", "vngandroid preserved")
+
+        -- 2b. userdata.platform normalization
+        assert(UserData.platform == "vngandroid")
+        assert(udInst.platform == "vngandroid")
+        udInst:parseData({ platform = "android" })
+        assert(udInst.platform == "vngandroid")
+        udInst:parseData({ platform = "" })
+        assert(udInst.platform == "vngandroid")
+        udInst:parseData({})
+        assert(udInst.platform == "vngandroid")
+        udInst:onUpdateUser({ platform = "vngios" })
+        assert(udInst.platform == "vngios")
+        udTmInst:parseData({ platform = "android" })
+        assert(udTmInst.platform == "vngandroid")
+
+        -- 2c. PayReader:getRowById(nil), VN ID pair +/-100 & +/-200, and synthetic fallback
+        local pr = g.databaseManager.payReader
+        assert(pr:getRowById(nil) == nil, "getRowById(nil) must return nil cleanly")
+        assert(_G.__FATAL_LOGS == 0, "getRowById(nil) must NOT trigger Logger.showFatal")
+
+        local r1603 = pr:getRowById(1603)
+        assert(type(r1603) == "table" and r1603.id == 1703 and r1603.consume_money == 5000, "1603 -> 1703 fallback")
+        local r1706 = pr:getRowById(1706)
+        assert(type(r1706) == "table" and r1706.id == 1606 and r1706.days == 8, "1706 -> 1606 fallback")
+        local r1859 = pr:getRowById(1859)
+        assert(type(r1859) == "table" and r1859.id == 1959, "1859 -> 1959 TM fallback")
+        local r1001 = pr:getRowById(1001)
+        assert(type(r1001) == "table" and r1001.id == 1101, "1001 -> 1101 +100 fallback")
+        local r1002 = pr:getRowById(1002)
+        assert(type(r1002) == "table" and r1002.id == 1202, "1002 -> 1202 pair fallback")
+
+        local rMissing = pr:getRowById(9876)
+        assert(type(rMissing) == "table"
+            and rMissing.id == 9876
+            and rMissing.is_open == 1
+            and rMissing.recharge_type == 5
+            and rMissing.consume_money == 0
+            and rMissing.currency_name == "VND"
+            and rMissing.title == "Gift"
+            and rMissing.des == "", "missing pay row must return safe synthetic VND Gift table")
+        assert(_G.__FATAL_LOGS == 0, "PayReader probes must not fire Logger.showFatal")
+
+        -- 3a. Normal mode SDKUtil.pay -> pay.instantBuy with plain pay_row & extra_data
+        g.SDKUtil.pay("1603", "5000", "04", "Qua 5000 VND", "VND", "Uu Dai", {4, 2, 1603})
+        assert(#sentNormal == 1 and #sentTM == 0)
+        local call1 = sentNormal[1]
+        assert(call1.method == "pay.instantBuy")
+        assert(call1.args.pay_id == 1603)
+        assert(call1.args.pay_id_str == "1603")
+        assert(call1.args.pay_price == 5000)
+        assert(call1.args.pay_type == "04")
+        assert(call1.args.product_name == "Qua 5000 VND")
+        assert(call1.args.buy_type == 4)
+        assert(call1.args.item_id == 2)
+        assert(type(call1.args.extra_data) == "table" and call1.args.extra_data[1] == 4 and call1.args.extra_data[2] == 2)
+        assert(type(call1.args.pay_row) == "table" and getmetatable(call1.args.pay_row) == nil)
+        assert(call1.args.pay_row.id == 1703 and call1.args.pay_row.vip_exp == 10)
+        assert(type(call1.args.pay_row.base_reward) == "table" and call1.args.pay_row.base_reward[1][2] == 14374)
+
+        -- Verify callback show_gain_popup == true opens gainItemListInfoPanel
+        call1.cb({ ret = "ok", show_gain_popup = true, reward = { {2, 0, 120}, {4, 14374, 1} } })
+        assert(#openedPopups == 1 and openedPopups[1].name == "gainItemListInfoPanel" and #openedPopups[1].reward == 2)
+
+        -- 3b. Time Machine mode via buy_type = 27 -> tmPay.instantBuy over g.network_TM
+        g.SDKUtil.pay("1859", "99000", "04", "TM Gift", "VND", "TM", {27, 1, 1859})
+        assert(#sentTM == 1)
+        assert(sentTM[1].method == "tmPay.instantBuy")
+        assert(sentTM[1].args.buy_type == 27 and sentTM[1].args.item_id == 1)
+        assert(sentTM[1].args.pay_row.id == 1959)
+        sentTM[1].cb({ ret = "ok", show_gain_popup = true, reward = { {4, 19133, 1} } })
+        assert(#openedPopups == 2 and openedPopups[2].name == "tmGainItemListInfoPanel")
+
+        -- Also verify g.isTM = true with g.network_TM == nil falls back to g.network with tmPay.instantBuy
+        local savedNetTM = g.network_TM
+        g.network_TM = nil
+        g.isTM = true
+        g.SDKUtil.pay("1002", "25000", "00", "60 NB", "VND", "")
+        assert(#sentNormal == 2 and sentNormal[2].method == "tmPay.instantBuy")
+        assert(sentNormal[2].args.pay_id == 1002 and sentNormal[2].args.pay_type == "00")
+        g.isTM = false
+        g.network_TM = savedNetTM
+
+        -- 3c. Direct Platform:getInstance():pay(jsonStr) guard without SDKUtil.pay
+        Platform:getInstance():pay('{"ProductId":"1606","ProductPrice":"249000","PayType":"04","ProductName":"PreBuy8","CurrencyName":"VND","ExtraData":"[4,5,1606]"}')
+        assert(#sentNormal == 3)
+        assert(sentNormal[3].method == "pay.instantBuy")
+        assert(sentNormal[3].args.pay_id == 1606 and sentNormal[3].args.buy_type == 4 and sentNormal[3].args.item_id == 5)
+        assert(sentNormal[3].args.pay_row.days == 8)
+
+        -- 3d. Survival across reload() clearing package.loaded and re-requiring SDKUtil & PayReader
+        _G.reload = function()
+            package.loaded["utils.SDKUtil"] = nil
+            package.loaded["game.dbReader.PayReader"] = nil
+            g.SDKUtil = require("utils.SDKUtil")
+            local PR2 = require("game.dbReader.PayReader")
+            g.databaseManager.payReader = PR2:new()
+        end
+        _G.__gclient_apply_net_resilience_sweep()
+        _G.reload()
+
+        mockPlValue = "android"
+        assert(g.SDKUtil.getPL() == "vngandroid", "SDKUtil.getPL hook must survive reload()")
+        assert(g.databaseManager.payReader:getRowById(nil) == nil, "PayReader nil guard must survive reload()")
+        assert(g.databaseManager.payReader:getRowById(1603).id == 1703, "PayReader +100 pair fallback must survive reload()")
+        g.SDKUtil.pay("1603", "5000", "04", "PostReloadBuy", "VND", "", {4, 2, 1603})
+        assert(#sentNormal == 4 and sentNormal[4].method == "pay.instantBuy" and sentNormal[4].args.product_name == "PostReloadBuy")
+    )LUA";
+    if (luaL_dostring(L, partBAndCScript) != 0) {
+        std::fprintf(stderr, "[PartBC FAIL] %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return false;
+    }
+    plat->tickLoop();
+    lua_close(L);
+
+    // 4. Loopback TCP + AMF3 + LCPacket wire verification of SDKUtil.pay -> pay.instantBuy!
+    SOCKET listenSock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    REQUIRE_TRUE(listenSock != INVALID_SOCKET);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(0);
+    REQUIRE_EQ(::bind(listenSock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)), 0);
+    REQUIRE_EQ(::listen(listenSock, 2), 0);
+#ifdef _WIN32
+    int addrLen = sizeof(addr);
+#else
+    socklen_t addrLen = sizeof(addr);
+#endif
+    REQUIRE_EQ(::getsockname(listenSock, reinterpret_cast<sockaddr*>(&addr), &addrLen), 0);
+    const unsigned int port = ntohs(addr.sin_port);
+
+    std::string capturedAmfPayload;
+    std::thread wireServer([listenSock, &capturedAmfPayload]() {
+        SOCKET client = ::accept(listenSock, nullptr, nullptr);
+        if (client != INVALID_SOCKET) {
+            char buf[2048] = {};
+            const auto n = ::recv(client, buf, sizeof(buf), 0);
+            if (n >= static_cast<int>(LCPacket::kTotalHeaderSize)) {
+                LCPacket::DecodedPacket pkt{};
+                if (LCPacket::parseLCPacket(buf, static_cast<size_t>(n), pkt)) {
+                    capturedAmfPayload = pkt.payload;
+                }
+            }
+#ifdef _WIN32
+            ::closesocket(client);
+#else
+            ::close(client);
+#endif
+        }
+#ifdef _WIN32
+        ::closesocket(listenSock);
+#else
+        ::close(listenSock);
+#endif
+    });
+
+    CNetwork* net = CNetwork::sharedNetwork();
+    CConnection* conn = net->newConnection();
+    REQUIRE_TRUE(conn->connect("127.0.0.1", port));
+
+    lua_State* wireL = luaL_newstate();
+    REQUIRE_TRUE(wireL != nullptr);
+    luaL_openlibs(wireL);
+    luaopen_amf3_extensions(wireL);
+    gclient::bindings::InstallNetworkResilienceHookImpl(wireL);
+
+    lua_pushlightuserdata(wireL, conn);
+    lua_pushcclosure(
+        wireL,
+        [](lua_State* s) -> int {
+            auto* c = static_cast<CConnection*>(lua_touserdata(s, lua_upvalueindex(1)));
+            size_t len = 0;
+            const char* bytes = luaL_checklstring(s, 1, &len);
+            lua_pushboolean(s, c->send(std::string(bytes, len), true) ? 1 : 0);
+            return 1;
+        },
+        1);
+    lua_setglobal(wireL, "__c_send_packet");
+
+    const char* wireLua = R"LUA(
+        local amf3 = require("amf3")
+        package.preload["utils.SDKUtil"] = function()
+            return { getPL = function() return "android" end, pay = function() end }
+        end
+        package.preload["game.dbReader.PayReader"] = function()
+            local M = {}
+            M.__index = M
+            function M:getRowById(id)
+                if tonumber(id) == 1703 then
+                    return { id = 1703, recharge_type = 5, consume_money = 5000, Stall = 10, vip_exp = 10, base_reward = { {4, 14374, 1} } }
+                end
+                return nil
+            end
+            return M
+        end
+        local SDKUtil = require("utils.SDKUtil")
+        local PayReader = require("game.dbReader.PayReader")
+        _G.g = {
+            SDKUtil = SDKUtil,
+            databaseManager = { payReader = setmetatable({}, PayReader) },
+            network = {
+                sendMsg = function(self, method, cb, args)
+                    local raw = amf3.encode({
+                        method = method,
+                        args = args,
+                        token = "tok_instant",
+                        callback = { callbackName = method .. "_1" },
+                    })
+                    assert(__c_send_packet(raw) == true)
+                end
+            }
+        }
+        _G.__gclient_apply_net_resilience_sweep()
+        g.SDKUtil.pay("1603", "5000", "04", "Qua 5000 VND", "VND", "", {4, 2, 1603})
+    )LUA";
+    REQUIRE_EQ(luaL_dostring(wireL, wireLua), 0);
+
+    wireServer.join();
+    CNetwork::destroySharedNetwork();
+    REQUIRE_TRUE(!capturedAmfPayload.empty());
+
+    // Decode captured AMF3 wire payload in Lua and verify exact C2S envelope!
+    lua_pushlstring(wireL, capturedAmfPayload.data(), capturedAmfPayload.size());
+    lua_setglobal(wireL, "__captured_amf");
+    const char* verifyWireLua = R"LUA(
+        local amf3 = require("amf3")
+        local env = amf3.decode(__captured_amf)
+        assert(env.method == "pay.instantBuy")
+        assert(env.args.pay_id == 1603 and env.args.buy_type == 4 and env.args.item_id == 2)
+        assert(env.args.pay_row.id == 1703 and env.args.pay_row.consume_money == 5000)
+    )LUA";
+    REQUIRE_EQ(luaL_dostring(wireL, verifyWireLua), 0);
+    lua_close(wireL);
+    std::error_code cleanEc;
+    fs::remove("device_uuid.txt", cleanEc);
+    fs::remove("sdk_cookies.txt", cleanEc);
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -3488,6 +3958,8 @@ int main() {
                 testWin32MouseRoutingDpiViewportAndFuncMenuCycles);
     runTestCase("17_NetworkAndDataLoading_CrashResilience_And_BindableDataRecovery",
                 testNetworkDataLoadingResilienceAndBindableDataRecovery);
+    runTestCase("18_InstantBuy_VngPlatformNormalization_And_BtPlatformPayShim",
+                testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim);
 
     std::printf("======================================================================\n");
     std::printf("Summary: %d passed, %d failed\n", g_passedTests, g_failedTests);

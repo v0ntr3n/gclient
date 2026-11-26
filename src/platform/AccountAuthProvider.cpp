@@ -20,7 +20,12 @@
 #include <fstream>
 #include <sstream>
 
+#if __has_include(<curl/curl.h>)
+#define GCLIENT_HAS_LIBCURL 1
 #include <curl/curl.h>
+#else
+#define GCLIENT_HAS_LIBCURL 0
+#endif
 #include <openssl/evp.h>
 
 namespace bt {
@@ -146,12 +151,15 @@ bool isValidHexTokenId(const std::string& s) {
 }
 
 void ensureCurlGlobalInit() {
+#if GCLIENT_HAS_LIBCURL
     static std::once_flag onceFlag;
     std::call_once(onceFlag, []() {
         curl_global_init(CURL_GLOBAL_DEFAULT);
     });
+#endif
 }
 
+#if GCLIENT_HAS_LIBCURL
 void configureCurlTlsOptions(CURL* curl) {
     if (!curl) return;
 
@@ -172,6 +180,7 @@ void configureCurlTlsOptions(CURL* curl) {
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     }
 }
+#endif
 
 std::string md5HexLower(const std::string& input) {
     unsigned char digest[EVP_MAX_MD_SIZE] = {};
@@ -281,6 +290,14 @@ std::string postQueryMap(const std::string& baseUrl,
     if (outHttpCode) *outHttpCode = 0;
     if (outError) outError->clear();
 
+#if !GCLIENT_HAS_LIBCURL
+    (void)baseUrl;
+    (void)params;
+    (void)isTruthyEnvFlag;
+    (void)urlEncode;
+    if (outError) *outError = "libcurl headers unavailable in standalone test build";
+    return {};
+#else
     CURL* curl = curl_easy_init();
     if (!curl) {
         if (outError) *outError = "curl_easy_init failed";
@@ -351,6 +368,7 @@ std::string postQueryMap(const std::string& baseUrl,
     }
 
     return response;
+#endif
 }
 
 bool callAccountAuth(const AccountAuthProvider::Config& rawConfig,
