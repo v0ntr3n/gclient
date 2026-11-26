@@ -965,6 +965,829 @@ bool testCNetworkLoopbackReentrantAndDestroySafety() {
     return true;
 }
 
+// ============================================================================
+// Scenario 18 (Issue #8): >= 50 Iterations of GainItemListInfoPanel / GainItemCell
+// Creation, UIWidget::addNode + CCArmature::removeFromParentAndCleanup(true),
+// Widget::getNodes() Stale-Pointer Elimination, removeAllChildrenWithCleanup(true)
+// Internal-Renderer Preservation, ImageView ignoreContentAdaptWithSize(false) ->
+// loadTexture -> setSize(100,100)/(98,98), Opaque RGBA _alpha PKM, & CCFadeIn
+// ============================================================================
+
+struct Issue8RefObject {
+    static inline int s_liveInstances = 0;
+    int retainCount = 1;
+
+    Issue8RefObject() noexcept { ++s_liveInstances; }
+    virtual ~Issue8RefObject() noexcept { --s_liveInstances; }
+
+    Issue8RefObject(const Issue8RefObject&) = delete;
+    Issue8RefObject& operator=(const Issue8RefObject&) = delete;
+
+    void retain() noexcept { ++retainCount; }
+    void release() noexcept {
+        if (--retainCount <= 0) {
+            delete this;
+        }
+    }
+};
+
+class Issue8Array : public Issue8RefObject {
+public:
+    std::vector<Issue8RefObject*> arr;
+
+    ~Issue8Array() noexcept override { removeAllObjects(); }
+
+    size_t count() const noexcept { return arr.size(); }
+
+    bool containsObject(const Issue8RefObject* obj) const noexcept {
+        for (const auto* p : arr) {
+            if (p == obj) return true;
+        }
+        return false;
+    }
+
+    void addObject(Issue8RefObject* obj) {
+        if (!obj) return;
+        obj->retain();
+        arr.push_back(obj);
+    }
+
+    void removeObject(Issue8RefObject* obj) {
+        if (!obj) return;
+        for (auto it = arr.begin(); it != arr.end(); ++it) {
+            if (*it == obj) {
+                Issue8RefObject* victim = *it;
+                arr.erase(it);
+                victim->release();
+                return;
+            }
+        }
+    }
+
+    void removeObjectAtIndex(size_t idx) {
+        if (idx >= arr.size()) return;
+        Issue8RefObject* victim = arr[idx];
+        arr.erase(arr.begin() + static_cast<std::ptrdiff_t>(idx));
+        if (victim) victim->release();
+    }
+
+    void removeAllObjects() {
+        std::vector<Issue8RefObject*> local;
+        local.swap(arr);
+        for (Issue8RefObject* obj : local) {
+            if (obj) obj->release();
+        }
+    }
+};
+
+struct Issue8SpriteFrame {
+    std::string key;
+    float width = 0.0f;
+    float height = 0.0f;
+    float offsetX = 0.0f;
+    float offsetY = 0.0f;
+    bool rotated = false;
+    uint8_t sampleAlpha = 255;
+};
+
+struct Issue8AssetEnv {
+    std::vector<Issue8SpriteFrame> plistFrames;
+    std::vector<Issue8SpriteFrame> diskFiles;
+
+    const Issue8SpriteFrame* findSpriteFrameWithFallback(const std::string& rawName) const {
+        std::string s = rawName;
+        for (char& c : s) {
+            if (c == '\\') c = '/';
+        }
+        while (!s.empty() && s.front() == '#') s.erase(s.begin());
+        if (s.empty()) return nullptr;
+
+        auto matchKey = [&](const std::string& k) -> const Issue8SpriteFrame* {
+            for (const auto& f : plistFrames) {
+                if (f.key == k) return &f;
+            }
+            const size_t sl = k.find_last_of('/');
+            const size_t dt = k.find_last_of('.');
+            if (dt == std::string::npos || (sl != std::string::npos && dt < sl)) {
+                const std::string withPng = k + ".png";
+                for (const auto& f : plistFrames) {
+                    if (f.key == withPng) return &f;
+                }
+            }
+            return nullptr;
+        };
+
+        if (const auto* f = matchKey(s)) return f;
+        if (s.rfind("res/jsonUI/", 0) == 0 && s.size() > 11) {
+            if (const auto* f = matchKey(s.substr(11))) return f;
+        }
+        if (s.rfind("res/", 0) == 0 && s.size() > 4) {
+            if (const auto* f = matchKey(s.substr(4))) return f;
+        }
+        if (s.rfind("gameImage/", 0) == 0 && s.size() > 10) {
+            if (const auto* f = matchKey("images/" + s.substr(10))) return f;
+        }
+        const size_t slash = s.find_last_of('/');
+        if (slash != std::string::npos && slash + 1 < s.size()) {
+            if (const auto* f = matchKey(s.substr(slash + 1))) return f;
+        }
+        return nullptr;
+    }
+
+    const Issue8SpriteFrame* loadTextureWithFallback(const std::string& rawName) const {
+        std::string s = rawName;
+        for (char& c : s) {
+            if (c == '\\') c = '/';
+        }
+        while (!s.empty() && s.front() == '#') s.erase(s.begin());
+        if (s.empty()) return nullptr;
+
+        auto stripExt = [](const std::string& p) -> std::string {
+            if (p.size() > 8 && p.compare(p.size() - 8, 8, ".pvr.ccz") == 0) {
+                return p.substr(0, p.size() - 8);
+            }
+            const size_t sl = p.find_last_of('/');
+            const size_t dt = p.find_last_of('.');
+            if (dt != std::string::npos && (sl == std::string::npos || dt > sl)) {
+                return p.substr(0, dt);
+            }
+            return p;
+        };
+
+        const std::string bases[4] = {
+            s,
+            (s.rfind("res/jsonUI/", 0) == 0 && s.size() > 11) ? s.substr(11) : std::string(),
+            (s.rfind("res/", 0) == 0 && s.size() > 4) ? s.substr(4) : std::string(),
+            (s.rfind("gameImage/", 0) == 0 && s.size() > 10) ? ("images/" + s.substr(10)) : std::string(),
+        };
+        static const char* const kExts[] = {".pvr.ccz", ".pkm", ".png", ".webp", ".jpg", ".jpeg"};
+
+        for (const std::string& base : bases) {
+            if (base.empty()) continue;
+            for (const auto& f : diskFiles) {
+                if (f.key == base) return &f;
+            }
+            const std::string stem = stripExt(base);
+            for (const char* ext : kExts) {
+                const std::string cand = stem + ext;
+                for (const auto& f : diskFiles) {
+                    if (f.key == cand) return &f;
+                }
+            }
+        }
+        return nullptr;
+    }
+};
+
+// Exact mirror of patched gclientExtractAlphaChannelBuffer RGBA _alpha logic
+uint8_t extractCompanionRgbaAlphaSample(const std::vector<uint8_t>& rgbaPixels) {
+    const size_t totalPx = rgbaPixels.size() / 4u;
+    if (totalPx == 0) return 0;
+    bool hasVariedAlpha = false;
+    bool anyNonZeroG = false;
+    for (size_t i = 0; i < totalPx; ++i) {
+        if (rgbaPixels[i * 4u + 3u] != 255u) hasVariedAlpha = true;
+        if (rgbaPixels[i * 4u + 1u] != 0u) anyNonZeroG = true;
+        if (hasVariedAlpha && anyNonZeroG) break;
+    }
+    const bool useAlphaChan = hasVariedAlpha || (!anyNonZeroG && rgbaPixels[3] > 0u);
+    return useAlphaChan ? rgbaPixels[3] : rgbaPixels[1];
+}
+
+class Issue8Node : public Issue8RefObject {
+public:
+    Issue8Node* parent = nullptr;
+    Issue8Array* children = new Issue8Array();
+    int zOrder = 0;
+    int tag = -1;
+    bool visible = true;
+    float posX = 0.0f, posY = 0.0f;
+    float scaleX = 1.0f, scaleY = 1.0f;
+    float width = 0.0f, height = 0.0f;
+    uint8_t realOpacity = 255;
+    uint8_t displayedOpacity = 255;
+    std::function<void()> onExitCallback;
+
+    ~Issue8Node() noexcept override {
+        if (children) {
+            children->release();
+            children = nullptr;
+        }
+    }
+
+    Issue8Node* getParent() const noexcept { return parent; }
+
+    virtual void setOpacity(uint8_t opa) {
+        realOpacity = displayedOpacity = opa;
+    }
+
+    virtual void addChild(Issue8Node* child, int z = 0, int t = -1) {
+        if (!child || child == this) return;
+        bool reparented = false;
+        if (child->parent != nullptr) {
+            child->retain();
+            reparented = true;
+            child->removeFromParentAndCleanup(false);
+        }
+        child->zOrder = z;
+        child->tag = t;
+        child->parent = this;
+        children->addObject(child);
+        if (reparented) {
+            child->release();
+        }
+    }
+
+    virtual void removeChild(Issue8Node* child, bool /*cleanup*/ = true) {
+        if (!child || !children || !children->containsObject(child)) return;
+        child->retain();
+        if (child->onExitCallback) {
+            auto cb = child->onExitCallback;
+            child->onExitCallback = nullptr;
+            cb();
+        }
+        child->parent = nullptr;
+        children->removeObject(child);
+        child->release();
+    }
+
+    virtual void removeFromParentAndCleanup(bool cleanup = true) {
+        if (parent) {
+            parent->removeChild(this, cleanup);
+        }
+    }
+
+    virtual void removeAllChildrenWithCleanup(bool cleanup = true) {
+        if (!children) return;
+        for (auto* obj : children->arr) {
+            if (auto* n = static_cast<Issue8Node*>(obj)) {
+                if (n->onExitCallback) {
+                    auto cb = n->onExitCallback;
+                    n->onExitCallback = nullptr;
+                    cb();
+                }
+                n->parent = nullptr;
+            }
+        }
+        (void)cleanup;
+        children->removeAllObjects();
+    }
+};
+
+class Issue8Sprite : public Issue8Node {
+public:
+    float offsetX = 0.0f;
+    float offsetY = 0.0f;
+    bool rectRotated = false;
+    bool hasTexture = false;
+    uint8_t texAlpha = 0;
+
+    bool initWithSpriteFrame(const Issue8SpriteFrame& frame) {
+        hasTexture = (frame.width > 0.0f && frame.height > 0.0f);
+        width = frame.width;
+        height = frame.height;
+        offsetX = frame.offsetX;
+        offsetY = frame.offsetY;
+        rectRotated = frame.rotated;
+        texAlpha = frame.sampleAlpha;
+        return hasTexture;
+    }
+
+    float renderedQuadWidth() const noexcept {
+        return (hasTexture && visible && displayedOpacity > 0 && texAlpha > 0) ? (width * scaleX) : 0.0f;
+    }
+    float renderedQuadHeight() const noexcept {
+        return (hasTexture && visible && displayedOpacity > 0 && texAlpha > 0) ? (height * scaleY) : 0.0f;
+    }
+};
+
+class Issue8Armature : public Issue8Node {
+public:
+    std::string animName;
+    bool disposed = false;
+    void dispose() noexcept { disposed = true; }
+};
+
+// Exact mirror of patched Cocos2d-x 2.2.6 ui::Widget
+class Issue8Widget : public Issue8Node {
+public:
+    Issue8Array* widgetChildren = new Issue8Array();
+    Issue8Array* nodes = new Issue8Array();
+    bool ignoreSize = true;
+    float customW = 0.0f, customH = 0.0f;
+    float sizeW = 0.0f, sizeH = 0.0f;
+    uint8_t widgetOpacity = 255;
+
+    ~Issue8Widget() noexcept override {
+        removeAllChildrenWithCleanup(true);
+        removeAllNodes();
+        if (widgetChildren) {
+            widgetChildren->release();
+            widgetChildren = nullptr;
+        }
+        if (nodes) {
+            nodes->release();
+            nodes = nullptr;
+        }
+    }
+
+    virtual void onSizeChanged() {}
+    virtual void updateTextureOpacity() {}
+
+    void ignoreContentAdaptWithSize(bool ignore) {
+        ignoreSize = ignore;
+        if (ignoreSize) {
+            sizeW = width;
+            sizeH = height;
+        } else {
+            sizeW = customW;
+            sizeH = customH;
+        }
+        onSizeChanged();
+    }
+
+    void setSize(float w, float h) {
+        customW = w;
+        customH = h;
+        if (!ignoreSize) {
+            sizeW = w;
+            sizeH = h;
+        }
+        onSizeChanged();
+    }
+
+    void setOpacity(uint8_t opa) override {
+        widgetOpacity = opa;
+        Issue8Node::setOpacity(opa);
+        updateTextureOpacity();
+    }
+
+    void addChild(Issue8Node* child, int z = 0, int t = -1) override {
+        if (!child || child == this) return;
+        if (dynamic_cast<Issue8Widget*>(child) == nullptr) {
+            addNode(child, z, t);
+            return;
+        }
+        if (child->getParent() == this) {
+            child->zOrder = z;
+            child->tag = t;
+            if (!widgetChildren->containsObject(child)) widgetChildren->addObject(child);
+            return;
+        }
+        Issue8Node::addChild(child, z, t);
+        if (!widgetChildren->containsObject(child)) widgetChildren->addObject(child);
+    }
+
+    virtual void addNode(Issue8Node* node, int z = 0, int t = -1) {
+        if (!node || node == this) return;
+        if (dynamic_cast<Issue8Widget*>(node) != nullptr) {
+            addChild(node, z, t);
+            return;
+        }
+        if (node->getParent() == this) {
+            node->zOrder = z;
+            node->tag = t;
+            if (!nodes->containsObject(node)) nodes->addObject(node);
+            return;
+        }
+        Issue8Node::addChild(node, z, t);
+        if (!nodes->containsObject(node)) nodes->addObject(node);
+    }
+
+    void removeChild(Issue8Node* child, bool cleanup = true) override {
+        if (!child) return;
+        child->retain();
+        Issue8Node::removeChild(child, cleanup);
+        if (widgetChildren) widgetChildren->removeObject(child);
+        if (nodes) nodes->removeObject(child);
+        child->release();
+    }
+
+    virtual void removeNode(Issue8Node* node) {
+        if (!node) return;
+        node->retain();
+        Issue8Node::removeChild(node, true);
+        if (nodes) nodes->removeObject(node);
+        if (widgetChildren) widgetChildren->removeObject(node);
+        node->release();
+    }
+
+    virtual void removeAllNodes() {
+        if (nodes && !nodes->arr.empty()) {
+            std::vector<Issue8Node*> snapshot;
+            snapshot.reserve(nodes->arr.size());
+            for (size_t i = 0; i < nodes->arr.size(); ++i) {
+                if (auto* pNode = static_cast<Issue8Node*>(nodes->arr[i])) {
+                    pNode->retain();
+                    snapshot.push_back(pNode);
+                }
+            }
+            nodes->removeAllObjects();
+            for (Issue8Node* n : snapshot) {
+                Issue8Node::removeChild(n, true);
+                n->release();
+            }
+        }
+    }
+
+    void removeAllChildrenWithCleanup(bool cleanup = true) override {
+        std::vector<Issue8Node*> snapshot;
+        if (widgetChildren && !widgetChildren->arr.empty()) {
+            for (auto* obj : widgetChildren->arr) {
+                if (auto* c = static_cast<Issue8Node*>(obj)) {
+                    c->retain();
+                    snapshot.push_back(c);
+                }
+            }
+            widgetChildren->removeAllObjects();
+        }
+        if (nodes && !nodes->arr.empty()) {
+            for (auto* obj : nodes->arr) {
+                if (auto* n = static_cast<Issue8Node*>(obj)) {
+                    n->retain();
+                    snapshot.push_back(n);
+                }
+            }
+            nodes->removeAllObjects();
+        }
+        for (Issue8Node* item : snapshot) {
+            Issue8Node::removeChild(item, cleanup);
+            item->release();
+        }
+    }
+
+    virtual Issue8Array* getNodes() {
+        if (nodes) {
+            for (int i = static_cast<int>(nodes->arr.size()) - 1; i >= 0; --i) {
+                auto* pNode = static_cast<Issue8Node*>(nodes->arr[static_cast<size_t>(i)]);
+                if (!pNode || pNode->getParent() != this) {
+                    nodes->removeObjectAtIndex(static_cast<size_t>(i));
+                }
+            }
+        }
+        return nodes;
+    }
+};
+
+class Issue8Layout : public Issue8Widget {
+public:
+    Issue8Sprite* backGroundImage = nullptr;
+    bool layoutSuppliedToWidgetOnly = true;
+    float clipOriginX = 0.0f, clipOriginY = 0.0f, clipW = 0.0f, clipH = 0.0f;
+
+    Issue8Layout() {
+        backGroundImage = new Issue8Sprite();
+        Issue8Node::addChild(backGroundImage, -2, -1); // Internal protected renderer in m_pChildren ONLY
+        backGroundImage->release();
+    }
+
+    void supplyTheLayoutParameterLackToChild(Issue8Widget* w) {
+        if (!w) layoutSuppliedToWidgetOnly = false;
+    }
+
+    void addChild(Issue8Node* child, int z = 0, int t = -1) override {
+        if (!child || child == this) return;
+        if (auto* wChild = dynamic_cast<Issue8Widget*>(child)) {
+            supplyTheLayoutParameterLackToChild(wChild);
+        }
+        Issue8Widget::addChild(child, z, t);
+    }
+
+    // Mirrors patched Layout::getClippingRect (.origin.y fix instead of stock .origin.x bug)
+    void computeNestedClippingRect(float parentClipX, float parentClipY, float parentClipW, float parentClipH,
+                                   float childWorldX, float childWorldY, float childW, float childH) {
+        float finalX = childWorldX;
+        float finalY = childWorldY;
+        float finalW = childW;
+        float finalH = childH;
+        const float bottomOffset = childWorldY - parentClipY;
+        if (bottomOffset < 0.0f) {
+            finalY = parentClipY; // Stock 2.2.6 bug had parentClipX here!
+            finalH += bottomOffset;
+        }
+        const float leftOffset = childWorldX - parentClipX;
+        if (leftOffset < 0.0f) {
+            finalX = parentClipX;
+            finalW += leftOffset;
+        }
+        if (finalX + finalW > parentClipX + parentClipW) {
+            finalW = (parentClipX + parentClipW) - finalX;
+        }
+        if (finalY + finalH > parentClipY + parentClipH) {
+            finalH = (parentClipY + parentClipH) - finalY;
+        }
+        clipOriginX = finalX;
+        clipOriginY = finalY;
+        clipW = finalW;
+        clipH = finalH;
+    }
+};
+
+class Issue8ImageView : public Issue8Widget {
+public:
+    Issue8Sprite* imageRenderer = nullptr;
+    std::string textureFile;
+    int texType = 0; // 0 = UI_TEX_TYPE_LOCAL, 1 = UI_TEX_TYPE_PLIST
+
+    Issue8ImageView() {
+        imageRenderer = new Issue8Sprite();
+        Issue8Node::addChild(imageRenderer, -1, -1); // Protected internal _imageRenderer
+        imageRenderer->release();
+    }
+
+    void imageTextureScaleChangedWithSize() {
+        if (ignoreSize) {
+            imageRenderer->scaleX = 1.0f;
+            imageRenderer->scaleY = 1.0f;
+            sizeW = width;
+            sizeH = height;
+        } else {
+            if (imageRenderer->width <= 0.0f || imageRenderer->height <= 0.0f) {
+                imageRenderer->scaleX = 1.0f;
+                imageRenderer->scaleY = 1.0f;
+                return;
+            }
+            imageRenderer->scaleX = sizeW / imageRenderer->width;
+            imageRenderer->scaleY = sizeH / imageRenderer->height;
+        }
+    }
+
+    void onSizeChanged() override {
+        imageTextureScaleChangedWithSize();
+    }
+
+    void updateTextureOpacity() override {
+        if (imageRenderer) {
+            imageRenderer->setOpacity(widgetOpacity);
+        }
+    }
+
+    bool loadTexture(const Issue8AssetEnv& env, const std::string& fileName, int resType = 0) {
+        if (fileName.empty()) return false;
+        textureFile = fileName;
+        texType = resType;
+        const Issue8SpriteFrame* resolved = nullptr;
+        if (resType == 1) {
+            resolved = env.findSpriteFrameWithFallback(fileName);
+            if (!resolved) resolved = env.loadTextureWithFallback(fileName);
+        } else {
+            resolved = env.loadTextureWithFallback(fileName);
+            if (!resolved) resolved = env.findSpriteFrameWithFallback(fileName);
+        }
+        if (!resolved || !imageRenderer->initWithSpriteFrame(*resolved)) {
+            return false;
+        }
+        width = imageRenderer->width;
+        height = imageRenderer->height;
+        imageTextureScaleChangedWithSize();
+        updateTextureOpacity();
+        return true;
+    }
+};
+
+class Issue8Label : public Issue8Widget {
+public:
+    std::string text;
+};
+
+bool testIssue8GainItemPanelLifecycleAndImageViewRendering() {
+    REQUIRE_EQ(Issue8RefObject::s_liveInstances, 0);
+
+    // 1. Verify companion RGBA _alpha opaque plane fix:
+    //    Solid (R=0, G=0, B=0, A=255) RGBA _alpha companion MUST preserve alpha=255 (NOT G=0!),
+    //    whereas a genuine green-channel grayscale mask (R=0, G=128, B=0, A=255) still reads G=128,
+    //    and varied-alpha RGBA (A=64) reads A=64.
+    {
+        const std::vector<uint8_t> solidOpaqueRgbaAlpha = {
+            0, 0, 0, 255,   0, 0, 0, 255,   0, 0, 0, 255,   0, 0, 0, 255
+        };
+        REQUIRE_EQ(extractCompanionRgbaAlphaSample(solidOpaqueRgbaAlpha), static_cast<uint8_t>(255));
+
+        const std::vector<uint8_t> greenChannelMaskRgba = {
+            0, 128, 0, 255, 0, 128, 0, 255, 0, 128, 0, 255, 0, 128, 0, 255
+        };
+        REQUIRE_EQ(extractCompanionRgbaAlphaSample(greenChannelMaskRgba), static_cast<uint8_t>(128));
+
+        const std::vector<uint8_t> variedAlphaRgba = {
+            0, 200, 0, 64,  0, 200, 0, 192, 0, 200, 0, 255, 0, 200, 0, 0
+        };
+        REQUIRE_EQ(extractCompanionRgbaAlphaSample(variedAlphaRgba), static_cast<uint8_t>(64));
+    }
+
+    // 2. Populate authentic vnsg2 asset fixture:
+    //    - frame_3.png (quality 3), frame_4.png (quality 4), frame_5.png (quality 5) packed inside .plistb CCSpriteFrameCache!
+    //    - item 10010 ("Tiến Cấp Đơn", small_pic="item/jinjiedan") stored on disk as .jpg!
+    //    - item 10020 ("Pet Tăng Sao Đơn", small_pic="item/shengxingdan") stored as .pkm + opaque RGBA _alpha!
+    //    - item 10012 ("Đá Luyện Trang Sức", small_pic="item/baowujinglianshi") stored under images/item/!
+    Issue8AssetEnv env;
+    env.plistFrames.push_back({"frame_3.png", 104.0f, 104.0f, 0.0f, 0.0f, false, 255});
+    env.plistFrames.push_back({"gameImage/frame/frame_4.png", 100.0f, 100.0f, 4.0f, -3.0f, true, 255});
+    env.plistFrames.push_back({"frame_5.png", 100.0f, 100.0f, 0.0f, 0.0f, false, 255});
+    env.plistFrames.push_back({"public_tm_itemIcon.png", 36.0f, 36.0f, 0.0f, 0.0f, false, 255});
+
+    const uint8_t pkmOpaqueAlpha = extractCompanionRgbaAlphaSample({0, 0, 0, 255, 0, 0, 0, 255});
+    env.diskFiles.push_back({"gameImage/item/jinjiedan.jpg", 98.0f, 98.0f, 0.0f, 0.0f, false, 255});
+    env.diskFiles.push_back({"gameImage/item/shengxingdan.pkm", 98.0f, 98.0f, 0.0f, 0.0f, false, pkmOpaqueAlpha});
+    env.diskFiles.push_back({"images/item/baowujinglianshi.webp", 98.0f, 98.0f, 0.0f, 0.0f, false, 255});
+
+    struct RewardItemSpec {
+        int id;
+        const char* name;
+        const char* frameReq;
+        const char* iconReq;
+        int quality;
+    };
+    const RewardItemSpec kRewardSpecs[3] = {
+        {10010, "Tiến Cấp Đơn", "gameImage/frame/frame_3.png", "gameImage/item/jinjiedan.png", 3},
+        {10020, "Pet Tăng Sao Đơn", "gameImage/frame/frame_4.png", "gameImage/item/shengxingdan.png", 4},
+        {10012, "Đá Luyện Trang Sức", "gameImage/frame/frame_5.png", "gameImage/item/baowujinglianshi.png", 5},
+    };
+
+    // 3. Execute 64 full iterations (>= 50 required) of GainItemListInfoPanel open -> populate ->
+    //    playFadeIn -> playArmatureOnce + removeFromParentAndCleanup(true) -> clearData -> close -> reopen!
+    constexpr int kIterations = 64;
+    for (int iter = 0; iter < kIterations; ++iter) {
+        auto* panelRoot = new Issue8Layout();
+        auto* itemContainer = new Issue8Layout();
+        panelRoot->addChild(itemContainer, 0, 100);
+
+        // Verify nested clipping rect inside ListView_reward (origin = (175, 151), size = 785x318)
+        itemContainer->computeNestedClippingRect(175.0f, 151.0f, 785.0f, 318.0f,
+                                                 215.0f, 120.0f, 100.0f, 120.0f);
+        REQUIRE_EQ(itemContainer->clipOriginY, 151.0f); // Must clamp to parentClipY (151), NOT parentClipX (175)!
+        REQUIRE_TRUE(itemContainer->clipH > 80.0f);
+
+        const int cellCount = (iter % 2 == 0) ? 4 : 7;
+        std::vector<Issue8Layout*> cells;
+        cells.reserve(static_cast<size_t>(cellCount));
+
+        for (int c = 0; c < cellCount; ++c) {
+            const RewardItemSpec& spec = kRewardSpecs[(static_cast<size_t>(iter) + static_cast<size_t>(c)) % 3u];
+
+            // GainItemCell.lua: Layout cell
+            auto* cell = new Issue8Layout();
+            itemContainer->addChild(cell, 0, 1000 + c);
+
+            // GainItemCell.lua:61: quality glow added via self:addNode(self.sprite, -1) at (87, 69), scale=1.2
+            auto* glowSprite = new Issue8Armature();
+            glowSprite->animName = (spec.quality >= 5) ? "wupinhuode_uihuang_1" : "wupinhuode_uizise_1";
+            glowSprite->posX = 87.0f;
+            glowSprite->posY = 69.0f;
+            glowSprite->scaleX = glowSprite->scaleY = 1.2f;
+            cell->addNode(glowSprite, -1, 501);
+            glowSprite->release(); // Owned solely by cell->children + cell->nodes
+
+            // BaseItemWithNameIcon_TM.lua: Layout iconItem added via cell:addChild(self.iconItem) (z=0) at (40, 0)
+            auto* iconItem = new Issue8Layout();
+            iconItem->posX = 40.0f;
+            iconItem->posY = 0.0f;
+            cell->addChild(iconItem, 0, 502);
+
+            // BaseItemIcon_TM.lua:60-66: ignoreContentAdaptWithSize(false) BEFORE loadTexture & BEFORE setSize!
+            auto* iconQuality = new Issue8ImageView();
+            iconQuality->ignoreContentAdaptWithSize(false);
+            REQUIRE_TRUE(std::isfinite(iconQuality->imageRenderer->scaleX));
+            REQUIRE_EQ(iconQuality->imageRenderer->scaleX, 1.0f);
+            iconItem->addChild(iconQuality, 0, 601);
+
+            auto* icon = new Issue8ImageView();
+            icon->ignoreContentAdaptWithSize(false);
+            REQUIRE_TRUE(std::isfinite(icon->imageRenderer->scaleX));
+            iconItem->addChild(icon, 0, 602);
+
+            // Test reused sprite offset reset: first load trimmed/rotated frame_4, then target icon
+            REQUIRE_TRUE(icon->loadTexture(env, "gameImage/frame/frame_4.png", /*UI_TEX_TYPE_LOCAL=*/0));
+            REQUIRE_TRUE(icon->imageRenderer->rectRotated);
+
+            // BaseItemIcon_TM.lua:114, 134, 143-148: 1-arg loadTexture (UI_TEX_TYPE_LOCAL) -> setSize(100,100) / (98,98)
+            REQUIRE_TRUE(iconQuality->loadTexture(env, spec.frameReq, /*UI_TEX_TYPE_LOCAL=*/0));
+            REQUIRE_TRUE(icon->loadTexture(env, spec.iconReq, /*UI_TEX_TYPE_LOCAL=*/0));
+            REQUIRE_TRUE(!icon->imageRenderer->rectRotated);
+            REQUIRE_EQ(icon->imageRenderer->offsetX, 0.0f);
+            REQUIRE_EQ(icon->imageRenderer->offsetY, 0.0f);
+
+            iconItem->setSize(100.0f, 120.0f);
+            iconQuality->setSize(100.0f, 100.0f);
+            icon->setSize(98.0f, 98.0f);
+            iconQuality->posX = icon->posX = 50.0f;
+            iconQuality->posY = icon->posY = 70.0f;
+
+            // BaseItemWithNameIcon_TM.lua:24: lbName ("Tiến Cấp Đơn")
+            auto* lbName = new Issue8Label();
+            lbName->text = spec.name;
+            iconItem->addChild(lbName, 0, 603);
+            lbName->release();
+
+            // Verify runtime observation & rendering fix:
+            // Widget scale is (1,1), opacity is 255, AND _imageRenderer now renders visible 100x100 & 98x98 quads!
+            REQUIRE_EQ(iconQuality->scaleX, 1.0f);
+            REQUIRE_EQ(iconQuality->scaleY, 1.0f);
+            REQUIRE_TRUE(std::fabs(iconQuality->imageRenderer->renderedQuadWidth() - 100.0f) < 0.01f);
+            REQUIRE_TRUE(std::fabs(iconQuality->imageRenderer->renderedQuadHeight() - 100.0f) < 0.01f);
+            REQUIRE_TRUE(std::fabs(icon->imageRenderer->renderedQuadWidth() - 98.0f) < 0.01f);
+            REQUIRE_TRUE(std::fabs(icon->imageRenderer->renderedQuadHeight() - 98.0f) < 0.01f);
+
+            // BaseItemIcon_TM.lua:181, 207: optional newziUI tip armature added via addNode and removed via removeFromParentAndCleanup
+            auto* tipArm = new Issue8Armature();
+            tipArm->animName = "newziUI";
+            iconItem->addNode(tipArm, 0, 604);
+            tipArm->release();
+            REQUIRE_EQ(iconItem->getNodes()->count(), 1u);
+            tipArm->removeFromParentAndCleanup(true);
+            REQUIRE_EQ(iconItem->getNodes()->count(), 0u); // Zero stale pointer in iconItem:getNodes()!
+
+            // UIEffectUtil:playFadeIn(cell, 1, 15, fn) -> CCFadeIn steps 0 -> 128 -> 255
+            cell->visible = false;
+            cell->visible = true;
+            cell->setOpacity(0);
+            REQUIRE_EQ(cell->displayedOpacity, static_cast<uint8_t>(0));
+            cell->setOpacity(128);
+            REQUIRE_EQ(cell->displayedOpacity, static_cast<uint8_t>(128));
+            cell->setOpacity(255);
+            REQUIRE_EQ(cell->displayedOpacity, static_cast<uint8_t>(255));
+
+            // Callback fn: UIEffectUtil:playArmatureOnce("dangewupinhuode", nil, ccp(90, 72), 1, cell)
+            auto* burstArm = new Issue8Armature();
+            burstArm->animName = "dangewupinhuode";
+            burstArm->posX = 90.0f;
+            burstArm->posY = 72.0f;
+            burstArm->scaleX = burstArm->scaleY = 1.2f;
+            cell->addNode(burstArm, 0, 503);
+            burstArm->release();
+            REQUIRE_EQ(cell->getNodes()->count(), 2u); // glowSprite + burstArm
+
+            // Movement COMPLETE callback (type == 1): armature:removeFromParentAndCleanup(true)
+            burstArm->removeFromParentAndCleanup(true);
+
+            // CRITICAL ASSERTION: Widget::getNodes() MUST NOT retain stale pointer to burstArm!
+            Issue8Array* liveCellNodes = cell->getNodes();
+            REQUIRE_EQ(liveCellNodes->count(), 1u);
+            REQUIRE_EQ(liveCellNodes->arr[0], glowSprite);
+            REQUIRE_EQ(glowSprite->getParent(), cell);
+
+            // Also test direct non-virtual CCNode::removeChild bypass + getNodes() pruning on an extra effect node
+            auto* bypassNode = new Issue8Node();
+            cell->addNode(bypassNode, 2, 504);
+            bypassNode->release();
+            REQUIRE_EQ(cell->getNodes()->count(), 2u);
+            cell->Issue8Node::removeChild(bypassNode, true); // Bypasses Widget::removeChild!
+            REQUIRE_EQ(cell->getNodes()->count(), 1u);       // getNodes() prunes detached node cleanly!
+
+            // Test re-entrant onExit mutation during removeAllChildrenWithCleanup
+            auto* reentrantChild = new Issue8Armature();
+            auto* companionNode = new Issue8Armature();
+            cell->addNode(companionNode, 3, 505);
+            companionNode->release();
+            reentrantChild->onExitCallback = [cell, companionNode]() {
+                if (companionNode->getParent() == cell) {
+                    companionNode->removeFromParentAndCleanup(true);
+                }
+            };
+            cell->addNode(reentrantChild, 3, 506);
+            reentrantChild->release();
+
+            iconQuality->release();
+            icon->release();
+            iconItem->release();
+            cells.push_back(cell);
+        }
+
+        // Simulate GainItemCell:clearData() on half the cells and _itemContainer:removeAllChildrenWithCleanup(true) on the rest
+        for (size_t idx = 0; idx < cells.size(); ++idx) {
+            Issue8Layout* cell = cells[idx];
+            if (idx % 2 == 0) {
+                // GainItemCell.lua:109-116: sprite:dispose(); sprite:removeFromParentAndCleanup(true); self:removeAllChildrenWithCleanup(true)
+                if (!cell->getNodes()->arr.empty()) {
+                    auto* sp = static_cast<Issue8Node*>(cell->getNodes()->arr[0]);
+                    sp->removeFromParentAndCleanup(true);
+                }
+                cell->removeAllChildrenWithCleanup(true);
+                REQUIRE_EQ(cell->getNodes()->count(), 0u);
+                REQUIRE_EQ(cell->widgetChildren->count(), 0u);
+                // Internal protected backGroundImage renderer MUST still be alive in cell->children!
+                REQUIRE_EQ(cell->children->count(), 1u);
+                REQUIRE_EQ(cell->children->arr[0], cell->backGroundImage);
+                REQUIRE_EQ(cell->backGroundImage->getParent(), cell);
+            }
+            cell->release();
+        }
+
+        // GainItemListInfoPanel.lua:273: self._itemContainer:removeAllChildrenWithCleanup(true)
+        itemContainer->removeAllChildrenWithCleanup(true);
+        REQUIRE_EQ(itemContainer->getNodes()->count(), 0u);
+        REQUIRE_EQ(itemContainer->widgetChildren->count(), 0u);
+        REQUIRE_EQ(itemContainer->children->count(), 1u); // Protected backGroundImage preserved!
+
+        // Close & destroy panel before next reopen iteration
+        panelRoot->removeAllChildrenWithCleanup(true);
+        itemContainer->release();
+        panelRoot->release();
+
+        // Zero leaked CCObjects across every single iteration!
+        REQUIRE_EQ(Issue8RefObject::s_liveInstances, 0);
+    }
+    return true;
+}
 
 void writeLE16U(uint8_t* dst, uint16_t v) { dst[0] = static_cast<uint8_t>(v & 0xFFu); dst[1] = static_cast<uint8_t>((v >> 8) & 0xFFu); }
 void writeLE16S(uint8_t* dst, int16_t v) { writeLE16U(dst, static_cast<uint16_t>(v)); }
@@ -1316,6 +2139,8 @@ int main() {
                 testPvrRgba8UnpackPremulAlphaAndBlendPipeline);
     runTestCase("14_StarburstSeam_And_GlowRing_OffscreenPixelVerification",
                 testStarburstSeamAndGlowRingOffscreenPixelVerification);
+    runTestCase("15_Issue8_GainItemPanel_50PlusLifecycle_GetNodesSync_And_ImageViewIcons",
+                testIssue8GainItemPanelLifecycleAndImageViewRendering);
 
     std::printf("======================================================================\n");
     std::printf("Summary: %d passed, %d failed\n", g_passedTests, g_failedTests);

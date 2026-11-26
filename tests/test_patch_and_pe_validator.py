@@ -564,6 +564,206 @@ bool CCImage::_initWithJpgData(void * data, int nSize)
 }
 """,
     )
+    w(
+        "cocos2dx/textures/CCTextureETC.h",
+        "namespace cocos2d { class CCTextureETC { public: bool initWithFile(const char* file); }; }\n",
+    )
+    w(
+        "cocos2dx/textures/CCTextureETC.cpp",
+        '#include "CCTextureETC.h"\nNS_CC_BEGIN\nbool CCTextureETC::initWithFile(const char* file) { return false; }\nNS_CC_END\n',
+    )
+    w(
+        "cocos2dx/textures/CCTextureCache.cpp",
+        """#include "CCTextureCache.h"
+NS_CC_BEGIN
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+CCTexture2D* CCTextureCache::addETCImage(const char* path)
+{
+    return NULL;
+}
+#endif
+CCTexture2D * CCTextureCache::addImage(const char * path)
+{
+    CCTexture2D * texture = NULL;
+    return texture;
+}
+NS_CC_END
+""",
+    )
+    w(
+        "extensions/CocoStudio/GUI/BaseClasses/UIWidget.cpp",
+        """#include "UIWidget.h"
+NS_CC_BEGIN
+namespace ui {
+void Widget::addChild(CCNode *child) { addChild(child, child->getZOrder(), child->getTag()); }
+void Widget::addChild(CCNode * child, int zOrder) { addChild(child, zOrder, child->getTag()); }
+void Widget::addChild(CCNode* child, int zOrder, int tag)
+{
+    CCAssert(dynamic_cast<Widget*>(child) != NULL, "Widget only supports Widgets as children");
+    CCNode::addChild(child, zOrder, tag);
+    _widgetChildren->addObject(child);
+}
+void Widget::removeChild(CCNode *child) { removeChild(child, true); }
+void Widget::removeChild(CCNode *child, bool cleanup)
+{
+    CCNode::removeChild(child, cleanup);
+    _widgetChildren->removeObject(child);
+}
+void Widget::removeAllChildrenWithCleanup(bool cleanup)
+{
+    if(_widgetChildren && _widgetChildren->count() > 0)
+    {
+        CCObject* child;
+        CCARRAY_FOREACH(_widgetChildren, child)
+        {
+            CCNode::removeChild((CCNode*)child, cleanup);
+        }
+    }
+    _widgetChildren->removeAllObjects();
+}
+CCNode* Widget::getChildByTag(int aTag)
+{
+    return NULL;
+}
+void Widget::addNode(CCNode* node) { addNode(node, node->getZOrder(), node->getTag()); }
+void Widget::addNode(CCNode * node, int zOrder) { addNode(node, zOrder, node->getTag()); }
+void Widget::addNode(CCNode* node, int zOrder, int tag)
+{
+    CCAssert(dynamic_cast<Widget*>(node) == NULL, "Widget only supports Nodes as renderer");
+    CCNode::addChild(node, zOrder, tag);
+    _nodes->addObject(node);
+}
+CCNode* Widget::getNodeByTag(int tag)
+{
+    return NULL;
+}
+CCArray* Widget::getNodes()
+{
+    return _nodes;
+}
+void Widget::removeNode(CCNode* node)
+{
+    CCNode::removeChild(node);
+    _nodes->removeObject(node);
+}
+void Widget::removeAllNodes()
+{
+    _nodes->removeAllObjects();
+}
+void Widget::setColor(const ccColor3B& color)
+{
+    _color = color;
+    updateTextureColor();
+}
+void Widget::setOpacity(GLubyte opacity)
+{
+    _opacity = opacity;
+    updateTextureOpacity();
+}
+}
+NS_CC_END
+""",
+    )
+    w(
+        "extensions/CocoStudio/GUI/Layouts/UILayout.cpp",
+        """#include "UILayout.h"
+NS_CC_BEGIN
+namespace ui {
+void Layout::addChild(CCNode *child) { addChild(child, child->getZOrder(), child->getTag()); }
+void Layout::addChild(CCNode * child, int zOrder) { addChild(child, zOrder, child->getTag()); }
+void Layout::addChild(CCNode *child, int zOrder, int tag)
+{
+    supplyTheLayoutParameterLackToChild(static_cast<Widget*>(child));
+    Widget::addChild(child, zOrder, tag);
+    _doLayoutDirty = true;
+}
+const CCRect& Layout::getClippingRect()
+{
+    if (_clippingRectDirty)
+    {
+        if (_clippingParent)
+        {
+            if (bottomOffset < 0.0f)
+            {
+                finalY = parentClippingRect.origin.x;
+            }
+        }
+    }
+    return _clippingRect;
+}
+void Layout::setBackGroundImage(const char* fileName,TextureResType texType)
+{
+    _backGroundImageFileName = fileName;
+}
+}
+NS_CC_END
+""",
+    )
+    w(
+        "extensions/CocoStudio/GUI/UIWidgets/ScrollWidget/UIScrollView.cpp",
+        """#include "UIScrollView.h"
+NS_CC_BEGIN
+namespace ui {
+void ScrollView::addChild(CCNode *child, int zOrder, int tag) { return _innerContainer->addChild(child, zOrder, tag); }
+void ScrollView::addNode(CCNode* node, int zOrder, int tag) { _innerContainer->addNode(node, zOrder, tag); }
+}
+NS_CC_END
+""",
+    )
+    w(
+        "extensions/CocoStudio/GUI/UIWidgets/ScrollWidget/UIListView.cpp",
+        """#include "UIListView.h"
+NS_CC_BEGIN
+namespace ui {
+void ListView::pushBackCustomItem(Widget* item) { _items->addObject(item); addChild(item); }
+void ListView::insertCustomItem(Widget* item, int index) { _items->insertObject(item, index); addChild(item); }
+}
+NS_CC_END
+""",
+    )
+    w(
+        "extensions/CocoStudio/GUI/UIWidgets/UIImageView.cpp",
+        """#include "UIImageView.h"
+NS_CC_BEGIN
+namespace ui {
+void ImageView::loadTexture(const char *fileName, TextureResType texType)
+{
+    _textureFile = fileName;
+    _imageTexType = texType;
+}
+void ImageView::setScale9Enabled(bool able)
+{
+    loadTexture(_textureFile.c_str(),_imageTexType);
+}
+}
+NS_CC_END
+""",
+    )
+    w(
+        "extensions/CocoStudio/Armature/CCArmature.cpp",
+        """#include "CCArmature.h"
+NS_CC_EXT_BEGIN
+void CCArmature::draw()
+{
+    if (CCSkin *skin = dynamic_cast<CCSkin *>(node))
+    {
+        CCTextureAtlas *textureAtlas = skin->getTextureAtlas();
+        bool blendDirty = skin->isBlendDirty();
+        if(m_pAtlas != textureAtlas || blendDirty)
+        {
+            if (m_pAtlas)
+            {
+                m_pAtlas->drawQuads();
+                m_pAtlas->removeAllQuads();
+            }
+        }
+        m_pAtlas = textureAtlas;
+        skin->updateTransform();
+    }
+}
+NS_CC_EXT_END
+""",
+    )
 
     # Mock legacy vcxproj files + stale MSVCR100 DLLs
     vcxproj_tpl = """<?xml version="1.0" encoding="utf-8"?>
@@ -665,6 +865,62 @@ class TestCocos2dxPatcher(unittest.TestCase):
             )
             rc_drift = patch_cocos2dx.main([str(drifted_root)])
             self.assertNotEqual(rc_drift, 0)
+
+    def test_issue8_widget_lifecycle_and_imageview_texture_patches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cocos_root = Path(tmp) / "cocos2d-x-2.2.6"
+            create_mock_cocos2dx_226_tree(cocos_root)
+
+            rc1 = patch_cocos2dx.main([str(cocos_root)])
+            self.assertEqual(rc1, 0)
+
+            # 1. UIWidget.cpp: _nodes & _widgetChildren synchronized across removeChild,
+            #    removeAllChildrenWithCleanup (preserving internal renderers), and getNodes()
+            widget_cpp = (cocos_root / "extensions/CocoStudio/GUI/BaseClasses/UIWidget.cpp").read_text(encoding="utf-8")
+            self.assertIn("GCLIENT_UIWIDGET_LIFECYCLE_V2", widget_cpp)
+            self.assertIn("if (_nodes) { _nodes->removeObject(", widget_cpp)
+            self.assertIn("pNode->getParent() != this", widget_cpp)
+            self.assertIn("_nodes->removeObjectAtIndex((unsigned int)i)", widget_cpp)
+            self.assertIn("CCNodeRGBA::setOpacity(", widget_cpp)
+            self.assertNotIn("CCNode::removeAllChildrenWithCleanup", widget_cpp)
+
+            # 2. UILayout.cpp: dynamic_cast<Widget*> before supplyTheLayoutParameterLackToChild + getClippingRect .origin.y fix
+            layout_cpp = (cocos_root / "extensions/CocoStudio/GUI/Layouts/UILayout.cpp").read_text(encoding="utf-8")
+            self.assertIn("dynamic_cast<Widget*>", layout_cpp)
+            self.assertIn("finalY = parentClippingRect.origin.y;", layout_cpp)
+            self.assertNotIn("finalY = parentClippingRect.origin.x;", layout_cpp)
+            self.assertIn("gclientGuiApplyToRenderer", layout_cpp)
+
+            # 3. UIImageView.cpp: SpriteFrame + multi-extension local texture fallback via initWithSpriteFrame
+            imgview_cpp = (cocos_root / "extensions/CocoStudio/GUI/UIWidgets/UIImageView.cpp").read_text(encoding="utf-8")
+            self.assertIn("GCLIENT_UIIMAGEVIEW_TEXTURE_FALLBACK", imgview_cpp)
+            self.assertIn("gclientGuiApplyToRenderer(_imageRenderer", imgview_cpp)
+            self.assertIn("sp->initWithSpriteFrame(frame)", imgview_cpp)
+
+            # 4. CCTextureCache.cpp & CCTextureETC.cpp: .jpg/.jpeg + prefix fallback & opaque RGBA _alpha preservation
+            texcache_cpp = (cocos_root / "cocos2dx/textures/CCTextureCache.cpp").read_text(encoding="utf-8")
+            self.assertIn('".jpg"', texcache_cpp)
+            self.assertIn('".jpeg"', texcache_cpp)
+            self.assertIn('"gameImage/"', texcache_cpp)
+
+            etc_cpp = (cocos_root / "cocos2dx/textures/CCTextureETC.cpp").read_text(encoding="utf-8")
+            self.assertIn("const bool useAlphaChan = hasVariedAlpha || (!anyNonZeroG && px[3] > 0u);", etc_cpp)
+
+            # 5. CCArmature.cpp: null textureAtlas guard in draw()
+            arm_cpp = (cocos_root / "extensions/CocoStudio/Armature/CCArmature.cpp").read_text(encoding="utf-8")
+            self.assertIn("if (!textureAtlas || !textureAtlas->getTexture())", arm_cpp)
+
+            # 6. Second pass must be 100% byte-for-byte idempotent across all newly patched files
+            rc2 = patch_cocos2dx.main([str(cocos_root)])
+            self.assertEqual(rc2, 0)
+            self.assertEqual(
+                widget_cpp,
+                (cocos_root / "extensions/CocoStudio/GUI/BaseClasses/UIWidget.cpp").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                imgview_cpp,
+                (cocos_root / "extensions/CocoStudio/GUI/UIWidgets/UIImageView.cpp").read_text(encoding="utf-8"),
+            )
 
 
     def test_patch_pvr_rgba8_premul_and_armature_seam_fixes(self) -> None:
