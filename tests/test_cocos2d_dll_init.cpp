@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -515,6 +516,177 @@ struct ScopedDummyWglContext {
     }
 };
 
+
+struct DirectorViewTestAccessor : public cocos2d::CCDirector {
+    static cocos2d::CCEGLView* currentView(cocos2d::CCDirector* dir) {
+        return dir ? dir->*(&DirectorViewTestAccessor::m_pobOpenGLView) : nullptr;
+    }
+    static void bindHeadlessView(cocos2d::CCDirector* dir, cocos2d::CCEGLView* view) {
+        if (!dir) return;
+        dir->*(&DirectorViewTestAccessor::m_pobOpenGLView) = view;
+        if (view) {
+            const cocos2d::CCSize ds = view->getDesignResolutionSize();
+            dir->*(&DirectorViewTestAccessor::m_obWinSizeInPoints) =
+                (ds.width > 0.0f && ds.height > 0.0f) ? ds : cocos2d::CCSizeMake(1136.0f, 640.0f);
+            view->setTouchDelegate(dir->getTouchDispatcher());
+            if (dir->getTouchDispatcher()) dir->getTouchDispatcher()->setDispatchEvents(true);
+        }
+    }
+    static void syncWinSizeAndOrtho(cocos2d::CCDirector* dir, const cocos2d::CCSize& ds) {
+        if (!dir) return;
+        dir->*(&DirectorViewTestAccessor::m_obWinSizeInPoints) = ds;
+        kmGLMatrixMode(KM_GL_PROJECTION);
+        kmGLLoadIdentity();
+        kmMat4 ortho;
+        kmMat4OrthographicProjection(&ortho, 0.0f, ds.width, 0.0f, ds.height, -1024.0f, 1024.0f);
+        kmGLMultMatrix(&ortho);
+        kmGLMatrixMode(KM_GL_MODELVIEW);
+        kmGLLoadIdentity();
+    }
+};
+
+class TestableWin32EGLView final : public cocos2d::CCEGLView {
+public:
+    explicit TestableWin32EGLView(bool hasGl20) : m_hasGl20(hasGl20) {}
+    bool isOpenGLReady() override { return m_hasGl20 ? cocos2d::CCEGLView::isOpenGLReady() : true; }
+    void swapBuffers() override { if (m_hasGl20) cocos2d::CCEGLView::swapBuffers(); }
+    void centerWindow() override {}
+    void setViewPortInPoints(float x, float y, float w, float h) override {
+        if (m_hasGl20) cocos2d::CCEGLView::setViewPortInPoints(x, y, w, h);
+    }
+    void setDesignResolutionSize(float width, float height, ResolutionPolicy policy) override {
+        if (width <= 0.0f || height <= 0.0f || m_obScreenSize.width <= 0.0f || m_obScreenSize.height <= 0.0f) return;
+        if (m_hasGl20) {
+            cocos2d::CCEGLView::setDesignResolutionSize(width, height, policy);
+            DirectorViewTestAccessor::syncWinSizeAndOrtho(cocos2d::CCDirector::sharedDirector(), m_obDesignResolutionSize);
+            return;
+        }
+        m_obDesignResolutionSize.setSize(width, height);
+        m_fScaleX = m_obScreenSize.width / m_obDesignResolutionSize.width;
+        m_fScaleY = m_obScreenSize.height / m_obDesignResolutionSize.height;
+        if (policy == kResolutionNoBorder) m_fScaleX = m_fScaleY = (std::max)(m_fScaleX, m_fScaleY);
+        else if (policy == kResolutionShowAll) m_fScaleX = m_fScaleY = (std::min)(m_fScaleX, m_fScaleY);
+        else if (policy == kResolutionFixedHeight) {
+            m_fScaleX = m_fScaleY;
+            m_obDesignResolutionSize.width = std::ceil(m_obScreenSize.width / m_fScaleX);
+        } else if (policy == kResolutionFixedWidth) {
+            m_fScaleY = m_fScaleX;
+            m_obDesignResolutionSize.height = std::ceil(m_obScreenSize.height / m_fScaleY);
+        }
+        const float vpW = m_obDesignResolutionSize.width * m_fScaleX, vpH = m_obDesignResolutionSize.height * m_fScaleY;
+        m_obViewPortRect.setRect((m_obScreenSize.width - vpW) * 0.5f, (m_obScreenSize.height - vpH) * 0.5f, vpW, vpH);
+        m_eResolutionPolicy = policy;
+        DirectorViewTestAccessor::syncWinSizeAndOrtho(cocos2d::CCDirector::sharedDirector(), m_obDesignResolutionSize);
+    }
+    static LRESULT CALLBACK hostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+        if (msg == WM_NCCREATE) {
+            const auto* cs = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+            ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+        } else if (msg == WM_GETMINMAXINFO) {
+            auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+            mmi->ptMaxTrackSize.x = mmi->ptMaxTrackSize.y = mmi->ptMaxSize.x = mmi->ptMaxSize.y = 8192;
+            return 0;
+        }
+        auto* self = reinterpret_cast<TestableWin32EGLView*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (self && self->getHWnd() == hwnd && msg != WM_DESTROY) {
+            return self->WindowProc(msg, wParam, lParam);
+        }
+        return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+private:
+    bool m_hasGl20 = false;
+};
+
+class NonSwallowingProbeLayer final : public cocos2d::CCLayer {
+public:
+    explicit NonSwallowingProbeLayer(int prio) : m_prio(prio) {}
+    void onEnter() override {
+        cocos2d::CCLayer::onEnter();
+        if (auto* td = cocos2d::CCDirector::sharedDirector()->getTouchDispatcher()) td->addTargetedDelegate(this, m_prio, false);
+    }
+    void onExit() override {
+        if (auto* td = cocos2d::CCDirector::sharedDirector()->getTouchDispatcher()) td->removeDelegate(this);
+        cocos2d::CCLayer::onExit();
+    }
+    bool ccTouchBegan(cocos2d::CCTouch*, cocos2d::CCEvent*) override { ++beganCount; return true; }
+    int beganCount = 0;
+private:
+    int m_prio = 0;
+};
+
+class WidgetCallbackTarget final : public cocos2d::CCObject {
+public:
+    std::function<void(cocos2d::CCObject*, cocos2d::ui::TouchEventType)> onEvent;
+    void handleTouch(cocos2d::CCObject* s, cocos2d::ui::TouchEventType t) { if (onEvent) onEvent(s, t); }
+};
+
+struct SendInputProbeStatus { bool available = false; std::string reason; };
+
+SendInputProbeStatus probeInteractiveSendInput(HWND targetHwnd) {
+    DWORD sessionId = 0;
+    if (!::ProcessIdToSessionId(::GetCurrentProcessId(), &sessionId) || sessionId == 0) {
+        return {false, "Session-0 non-interactive service session"};
+    }
+    if (HWINSTA hWinSta = ::GetProcessWindowStation()) {
+        USEROBJECTFLAGS uof{};
+        DWORD len = 0;
+        if (::GetUserObjectInformationW(hWinSta, UOI_FLAGS, &uof, sizeof(uof), &len) && (uof.dwFlags & WSF_VISIBLE) == 0) {
+            return {false, "WindowStation lacks WSF_VISIBLE (headless/non-interactive)"};
+        }
+    }
+    HDESK hDesk = ::OpenInputDesktop(0, FALSE, DESKTOP_WRITEOBJECTS | DESKTOP_JOURNALPLAYBACK);
+    if (!hDesk) return {false, "OpenInputDesktop denied/locked (err=" + std::to_string(::GetLastError()) + ")"};
+    ::CloseDesktop(hDesk);
+    wchar_t ciBuf[16] = {};
+    if (::GetEnvironmentVariableW(L"GITHUB_ACTIONS", ciBuf, 16) > 0 && std::wcscmp(ciBuf, L"true") == 0) {
+        return {false, "GITHUB_ACTIONS headless runner desktop"};
+    }
+    ::ShowWindow(targetHwnd, SW_SHOWNOACTIVATE);
+    ::SetForegroundWindow(targetHwnd);
+    if (::GetForegroundWindow() != targetHwnd) {
+        return {false, "Target HWND could not acquire foreground focus (UIPI/locked desktop)"};
+    }
+    return {true, "Interactive unlocked desktop verified"};
+}
+
+bool dispatchWin32ClickViaWindowProc(HWND hwnd, int clientX, int clientY, WPARAM downWParam = MK_LBUTTON) {
+    if (!hwnd || !::IsWindow(hwnd)) return false;
+    const LPARAM lp = MAKELPARAM(static_cast<short>(clientX), static_cast<short>(clientY));
+    ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, lp);
+    ::SendMessageW(hwnd, WM_LBUTTONDOWN, downWParam, lp);
+    ::SendMessageW(hwnd, WM_MOUSEMOVE, downWParam, lp);
+    ::SendMessageW(hwnd, WM_LBUTTONUP, 0, lp);
+    return true;
+}
+
+bool dispatchWin32ClickViaSendInput(HWND hwnd, int clientX, int clientY, std::string& errOut) {
+    POINT screenPt{clientX, clientY};
+    if (!::ClientToScreen(hwnd, &screenPt)) { errOut = "ClientToScreen failed"; return false; }
+    const int vL = ::GetSystemMetrics(SM_XVIRTUALSCREEN), vT = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int vW = (std::max)(1, ::GetSystemMetrics(SM_CXVIRTUALSCREEN));
+    const int vH = (std::max)(1, ::GetSystemMetrics(SM_CYVIRTUALSCREEN));
+    INPUT inputs[3] = {};
+    inputs[0].type = INPUT_MOUSE;
+    inputs[0].mi.dx = static_cast<LONG>(((static_cast<int64_t>(screenPt.x - vL) * 65535) + vW / 2) / vW);
+    inputs[0].mi.dy = static_cast<LONG>(((static_cast<int64_t>(screenPt.y - vT) * 65535) + vH / 2) / vH);
+    inputs[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    inputs[1] = inputs[0]; inputs[1].mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
+    inputs[2] = inputs[0]; inputs[2].mi.dwFlags |= MOUSEEVENTF_LEFTUP;
+    ::SetLastError(0);
+    const UINT sent = ::SendInput(3, inputs, sizeof(INPUT));
+    if (sent != 3) {
+        errOut = "SendInput returned " + std::to_string(sent) + " (err=" + std::to_string(::GetLastError()) + ")";
+        return false;
+    }
+    MSG msg{};
+    const ULONGLONG deadline = ::GetTickCount64() + 250;
+    while (::GetTickCount64() < deadline) {
+        while (::PeekMessageW(&msg, hwnd, 0, 0, PM_REMOVE)) { ::TranslateMessage(&msg); ::DispatchMessageW(&msg); }
+        ::Sleep(5);
+    }
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -717,6 +889,11 @@ int main(int argc, char** argv) {
         gclient::assets::InstallBtDecryptHook(fu);
 
         const auto searchCopy = fu->getSearchPaths();
+        // Regression guard for Issue #8: verify non-existent ASCII & UTF-8 paths do not tail-recurse.
+        if (fu->isFileExist("cc_fps_images") || fu->isFileExist("nonexistent_Tửu_Quán_probe.png")) {
+            detail = "isFileExist unexpectedly returned true for non-existent probe path";
+            return false;
+        }
         const std::string resolved = fu->fullPathForFilename("scripts/boot_probe.lua");
         if (resolved.empty() || !fu->isFileExist(resolved)) {
             detail = "Failed to resolve UTF-8 path scripts/boot_probe.lua -> " + resolved;
@@ -842,7 +1019,317 @@ int main(int argc, char** argv) {
         return rc == 0 && probeVal == 42;
     });
 
-    // Phase 5 (Issue #8): >= 50 iterations of GainItemListInfoPanel / GainItemCell widget lifecycle,
+    // Phase 5: Real Win32 HWND + CCEGLView + TouchGroup + FuncMenu (Tửu Quán) Mouse Routing (>= 24 cycles)
+    runPhase("phase5_win32_funcmenu_mouse_routing", [&](std::string& detail) -> bool {
+        auto makeTouchBtn = [&]() -> cocos2d::ui::Widget* {
+            if (wglCtx.ready) return cocos2d::ui::Button::create();
+            auto* l = cocos2d::ui::Layout::create();
+            l->setAnchorPoint(cocos2d::CCPointMake(0.5f, 0.5f));
+            return l;
+        };
+        using cocos2d::ui::SEL_TouchEvent;
+        cocos2d::CCDirector* dir = cocos2d::CCDirector::sharedDirector();
+        if (!dir || !dir->getTouchDispatcher()) { detail = "CCDirector/CCTouchDispatcher null"; return false; }
+
+        static const wchar_t* kTestWndClass = L"KestrelFuncMenuMouseProbeWnd";
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
+        wc.lpfnWndProc = &TestableWin32EGLView::hostWndProc;
+        wc.hInstance = ::GetModuleHandleW(nullptr);
+        wc.lpszClassName = kTestWndClass;
+        ::RegisterClassExW(&wc);
+
+        auto* testView = new TestableWin32EGLView(false);
+        HWND testHwnd = ::CreateWindowExW(0, kTestWndClass, L"Kestrel Issue #8 FuncMenu Mouse Probe",
+                                          WS_POPUP, 0, 0, 1136, 640, nullptr, nullptr, wc.hInstance, testView);
+        if (!testHwnd) { delete testView; detail = "CreateWindowExW failed"; return false; }
+        testView->setHWnd(testHwnd);
+
+        cocos2d::CCEGLView* prevView = DirectorViewTestAccessor::currentView(dir);
+        DirectorViewTestAccessor::bindHeadlessView(dir, testView);
+
+        struct ResCase { int baseW, baseH, dpiPct; };
+        const ResCase kCases[12] = {
+            {960, 640, 100},  {960, 640, 125},  {960, 640, 150},
+            {1136, 640, 100}, {1136, 640, 125}, {1136, 640, 150},
+            {1280, 720, 100}, {1280, 720, 125}, {1280, 720, 150},
+            {1920, 1080, 100},{1920, 1080, 125},{1920, 1080, 150},
+        };
+
+        int completedCycles = 0, directOpens = 0, secOpens = 0, jgOpens = 0, panelCloses = 0;
+        std::string failReason;
+
+        auto runCycle = [&](int cycleIdx, const ResCase& rc, bool secMode) -> bool {
+            const float zoom = static_cast<float>(rc.dpiPct) / 100.0f;
+            testView->setFrameZoomFactor(zoom);
+            testView->setFrameSize(static_cast<float>(rc.baseW), static_cast<float>(rc.baseH));
+            RECT clientRc{};
+            ::GetClientRect(testHwnd, &clientRc);
+
+            testView->setDesignResolutionSize(1136.0f, 640.0f, kResolutionFixedWidth);
+            cocos2d::CCSize cppDesign = testView->getDesignResolutionSize();
+            if (cppDesign.height > 768.0f) {
+                testView->setDesignResolutionSize(1136.0f, 768.0f, kResolutionShowAll);
+                cppDesign = testView->getDesignResolutionSize();
+            }
+            const float luaW = cppDesign.width, luaH = (std::max)(cppDesign.height, 640.0f);
+            const float yShift = (luaH - 640.0f) * 0.5f;
+            const float stScale = (cppDesign.height < 640.0f) ? (cppDesign.height / 640.0f) : 1.0f;
+            const float stX = (cppDesign.height < 640.0f) ? ((cppDesign.width - 1136.0f * stScale) * 0.5f) : ((cppDesign.width - 1136.0f) * 0.5f);
+            const float stY = (cppDesign.height < 640.0f) ? 0.0f : ((cppDesign.height - 640.0f) * 0.5f);
+
+            auto* stage = cocos2d::CCScene::create();
+            stage->retain();
+            auto* stageLayer = cocos2d::CCNode::create();
+            stageLayer->setPosition(cocos2d::CCPointMake(stX, stY));
+            stageLayer->setScale(stScale);
+            stage->addChild(stageLayer);
+
+            auto* sceneHost = cocos2d::CCNode::create();
+            auto* panelHost = cocos2d::CCNode::create();
+            stageLayer->addChild(sceneHost, 0);
+            stageLayer->addChild(panelHost, 10);
+
+            auto* touchFxProbe = new NonSwallowingProbeLayer(-123);
+            touchFxProbe->autorelease();
+            stage->addChild(touchFxProbe, 100);
+            auto* rotateProbe = new NonSwallowingProbeLayer(-3);
+            rotateProbe->autorelease();
+            sceneHost->addChild(rotateProbe, 0);
+
+            auto* mainScene = cocos2d::ui::TouchGroup::create();
+            mainScene->setTouchPriority(-2);
+            sceneHost->addChild(mainScene, 999);
+
+            auto* funcMenu = cocos2d::ui::Layout::create();
+            funcMenu->setPosition(cocos2d::CCPointMake(0.0f, yShift));
+            mainScene->addWidget(funcMenu);
+
+            auto* choukaWrap = cocos2d::ui::Layout::create();
+            choukaWrap->setPosition(cocos2d::CCPointMake(50.0f, 400.0f));
+            funcMenu->addChild(choukaWrap);
+
+            auto* choukaBtn = makeTouchBtn();
+            choukaBtn->ignoreContentAdaptWithSize(false);
+            choukaBtn->setSize(cocos2d::CCSizeMake(119.0f, 112.0f));
+            choukaBtn->setScale(0.8f);
+            choukaBtn->setAnchorPoint(cocos2d::CCPointMake(0.5f, 0.0f));
+            choukaBtn->setTouchEnabled(true);
+            choukaWrap->addChild(choukaBtn);
+
+            auto* tipsMore = cocos2d::ui::Layout::create();
+            tipsMore->setPosition(cocos2d::CCPointMake(0.0f, -yShift));
+            auto* panelMask = cocos2d::ui::Layout::create();
+            panelMask->setSize(cocos2d::CCSizeMake(1.0f, 1.0f));
+            panelMask->setPosition(cocos2d::CCPointMake(0.0f, 20.0f));
+            panelMask->setTouchEnabled(true);
+            tipsMore->addChild(panelMask);
+            mainScene->addWidget(tipsMore);
+
+            bool raffleOpen = false, secondaryOpen = false;
+            cocos2d::ui::TouchGroup* activeRaffle = nullptr;
+            cocos2d::ui::Layout* secMask = nullptr;
+            cocos2d::ui::Widget* secBg = nullptr;
+
+            auto* choukaCb = new WidgetCallbackTarget();
+            auto* closeCb = new WidgetCallbackTarget();
+            auto* maskCb = new WidgetCallbackTarget();
+            auto* jgCb = new WidgetCallbackTarget();
+
+            auto spawnRaffle = [&]() {
+                if (raffleOpen) return;
+                raffleOpen = true;
+                activeRaffle = cocos2d::ui::TouchGroup::create();
+                activeRaffle->setTouchPriority(-26);
+                auto* modalBg = cocos2d::ui::Layout::create();
+                modalBg->setSize(cocos2d::CCSizeMake(luaW, luaH));
+                modalBg->setPosition(cocos2d::CCPointMake(0.0f, -yShift));
+                modalBg->setTouchEnabled(true);
+                activeRaffle->addWidget(modalBg);
+                modalBg->setZOrder(-2);
+
+                auto* closeBtn = makeTouchBtn();
+                closeBtn->ignoreContentAdaptWithSize(false);
+                closeBtn->setSize(cocos2d::CCSizeMake(80.0f, 80.0f));
+                closeBtn->setPosition(cocos2d::CCPointMake(1060.0f, 580.0f + yShift));
+                closeBtn->setTouchEnabled(true);
+                closeBtn->addTouchEventListener(closeCb, toucheventselector(WidgetCallbackTarget::handleTouch));
+                activeRaffle->addWidget(closeBtn);
+                panelHost->addChild(activeRaffle);
+            };
+            closeCb->onEvent = [&](cocos2d::CCObject*, cocos2d::ui::TouchEventType t) {
+                if (t == cocos2d::ui::TOUCH_EVENT_ENDED && activeRaffle) {
+                    activeRaffle->removeFromParentAndCleanup(true);
+                    activeRaffle = nullptr;
+                    raffleOpen = false;
+                    ++panelCloses;
+                }
+            };
+            auto closeSec = [&]() {
+                if (!secondaryOpen) return;
+                secondaryOpen = false;
+                if (secBg) { secBg->removeFromParentAndCleanup(true); secBg = nullptr; }
+                if (secMask) { secMask->removeFromParentAndCleanup(true); secMask = nullptr; }
+            };
+            maskCb->onEvent = [&](cocos2d::CCObject*, cocos2d::ui::TouchEventType t) {
+                if (t == cocos2d::ui::TOUCH_EVENT_ENDED) closeSec();
+            };
+            jgCb->onEvent = [&](cocos2d::CCObject*, cocos2d::ui::TouchEventType t) {
+                if (t == cocos2d::ui::TOUCH_EVENT_ENDED) { ++jgOpens; closeSec(); spawnRaffle(); }
+            };
+            choukaCb->onEvent = [&](cocos2d::CCObject*, cocos2d::ui::TouchEventType t) {
+                if (t != cocos2d::ui::TOUCH_EVENT_ENDED) return;
+                if (!secMode) {
+                    ++directOpens;
+                    spawnRaffle();
+                } else {
+                    if (secondaryOpen) { closeSec(); return; }
+                    secondaryOpen = true;
+                    ++secOpens;
+                    secMask = cocos2d::ui::Layout::create();
+                    secMask->setSize(cocos2d::CCSizeMake(luaW, luaH));
+                    secMask->setPosition(cocos2d::CCPointMake(0.0f, -yShift));
+                    secMask->setTouchEnabled(true);
+                    secMask->addTouchEventListener(maskCb, toucheventselector(WidgetCallbackTarget::handleTouch));
+                    funcMenu->addChild(secMask);
+
+                    secBg = wglCtx.ready ? static_cast<cocos2d::ui::Widget*>(cocos2d::ui::ImageView::create()) : static_cast<cocos2d::ui::Widget*>(cocos2d::ui::Layout::create());
+                    secBg->ignoreContentAdaptWithSize(false);
+                    secBg->setAnchorPoint(cocos2d::CCPointMake(0.0f, 0.0f));
+                    secBg->setPosition(cocos2d::CCPointMake(100.0f, 370.0f));
+                    secBg->setSize(cocos2d::CCSizeMake(245.0f, 110.0f));
+                    funcMenu->addChild(secBg);
+
+                    auto* jgWrap = cocos2d::ui::Layout::create();
+                    jgWrap->setPosition(cocos2d::CCPointMake(68.0f, 10.0f));
+                    secBg->addChild(jgWrap);
+                    auto* jgBtn = makeTouchBtn();
+                    jgBtn->ignoreContentAdaptWithSize(false);
+                    jgBtn->setSize(cocos2d::CCSizeMake(119.0f, 112.0f));
+                    jgBtn->setScale(0.8f);
+                    jgBtn->setAnchorPoint(cocos2d::CCPointMake(0.5f, 0.0f));
+                    jgBtn->setTouchEnabled(true);
+                    jgBtn->addTouchEventListener(jgCb, toucheventselector(WidgetCallbackTarget::handleTouch));
+                    jgWrap->addChild(jgBtn);
+                }
+            };
+            choukaBtn->addTouchEventListener(choukaCb, toucheventselector(WidgetCallbackTarget::handleTouch));
+            stage->onEnter();
+            stage->onEnterTransitionDidFinish();
+
+            auto sceneToClient = [&](float sx, float sy) -> POINT {
+                const float glX = stX + sx * stScale, glY = stY + sy * stScale;
+                const cocos2d::CCRect vp = testView->getViewPortRect();
+                return POINT{
+                    static_cast<LONG>(std::lround((glX * testView->getScaleX() + vp.origin.x) * zoom)),
+                    static_cast<LONG>(std::lround(((cppDesign.height - glY) * testView->getScaleY() + vp.origin.y) * zoom))
+                };
+            };
+
+            bool ok = true;
+            const POINT choukaPt = sceneToClient(50.0f, yShift + ((cycleIdx % 2 == 0) ? 444.8f : 435.0f));
+            const WPARAM clickWParam = (cycleIdx % 3 == 1) ? (MK_LBUTTON | MK_CONTROL)
+                                     : (cycleIdx % 3 == 2) ? static_cast<WPARAM>(0) : static_cast<WPARAM>(MK_LBUTTON);
+
+            if (cycleIdx == 0) {
+                const POINT missPt = sceneToClient(50.0f, yShift + 392.0f);
+                dispatchWin32ClickViaWindowProc(testHwnd, missPt.x, missPt.y, MK_LBUTTON);
+                if (raffleOpen || secondaryOpen) { failReason = "Hit below bottom-center anchor y=400"; ok = false; }
+                ::SendMessageW(testHwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(choukaPt.x, choukaPt.y));
+                ::SendMessageW(testHwnd, WM_CAPTURECHANGED, 0, reinterpret_cast<LPARAM>(wglCtx.hwnd));
+                if (raffleOpen || secondaryOpen) { failReason = "WM_CAPTURECHANGED did not cancel touch"; ok = false; }
+            }
+
+            if (ok) {
+                std::printf("[InputRoute] cycle=%02d mode=%s res=%dx%d@%d%% client=%ldx%ld cppDesign=%.0fx%.0f clickClient=(%ld,%ld) wParam=0x%llX\n",
+                            cycleIdx + 1, secMode ? "Lv50_Secondary" : "Direct_Raffle",
+                            rc.baseW, rc.baseH, rc.dpiPct, clientRc.right - clientRc.left, clientRc.bottom - clientRc.top,
+                            cppDesign.width, cppDesign.height, choukaPt.x, choukaPt.y, static_cast<unsigned long long>(clickWParam));
+                dispatchWin32ClickViaWindowProc(testHwnd, choukaPt.x, choukaPt.y, clickWParam);
+                const POINT closePt = sceneToClient(1060.0f, 580.0f + yShift);
+                if (!secMode) {
+                    const int prevOpens = directOpens;
+                    if (!raffleOpen) { failReason = "Direct Tửu Quán open failed"; ok = false; }
+                    else {
+                        dispatchWin32ClickViaWindowProc(testHwnd, choukaPt.x, choukaPt.y, MK_LBUTTON);
+                        if (directOpens != prevOpens) { failReason = "Modal RaffleMainPanel did not swallow click"; ok = false; }
+                        dispatchWin32ClickViaWindowProc(testHwnd, closePt.x, closePt.y, MK_LBUTTON);
+                        if (raffleOpen) { failReason = "RaffleMainPanel close failed"; ok = false; }
+                    }
+                } else {
+                    if (!secondaryOpen) { failReason = "Secondary simg_bg open failed"; ok = false; }
+                    else {
+                        const POINT jgPt = sceneToClient(168.0f, yShift + 424.8f);
+                        dispatchWin32ClickViaWindowProc(testHwnd, jgPt.x, jgPt.y, MK_LBUTTON);
+                        if (secondaryOpen || !raffleOpen) { failReason = "Secondary jiuguan open failed"; ok = false; }
+                        else {
+                            dispatchWin32ClickViaWindowProc(testHwnd, closePt.x, closePt.y, MK_LBUTTON);
+                            if (raffleOpen) { failReason = "RaffleMainPanel close failed after jiuguan"; ok = false; }
+                        }
+                    }
+                }
+            }
+            if (ok && touchFxProbe->beganCount < 2) { failReason = "TouchEffectManager (-123) missed touches"; ok = false; }
+
+            stage->onExit();
+            stage->cleanup();
+            stage->release();
+            choukaCb->release(); closeCb->release(); maskCb->release(); jgCb->release();
+            return ok;
+        };
+
+        for (int i = 0; i < 12 && failReason.empty(); ++i) { if (!runCycle(i, kCases[i], false)) break; ++completedCycles; }
+        for (int i = 0; i < 12 && failReason.empty(); ++i) { if (!runCycle(12 + i, kCases[i], true)) break; ++completedCycles; }
+
+        std::string sendInputVerdict;
+        if (failReason.empty()) {
+            const SendInputProbeStatus siProbe = probeInteractiveSendInput(testHwnd);
+            if (!siProbe.available) {
+                sendInputVerdict = "BLOCKED (" + siProbe.reason + ")";
+            } else {
+                testView->setFrameZoomFactor(1.0f);
+                testView->setFrameSize(1136.0f, 640.0f);
+                testView->setDesignResolutionSize(1136.0f, 640.0f, kResolutionFixedWidth);
+                auto* siScene = cocos2d::CCScene::create(); siScene->retain();
+                auto* siGroup = cocos2d::ui::TouchGroup::create(); siGroup->setTouchPriority(-2);
+                auto* siBtn = makeTouchBtn();
+                siBtn->ignoreContentAdaptWithSize(false);
+                siBtn->setSize(cocos2d::CCSizeMake(119.0f, 112.0f));
+                siBtn->setScale(0.8f);
+                siBtn->setAnchorPoint(cocos2d::CCPointMake(0.5f, 0.0f));
+                siBtn->setPosition(cocos2d::CCPointMake(50.0f, 400.0f));
+                siBtn->setTouchEnabled(true);
+                bool siHit = false;
+                auto* siCb = new WidgetCallbackTarget();
+                siCb->onEvent = [&](cocos2d::CCObject*, cocos2d::ui::TouchEventType t) { if (t == cocos2d::ui::TOUCH_EVENT_ENDED) siHit = true; };
+                siBtn->addTouchEventListener(siCb, toucheventselector(WidgetCallbackTarget::handleTouch));
+                siGroup->addWidget(siBtn); siScene->addChild(siGroup); siScene->onEnter();
+
+                std::string siErr;
+                const bool sentOk = dispatchWin32ClickViaSendInput(testHwnd, 50, 195, siErr);
+                siScene->onExit(); siScene->cleanup(); siScene->release(); siCb->release();
+                sendInputVerdict = (!sentOk || !siHit)
+                    ? ("BLOCKED (" + (siErr.empty() ? std::string("UIPI/desktop filter swallowed SendInput") : siErr) + ")")
+                    : std::string("OK (hardware queue delivered)");
+            }
+            std::printf("[InputRoute] SendInput=%s\n", sendInputVerdict.c_str());
+        }
+
+        std::fflush(stdout);
+        DirectorViewTestAccessor::bindHeadlessView(dir, prevView);
+        testView->setHWnd(nullptr);
+        ::DestroyWindow(testHwnd);
+        delete testView;
+
+        if (!failReason.empty()) { detail = failReason; return false; }
+        detail = "cycles=" + std::to_string(completedCycles) + " direct=" + std::to_string(directOpens) +
+                 " sec=" + std::to_string(secOpens) + " jiuguan=" + std::to_string(jgOpens) +
+                 " closes=" + std::to_string(panelCloses) + " sendInput=" + sendInputVerdict;
+        return completedCycles == 24 && directOpens == 12 && secOpens == 12 && jgOpens == 12 && panelCloses == 24;
+    });
+
+    // Phase 6 (Issue #8): >= 50 iterations of GainItemListInfoPanel / GainItemCell widget lifecycle,
     // addNode + removeFromParentAndCleanup(true) -> Widget::getNodes() synchronization,
     // removeAllChildrenWithCleanup(true) internal renderer preservation, and ImageView
     // ignoreContentAdaptWithSize(false) -> loadTexture (plist frame & local) -> setSize(100,100)/(98,98) + CCFadeIn

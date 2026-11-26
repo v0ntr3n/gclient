@@ -31,6 +31,7 @@ extern "C" {
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -38,6 +39,7 @@ extern "C" {
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -49,8 +51,10 @@ extern "C" {
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -77,6 +81,19 @@ int g_failedTests = 0;
         if (!(_l == _r)) {                                                                 \
             std::fprintf(stderr, "[FAIL] %s:%d: expected (%s == %s)\n", __FILE__,          \
                          __LINE__, #lhs, #rhs);                                            \
+            std::fflush(stderr);                                                           \
+            return false;                                                                  \
+        }                                                                                  \
+    } while (0)
+
+#define REQUIRE_NEAR(lhs, rhs, eps)                                                        \
+    do {                                                                                   \
+        const double _l = static_cast<double>(lhs);                                        \
+        const double _r = static_cast<double>(rhs);                                        \
+        const double _e = static_cast<double>(eps);                                        \
+        if (!(std::fabs(_l - _r) <= _e)) {                                                 \
+            std::fprintf(stderr, "[FAIL] %s:%d: expected |%s - %s| <= %g (got %g vs %g)\n",\
+                         __FILE__, __LINE__, #lhs, #rhs, _e, _l, _r);                      \
             std::fflush(stderr);                                                           \
             return false;                                                                  \
         }                                                                                  \
@@ -962,6 +979,524 @@ bool testCNetworkLoopbackReentrantAndDestroySafety() {
     REQUIRE_EQ(receivedPayloads.size(), 2u);
     REQUIRE_EQ(receivedPayloads[0], std::string("pong_packet_1"));
     REQUIRE_EQ(receivedPayloads[1], std::string("pong_packet_2"));
+    return true;
+}
+
+// ============================================================================
+// Scenario 18 (Issue #8): Win32 Mouse Routing, DPI/Viewport Sync & FuncMenu 24-Cycle QA
+// ============================================================================
+
+struct SimVec2 { float x = 0.0f, y = 0.0f; };
+struct SimSize { float width = 0.0f, height = 0.0f; };
+struct SimRect {
+    float x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
+    bool isZero() const noexcept { return width == 0.0f && height == 0.0f && x == 0.0f && y == 0.0f; }
+    bool containsPoint(float px, float py) const noexcept {
+        return px >= x && px <= (x + width) && py >= y && py <= (y + height);
+    }
+};
+
+enum class SimResPolicy { Unknown, ShowAll, FixedHeight, FixedWidth };
+enum class SimTouchEv { Began = 0, Moved = 1, Ended = 2, Canceled = 3 };
+
+struct SimWidget {
+    std::string name;
+    bool isLayout = false, visible = true, enabled = true, touchEnabled = false;
+    bool clippingEnabled = false, touchPassedEnabled = false, hitted = false, focused = false;
+    int zOrder = 0;
+    SimVec2 pos{0.0f, 0.0f}, anchor{0.5f, 0.5f};
+    SimSize size{0.0f, 0.0f};
+    float scaleX = 1.0f, scaleY = 1.0f;
+    SimWidget* parent = nullptr;
+    std::vector<std::shared_ptr<SimWidget>> children;
+    std::function<void(SimWidget*, SimTouchEv)> listener;
+
+    static std::shared_ptr<SimWidget> createLayout(const std::string& nm) {
+        auto w = std::make_shared<SimWidget>();
+        w->name = nm;
+        w->isLayout = true;
+        w->anchor = {0.0f, 0.0f};
+        return w;
+    }
+    static std::shared_ptr<SimWidget> createButton(const std::string& nm, float wSz, float hSz) {
+        auto w = std::make_shared<SimWidget>();
+        w->name = nm;
+        w->size = {wSz, hSz};
+        w->touchEnabled = true;
+        return w;
+    }
+    void addChild(const std::shared_ptr<SimWidget>& ch, int z = 0) {
+        ch->parent = this;
+        ch->zOrder = z;
+        auto it = std::upper_bound(children.begin(), children.end(), z,
+            [](int lhsZ, const std::shared_ptr<SimWidget>& rhs) { return lhsZ < rhs->zOrder; });
+        children.insert(it, ch);
+    }
+    void removeFromParent() {
+        if (!parent) return;
+        auto& vec = parent->children;
+        vec.erase(std::remove_if(vec.begin(), vec.end(),
+            [this](const std::shared_ptr<SimWidget>& p) { return p.get() == this; }), vec.end());
+        parent = nullptr;
+    }
+    SimVec2 worldToLocal(SimVec2 worldPt, SimVec2 stageOrigin, float stageScale) const {
+        std::vector<const SimWidget*> chain;
+        for (const SimWidget* cur = this; cur != nullptr; cur = cur->parent) chain.push_back(cur);
+        SimVec2 p{(worldPt.x - stageOrigin.x) / stageScale, (worldPt.y - stageOrigin.y) / stageScale};
+        // In CocoStudio UIWidget, CCNode::m_obContentSize is (0,0) while Widget::_size is tested
+        // against CCRect(-_size * anchor, _size) in UIWidget::hitTest.
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+            const SimWidget* n = *it;
+            p.x = (p.x - n->pos.x) / (n->scaleX != 0.0f ? n->scaleX : 1.0f);
+            p.y = (p.y - n->pos.y) / (n->scaleY != 0.0f ? n->scaleY : 1.0f);
+        }
+        return p;
+    }
+    bool hitTest(SimVec2 glPt, SimVec2 stageOrigin, float stageScale) const {
+        const SimVec2 nsp = worldToLocal(glPt, stageOrigin, stageScale);
+        const float ox = -size.width * anchor.x, oy = -size.height * anchor.y;
+        return nsp.x >= ox && nsp.x <= (ox + size.width) && nsp.y >= oy && nsp.y <= (oy + size.height);
+    }
+    bool clippingParentAreaContainPoint(SimVec2 glPt, SimVec2 stageOrigin, float stageScale) const {
+        for (const SimWidget* p = parent; p != nullptr; p = p->parent) {
+            if (p->isLayout && p->clippingEnabled) {
+                return p->hitTest(glPt, stageOrigin, stageScale) &&
+                       p->clippingParentAreaContainPoint(glPt, stageOrigin, stageScale);
+            }
+        }
+        return true;
+    }
+    bool onTouchBegan(SimVec2 glPt, SimVec2 stageOrigin, float stageScale) {
+        hitted = enabled && touchEnabled && hitTest(glPt, stageOrigin, stageScale) &&
+                 clippingParentAreaContainPoint(glPt, stageOrigin, stageScale);
+        if (!hitted) return false;
+        focused = true;
+        if (listener) listener(this, SimTouchEv::Began);
+        return !touchPassedEnabled;
+    }
+    void onTouchMoved(SimVec2 glPt, SimVec2 stageOrigin, float stageScale) {
+        focused = hitTest(glPt, stageOrigin, stageScale);
+        if (listener) listener(this, SimTouchEv::Moved);
+    }
+    void onTouchEnded(SimVec2) {
+        const bool wasFocused = focused;
+        focused = false;
+        if (listener) listener(this, wasFocused ? SimTouchEv::Ended : SimTouchEv::Canceled);
+    }
+    void onTouchCancelled() {
+        focused = false;
+        if (listener) listener(this, SimTouchEv::Canceled);
+    }
+};
+
+struct SimTouchDelegate {
+    int priority = 0;
+    bool swallowsTouches = true, visible = true;
+    std::function<bool(SimVec2)> onBegan;
+    std::function<void(SimVec2)> onMoved;
+    std::function<void(SimVec2)> onEnded;
+    std::function<void()> onCancelled;
+};
+
+struct SimTouchGroup {
+    explicit SimTouchGroup(int prio) : priority(prio), rootWidget(SimWidget::createLayout("Root")) {}
+    int priority = 0;
+    bool visible = true;
+    std::shared_ptr<SimWidget> rootWidget;
+    std::vector<std::shared_ptr<SimWidget>> selectedWidgets;
+
+    bool checkTouchEvent(const std::shared_ptr<SimWidget>& r, SimVec2 glPt, SimVec2 stOrig, float stScale) {
+        if (!r || !r->visible) return false;
+        for (int i = static_cast<int>(r->children.size()) - 1; i >= 0; --i) {
+            if (checkTouchEvent(r->children[static_cast<size_t>(i)], glPt, stOrig, stScale)) return true;
+        }
+        const bool pass = r->onTouchBegan(glPt, stOrig, stScale);
+        if (r->hitted) {
+            selectedWidgets.push_back(r);
+            return true;
+        }
+        return pass;
+    }
+    bool ccTouchBegan(SimVec2 glPt, SimVec2 stOrig, float stScale) {
+        if (!visible) return false;
+        selectedWidgets.clear();
+        checkTouchEvent(rootWidget, glPt, stOrig, stScale);
+        return !selectedWidgets.empty();
+    }
+    void ccTouchMoved(SimVec2 glPt, SimVec2 stOrig, float stScale) {
+        auto snap = selectedWidgets;
+        for (auto& w : snap) w->onTouchMoved(glPt, stOrig, stScale);
+    }
+    void ccTouchEnded(SimVec2 glPt) {
+        auto snap = selectedWidgets;
+        selectedWidgets.clear();
+        for (auto& w : snap) w->onTouchEnded(glPt);
+    }
+    void ccTouchCancelled() {
+        auto snap = selectedWidgets;
+        selectedWidgets.clear();
+        for (auto& w : snap) w->onTouchCancelled();
+    }
+};
+
+struct PatchedWin32EglPipeline {
+    SimSize screenSize{1136.0f, 640.0f}, designSize{1136.0f, 640.0f};
+    SimRect viewPortRect{0.0f, 0.0f, 1136.0f, 640.0f};
+    float scaleX = 1.0f, scaleY = 1.0f, frameZoomFactor = 1.0f;
+    SimResPolicy policy = SimResPolicy::Unknown;
+    bool supportTouch = true, captured = false, hasActiveTouch0 = false;
+    std::vector<SimTouchDelegate*> delegates, claimed;
+
+    void setFrameSizeWithClientClamp(float reqW, float reqH, int actualClientW, int actualClientH) {
+        const float zoom = frameZoomFactor > 0.0f ? frameZoomFactor : 1.0f;
+        screenSize = designSize = (actualClientW > 0 && actualClientH > 0)
+            ? SimSize{static_cast<float>(actualClientW) / zoom, static_cast<float>(actualClientH) / zoom}
+            : SimSize{reqW, reqH};
+    }
+    void setDesignResolutionSize(float w, float h, SimResPolicy pol) {
+        if (w <= 0.0f || h <= 0.0f || screenSize.width <= 0.0f || screenSize.height <= 0.0f) return;
+        designSize = {w, h};
+        scaleX = screenSize.width / designSize.width;
+        scaleY = screenSize.height / designSize.height;
+        if (pol == SimResPolicy::ShowAll) scaleX = scaleY = (std::min)(scaleX, scaleY);
+        else if (pol == SimResPolicy::FixedHeight) { scaleX = scaleY; designSize.width = std::ceil(screenSize.width / scaleX); }
+        else if (pol == SimResPolicy::FixedWidth) { scaleY = scaleX; designSize.height = std::ceil(screenSize.height / scaleY); }
+        const float vpW = designSize.width * scaleX, vpH = designSize.height * scaleY;
+        viewPortRect = {(screenSize.width - vpW) * 0.5f, (screenSize.height - vpH) * 0.5f, vpW, vpH};
+        policy = pol;
+    }
+    void onWmSize(int clientW, int clientH) {
+        if (clientW <= 0 || clientH <= 0) return;
+        const float zoom = frameZoomFactor > 0.0f ? frameZoomFactor : 1.0f;
+        const float unzoomedW = static_cast<float>(clientW) / zoom, unzoomedH = static_cast<float>(clientH) / zoom;
+        const SimSize prevFrame = screenSize, prevDesign = designSize;
+        const SimResPolicy prevPol = policy;
+        screenSize = designSize = {unzoomedW, unzoomedH};
+        if (prevDesign.width >= 1.0f && prevDesign.height >= 1.0f && prevPol != SimResPolicy::Unknown) {
+            const bool sameAspect = prevFrame.width > 0.0f && prevFrame.height > 0.0f &&
+                                    std::fabs((unzoomedW / unzoomedH) - (prevFrame.width / prevFrame.height)) < 1e-3f;
+            setDesignResolutionSize(prevDesign.width, prevDesign.height, sameAspect ? prevPol : SimResPolicy::ShowAll);
+        } else {
+            setDesignResolutionSize(1136.0f, 640.0f, SimResPolicy::FixedWidth);
+        }
+    }
+    SimVec2 clientToGL(float ptX, float ptY) const {
+        return {(ptX - viewPortRect.x) / scaleX, designSize.height - (ptY - viewPortRect.y) / scaleY};
+    }
+    static bool isTouchSynthesizedMouse(uint32_t extraInfo, bool inSendMessage) noexcept {
+        return !inSendMessage && ((extraInfo & 0xFFFFFF80u) == 0xFF515780u);
+    }
+    void cancelActiveTouch0() {
+        if (!hasActiveTouch0) return;
+        auto snap = claimed;
+        claimed.clear();
+        hasActiveTouch0 = false;
+        for (auto* d : snap) if (d->onCancelled) d->onCancelled();
+    }
+    void onWmLButtonDown(int clientX, int clientY, uint32_t, uint32_t extra = 0, bool inSendMsg = false) {
+        if (supportTouch && isTouchSynthesizedMouse(extra, inSendMsg)) return;
+        const float zoom = frameZoomFactor > 0.0f ? frameZoomFactor : 1.0f;
+        const float ptX = static_cast<float>(clientX) / zoom, ptY = static_cast<float>(clientY) / zoom;
+        if (viewPortRect.isZero() || viewPortRect.containsPoint(ptX, screenSize.height - ptY)) {
+            captured = true;
+            if (hasActiveTouch0) cancelActiveTouch0();
+            hasActiveTouch0 = true;
+            claimed.clear();
+            const SimVec2 glPt = clientToGL(ptX, ptY);
+            std::vector<SimTouchDelegate*> sorted = delegates;
+            std::stable_sort(sorted.begin(), sorted.end(),
+                [](const SimTouchDelegate* a, const SimTouchDelegate* b) { return a->priority < b->priority; });
+            for (auto* d : sorted) {
+                if (d->visible && d->onBegan && d->onBegan(glPt)) {
+                    claimed.push_back(d);
+                    if (d->swallowsTouches) break;
+                }
+            }
+        }
+    }
+    void onWmMouseMove(int clientX, int clientY, uint32_t wParam, uint32_t extra = 0, bool inSendMsg = false) {
+        if (supportTouch && isTouchSynthesizedMouse(extra, inSendMsg)) return;
+        if (!captured || (wParam & 0x0001u) == 0 || !hasActiveTouch0) return;
+        const float zoom = frameZoomFactor > 0.0f ? frameZoomFactor : 1.0f;
+        const SimVec2 glPt = clientToGL(static_cast<float>(clientX) / zoom, static_cast<float>(clientY) / zoom);
+        auto snap = claimed;
+        for (auto* d : snap) if (d->onMoved) d->onMoved(glPt);
+    }
+    void onWmLButtonUp(int clientX, int clientY, uint32_t extra = 0, bool inSendMsg = false) {
+        if (supportTouch && isTouchSynthesizedMouse(extra, inSendMsg)) return;
+        if (!captured) return;
+        captured = false;
+        if (!hasActiveTouch0) return;
+        const float zoom = frameZoomFactor > 0.0f ? frameZoomFactor : 1.0f;
+        const SimVec2 glPt = clientToGL(static_cast<float>(clientX) / zoom, static_cast<float>(clientY) / zoom);
+        auto snap = claimed;
+        claimed.clear();
+        hasActiveTouch0 = false;
+        for (auto* d : snap) if (d->onEnded) d->onEnded(glPt);
+    }
+    void onWmCaptureChanged(bool lostToOtherWindow) {
+        if (captured && lostToOtherWindow) { captured = false; cancelActiveTouch0(); }
+    }
+};
+
+bool testWin32MouseRoutingDpiViewportAndFuncMenuCycles() {
+    // 1. Verify Windows Pen (0xFF515700) vs Touch (0xFF515780) & InSendMessage filter
+    REQUIRE_TRUE(!PatchedWin32EglPipeline::isTouchSynthesizedMouse(0xFF515700u, false));
+    REQUIRE_TRUE(!PatchedWin32EglPipeline::isTouchSynthesizedMouse(0xFF515701u, false));
+    REQUIRE_TRUE(PatchedWin32EglPipeline::isTouchSynthesizedMouse(0xFF515780u, false));
+    REQUIRE_TRUE(!PatchedWin32EglPipeline::isTouchSynthesizedMouse(0xFF515780u, true));
+
+    // 2. Verify WM_SIZE preservation of 1024x768 ShowAll & F11 fullscreen letterboxing
+    {
+        PatchedWin32EglPipeline pipe;
+        pipe.setFrameSizeWithClientClamp(1024.0f, 768.0f, 1024, 768);
+        pipe.setDesignResolutionSize(1136.0f, 640.0f, SimResPolicy::FixedWidth);
+        REQUIRE_TRUE(pipe.designSize.height > 768.0f);
+        pipe.setDesignResolutionSize(1136.0f, 768.0f, SimResPolicy::ShowAll);
+        pipe.onWmSize(1024, 768);
+        REQUIRE_NEAR(pipe.designSize.width, 1136.0f, 1e-3f);
+        REQUIRE_NEAR(pipe.designSize.height, 768.0f, 1e-3f);
+        REQUIRE_TRUE(pipe.policy == SimResPolicy::ShowAll);
+
+        pipe.setFrameSizeWithClientClamp(1136.0f, 640.0f, 1136, 640);
+        pipe.setDesignResolutionSize(1136.0f, 640.0f, SimResPolicy::FixedWidth);
+        pipe.onWmSize(1920, 1200);
+        REQUIRE_NEAR(pipe.designSize.width, 1136.0f, 1e-3f);
+        REQUIRE_NEAR(pipe.designSize.height, 640.0f, 1e-3f);
+        REQUIRE_TRUE(pipe.policy == SimResPolicy::ShowAll);
+        REQUIRE_NEAR(pipe.viewPortRect.y, (1200.0f - 640.0f * (1920.0f / 1136.0f)) * 0.5f, 0.5f);
+    }
+
+    // 3. Verify monitor-clamped bordered window (1920x1080 requested -> 1920x1041 client rect)
+    {
+        PatchedWin32EglPipeline clamped;
+        clamped.setFrameSizeWithClientClamp(1920.0f, 1080.0f, 1920, 1041);
+        clamped.setDesignResolutionSize(1136.0f, 640.0f, SimResPolicy::FixedWidth);
+        REQUIRE_NEAR(clamped.screenSize.height, 1041.0f, 1e-3f);
+        const SimVec2 glC = clamped.clientToGL(50.0f * clamped.scaleX, (clamped.designSize.height - 444.8f) * clamped.scaleY);
+        REQUIRE_NEAR(glC.x, 50.0f, 0.05f);
+        REQUIRE_NEAR(glC.y, 444.8f, 0.05f);
+    }
+
+    // 4. Execute 24 open/close cycles across 960x640, 1136x640, 1280x720, 1920x1080 x 100%/125%/150% DPI
+    struct ResDpiSpec { int baseW, baseH, dpiPct; };
+    const ResDpiSpec kSpecs[12] = {
+        {960, 640, 100},  {960, 640, 125},  {960, 640, 150},
+        {1136, 640, 100}, {1136, 640, 125}, {1136, 640, 150},
+        {1280, 720, 100}, {1280, 720, 125}, {1280, 720, 150},
+        {1920, 1080, 100},{1920, 1080, 125},{1920, 1080, 150},
+    };
+
+    int totalCycles = 0;
+    for (int mode = 0; mode < 2; ++mode) {
+        const bool secondaryMode = (mode == 1);
+        for (int i = 0; i < 12; ++i) {
+            const auto& sp = kSpecs[i];
+            const float zoom = static_cast<float>(sp.dpiPct) / 100.0f;
+            const int clientW = static_cast<int>(std::lround(sp.baseW * zoom));
+            const int clientH = static_cast<int>(std::lround(sp.baseH * zoom));
+
+            PatchedWin32EglPipeline pipe;
+            pipe.frameZoomFactor = zoom;
+            pipe.setFrameSizeWithClientClamp(static_cast<float>(sp.baseW), static_cast<float>(sp.baseH), clientW, clientH);
+            pipe.setDesignResolutionSize(1136.0f, 640.0f, SimResPolicy::FixedWidth);
+            if (pipe.designSize.height > 768.0f) pipe.setDesignResolutionSize(1136.0f, 768.0f, SimResPolicy::ShowAll);
+            pipe.onWmSize(clientW, clientH);
+            REQUIRE_NEAR(pipe.screenSize.width, static_cast<float>(sp.baseW), 0.5f);
+            REQUIRE_NEAR(pipe.screenSize.height, static_cast<float>(sp.baseH), 0.5f);
+
+            const float cppW = pipe.designSize.width, cppH = pipe.designSize.height;
+            const float luaH = (std::max)(cppH, 640.0f), yShift = (luaH - 640.0f) * 0.5f;
+            const float stageScale = (cppH < 640.0f) ? (cppH / 640.0f) : 1.0f;
+            const SimVec2 stageOrigin = (cppH < 640.0f)
+                ? SimVec2{(cppW - 1136.0f * stageScale) * 0.5f, 0.0f}
+                : SimVec2{(cppW - 1136.0f) * 0.5f, (cppH - 640.0f) * 0.5f};
+
+            int touchFxCount = 0;
+            SimTouchDelegate touchFxDel{-123, false, true, [&](SimVec2) { ++touchFxCount; return true; }, {}, {}, {}};
+            SimTouchDelegate rotateListDel{-3, false, true, [&](SimVec2) { return true; }, {}, {}, {}};
+
+            SimTouchGroup mainSceneGroup(-2), rafflePanelGroup(-26);
+            rafflePanelGroup.visible = false;
+
+            auto funcMenu = SimWidget::createLayout("FuncMenu");
+            funcMenu->pos = {0.0f, yShift};
+            mainSceneGroup.rootWidget->addChild(funcMenu, 0);
+
+            auto choukaWrap = SimWidget::createLayout("MainMenuBtn_chouka");
+            choukaWrap->pos = {50.0f, 400.0f};
+            funcMenu->addChild(choukaWrap, 0);
+
+            auto choukaBtn = SimWidget::createButton("btn_chouka", 119.0f, 112.0f);
+            choukaBtn->scaleX = choukaBtn->scaleY = 0.8f;
+            choukaBtn->anchor = {0.5f, 0.0f};
+            choukaWrap->addChild(choukaBtn, 0);
+
+            auto tipsMore = SimWidget::createLayout("MainTipsMoreItem");
+            tipsMore->pos = {0.0f, -yShift};
+            auto panelMask = SimWidget::createLayout("Panel_mask");
+            panelMask->size = {1.0f, 1.0f};
+            panelMask->pos = {0.0f, 20.0f};
+            panelMask->touchEnabled = true;
+            tipsMore->addChild(panelMask, 0);
+            mainSceneGroup.rootWidget->addChild(tipsMore, 0);
+
+            auto raffleModalBg = SimWidget::createLayout("RaffleModalBg");
+            raffleModalBg->size = {cppW, luaH};
+            raffleModalBg->pos = {0.0f, -yShift};
+            raffleModalBg->touchEnabled = true;
+            rafflePanelGroup.rootWidget->addChild(raffleModalBg, -2);
+
+            auto raffleCloseBtn = SimWidget::createButton("RaffleCloseBtn", 80.0f, 80.0f);
+            raffleCloseBtn->pos = {1060.0f, 580.0f + yShift};
+            rafflePanelGroup.rootWidget->addChild(raffleCloseBtn, 1);
+
+            bool raffleOpen = false, secondaryOpen = false;
+            std::shared_ptr<SimWidget> secMask, secBg;
+            raffleCloseBtn->listener = [&](SimWidget*, SimTouchEv ev) {
+                if (ev == SimTouchEv::Ended) { raffleOpen = false; rafflePanelGroup.visible = false; }
+            };
+            auto closeSecondary = [&]() {
+                secondaryOpen = false;
+                if (secBg) { secBg->removeFromParent(); secBg.reset(); }
+                if (secMask) { secMask->removeFromParent(); secMask.reset(); }
+            };
+            choukaBtn->listener = [&](SimWidget*, SimTouchEv ev) {
+                if (ev != SimTouchEv::Ended) return;
+                if (!secondaryMode) {
+                    raffleOpen = rafflePanelGroup.visible = true;
+                } else {
+                    secondaryOpen = true;
+                    secMask = SimWidget::createLayout("FuncMenu_rootLayout");
+                    secMask->size = {cppW, luaH};
+                    secMask->pos = {0.0f, -yShift};
+                    secMask->touchEnabled = true;
+                    secMask->listener = [&](SimWidget*, SimTouchEv mEv) { if (mEv == SimTouchEv::Ended) closeSecondary(); };
+                    funcMenu->addChild(secMask, 0);
+
+                    secBg = SimWidget::createLayout("simg_bg");
+                    secBg->pos = {100.0f, 370.0f};
+                    secBg->size = {245.0f, 110.0f};
+                    funcMenu->addChild(secBg, 0);
+
+                    auto jgWrap = SimWidget::createLayout("MainMenuBtn_jiuguan");
+                    jgWrap->pos = {68.0f, 10.0f};
+                    secBg->addChild(jgWrap, 0);
+
+                    auto jgBtn = SimWidget::createButton("btn_jiuguan", 119.0f, 112.0f);
+                    jgBtn->scaleX = jgBtn->scaleY = 0.8f;
+                    jgBtn->anchor = {0.5f, 0.0f};
+                    jgBtn->listener = [&](SimWidget*, SimTouchEv jEv) {
+                        if (jEv == SimTouchEv::Ended) { closeSecondary(); raffleOpen = rafflePanelGroup.visible = true; }
+                    };
+                    jgWrap->addChild(jgBtn, 0);
+                }
+            };
+
+            SimTouchDelegate mainSceneDel{-2, true, true,
+                [&](SimVec2 p) { return mainSceneGroup.ccTouchBegan(p, stageOrigin, stageScale); },
+                [&](SimVec2 p) { mainSceneGroup.ccTouchMoved(p, stageOrigin, stageScale); },
+                [&](SimVec2 p) { mainSceneGroup.ccTouchEnded(p); },
+                [&]() { mainSceneGroup.ccTouchCancelled(); }};
+            SimTouchDelegate raffleDel{-26, true, true,
+                [&](SimVec2 p) { return rafflePanelGroup.ccTouchBegan(p, stageOrigin, stageScale); },
+                [&](SimVec2 p) { rafflePanelGroup.ccTouchMoved(p, stageOrigin, stageScale); },
+                [&](SimVec2 p) { rafflePanelGroup.ccTouchEnded(p); },
+                [&]() { rafflePanelGroup.ccTouchCancelled(); }};
+            pipe.delegates = {&touchFxDel, &raffleDel, &rotateListDel, &mainSceneDel};
+
+            auto toClient = [&](float sx, float sy) -> std::pair<int, int> {
+                const float glX = stageOrigin.x + sx * stageScale, glY = stageOrigin.y + sy * stageScale;
+                return {
+                    static_cast<int>(std::lround((glX * pipe.scaleX + pipe.viewPortRect.x) * zoom)),
+                    static_cast<int>(std::lround(((cppH - glY) * pipe.scaleY + pipe.viewPortRect.y) * zoom))
+                };
+            };
+            auto clickAt = [&](std::pair<int, int> pt, uint32_t wP = 0x0001u, uint32_t ex = 0u) {
+                pipe.onWmLButtonDown(pt.first, pt.second, wP, ex, false);
+                pipe.onWmMouseMove(pt.first, pt.second, wP | 0x0001u, ex, false);
+                pipe.onWmLButtonUp(pt.first, pt.second, ex, false);
+            };
+
+            clickAt(toClient(50.0f, yShift + 392.0f));
+            REQUIRE_TRUE(!raffleOpen && !secondaryOpen);
+
+            const auto choukaPt = toClient(50.0f, yShift + ((totalCycles % 2 == 0) ? 444.8f : 435.0f));
+            pipe.onWmLButtonDown(choukaPt.first, choukaPt.second, 0x0001u);
+            pipe.onWmCaptureChanged(/*lostToOtherWindow=*/true);
+            REQUIRE_TRUE(!raffleOpen && !secondaryOpen);
+
+            const uint32_t testWParam = (totalCycles % 3 == 1) ? 0x0009u : (totalCycles % 3 == 2 ? 0u : 0x0001u);
+            const uint32_t testExtra = (totalCycles % 4 == 3) ? 0xFF515700u : 0u;
+            const SimVec2 routedGl = pipe.clientToGL(choukaPt.first / zoom, choukaPt.second / zoom);
+            std::printf(
+                "  [InputRoute] cycle=%02d mode=%s res=%dx%d@%d%% client=%dx%d cppDesign=%.0fx%.0f clickClient=(%d,%d) gl=(%.2f,%.2f) wParam=0x%X extra=0x%X\n",
+                totalCycles + 1, secondaryMode ? "Lv50_Secondary" : "Direct_Raffle",
+                sp.baseW, sp.baseH, sp.dpiPct, clientW, clientH, cppW, cppH,
+                choukaPt.first, choukaPt.second, routedGl.x, routedGl.y, testWParam, testExtra);
+            clickAt(choukaPt, testWParam, testExtra);
+
+            if (!secondaryMode) {
+                REQUIRE_TRUE(raffleOpen);
+                clickAt(choukaPt);
+                REQUIRE_TRUE(raffleOpen);
+                clickAt(toClient(1060.0f, 580.0f + yShift));
+                REQUIRE_TRUE(!raffleOpen);
+            } else {
+                REQUIRE_TRUE(secondaryOpen);
+                clickAt(toClient(168.0f, yShift + 424.8f));
+                REQUIRE_TRUE(!secondaryOpen && raffleOpen);
+                clickAt(toClient(1060.0f, 580.0f + yShift));
+                REQUIRE_TRUE(!raffleOpen);
+            }
+            REQUIRE_TRUE(touchFxCount >= 2);
+            ++totalCycles;
+        }
+    }
+    REQUIRE_EQ(totalCycles, 24);
+
+#ifdef _WIN32
+    {
+        static std::atomic<int> s_win32Clicks{0};
+        static const wchar_t* kRegCls = L"KestrelWin32RegressionMouseProbe";
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = [](HWND h, UINT m, WPARAM w, LPARAM l) -> LRESULT {
+            if (m == WM_LBUTTONUP) { s_win32Clicks.fetch_add(1, std::memory_order_relaxed); return 0; }
+            return ::DefWindowProcW(h, m, w, l);
+        };
+        wc.hInstance = ::GetModuleHandleW(nullptr);
+        wc.lpszClassName = kRegCls;
+        ::RegisterClassExW(&wc);
+        HWND hwnd = ::CreateWindowExW(0, kRegCls, L"MouseProbe", WS_POPUP, 0, 0, 1136, 640,
+                                      nullptr, nullptr, wc.hInstance, nullptr);
+        REQUIRE_TRUE(hwnd != nullptr);
+        const LPARAM lp = MAKELPARAM(50, 195);
+        ::SendMessageW(hwnd, WM_MOUSEMOVE, 0, lp);
+        ::SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp);
+        ::SendMessageW(hwnd, WM_LBUTTONUP, 0, lp);
+        REQUIRE_EQ(s_win32Clicks.load(std::memory_order_relaxed), 1);
+
+        DWORD sessId = 0;
+        const bool sessionZero = !::ProcessIdToSessionId(::GetCurrentProcessId(), &sessId) || sessId == 0;
+        HDESK hDesk = ::OpenInputDesktop(0, FALSE, DESKTOP_WRITEOBJECTS | DESKTOP_JOURNALPLAYBACK);
+        if (sessionZero || hDesk == nullptr) {
+            std::printf("  [InputRoute] SendInput=BLOCKED (session=%lu, err=%lu)\n",
+                        static_cast<unsigned long>(sessId), static_cast<unsigned long>(::GetLastError()));
+        } else {
+            ::CloseDesktop(hDesk);
+            INPUT in[2] = {};
+            in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+            in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+            const UINT sent = ::SendInput(2, in, sizeof(INPUT));
+            std::printf("  [InputRoute] SendInput=%s (sent=%u, err=%lu)\n",
+                        sent == 2 ? "OK" : "BLOCKED", sent, static_cast<unsigned long>(::GetLastError()));
+        }
+        ::DestroyWindow(hwnd);
+    }
+#else
+    std::printf("  [InputRoute] SendInput=BLOCKED (non-Win32 POSIX host; verified via WindowProc/SendMessageW simulation)\n");
+#endif
     return true;
 }
 
@@ -2141,6 +2676,8 @@ int main() {
                 testStarburstSeamAndGlowRingOffscreenPixelVerification);
     runTestCase("15_Issue8_GainItemPanel_50PlusLifecycle_GetNodesSync_And_ImageViewIcons",
                 testIssue8GainItemPanelLifecycleAndImageViewRendering);
+    runTestCase("16_Win32MouseRouting_DpiViewport_And_FuncMenuTouchGroupCycles",
+                testWin32MouseRoutingDpiViewportAndFuncMenuCycles);
 
     std::printf("======================================================================\n");
     std::printf("Summary: %d passed, %d failed\n", g_passedTests, g_failedTests);

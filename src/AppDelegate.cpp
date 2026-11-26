@@ -137,6 +137,11 @@ struct HasGetHWnd : std::false_type {};
 template <typename T>
 struct HasGetHWnd<T, std::void_t<decltype(std::declval<T*>()->getHWnd())>> : std::true_type {};
 
+template <typename T, typename = void>
+struct HasGetFrameZoomFactor : std::false_type {};
+template <typename T>
+struct HasGetFrameZoomFactor<T, std::void_t<decltype(std::declval<T*>()->getFrameZoomFactor())>> : std::true_type {};
+
 template <typename T>
 bool isEglViewZeroOrMinimized(T* eglView) {
     if (!eglView) {
@@ -173,6 +178,43 @@ void ensureNonZeroEglFrameSize(T* eglView, int fallbackW, int fallbackH) {
     if (!eglView) {
         return;
     }
+    float zoom = 1.0f;
+    if constexpr (HasGetFrameZoomFactor<T>::value) {
+        const float rawZoom = eglView->getFrameZoomFactor();
+        if (std::isfinite(rawZoom) && rawZoom > 0.0f) {
+            zoom = rawZoom;
+        }
+    }
+#ifdef _WIN32
+    // Synchronize m_obScreenSize to the actual Win32 client rect (divided by m_fFrameZoomFactor)
+    // whenever SetWindowPos clamped an oversized window (e.g. 1920x1080 + caption on a 1080p monitor)
+    // so glViewport and Win32 mouse Y-flip (m_obScreenSize.height - pt.y) never drift!
+    if constexpr (HasGetHWnd<T>::value && HasGetFrameSize<T>::value) {
+        HWND hwnd = eglView->getHWnd();
+        if (hwnd != nullptr && ::IsWindow(hwnd) && !::IsIconic(hwnd)) {
+            RECT rc{};
+            if (::GetClientRect(hwnd, &rc)) {
+                const int clientW = rc.right - rc.left;
+                const int clientH = rc.bottom - rc.top;
+                if (clientW > 0 && clientH > 0) {
+                    const float actualFrameW = static_cast<float>(clientW) / zoom;
+                    const float actualFrameH = static_cast<float>(clientH) / zoom;
+                    const cocos2d::CCSize curSz = eglView->getFrameSize();
+                    if (!std::isfinite(curSz.width) || !std::isfinite(curSz.height) ||
+                        std::fabs(curSz.width - actualFrameW) > 0.5f ||
+                        std::fabs(curSz.height - actualFrameH) > 0.5f) {
+                        if constexpr (std::is_base_of_v<cocos2d::CCEGLViewProtocol, T>) {
+                            eglView->cocos2d::CCEGLViewProtocol::setFrameSize(actualFrameW, actualFrameH);
+                        } else {
+                            eglView->setFrameSize(actualFrameW, actualFrameH);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+#endif
     if constexpr (HasGetFrameSize<T>::value) {
         const cocos2d::CCSize frameSz = eglView->getFrameSize();
         if (frameSz.width < 1.0f || frameSz.height < 1.0f ||
@@ -394,6 +436,10 @@ static int gclientLuaLoader(lua_State* L) {
 // ----------------------------------------------------------------------------
 // AppDelegate lifecycle
 // ----------------------------------------------------------------------------
+bool AppDelegate::hasActiveInstance() noexcept {
+    return g_activeAppInstance.load(std::memory_order_acquire) != nullptr;
+}
+
 bool AppDelegate::isLifecycleReady() noexcept {
     AppDelegate* inst = g_activeAppInstance.load(std::memory_order_acquire);
     return inst != nullptr && inst->isReady();
