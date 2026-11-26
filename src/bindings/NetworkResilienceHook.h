@@ -1044,6 +1044,484 @@ do
     end
   end
 
+  local function _normalizeVngPlatform(pl)
+    if pl == "vngios" then
+      return "vngios"
+    end
+    if pl == nil or pl == "" or pl == "android" or pl == "vnsg2" or pl == "android_vnsg2" or pl == "win32" then
+      return "vngandroid"
+    end
+    return pl
+  end
+
+  local function _normalizeUserDataTarget(ud)
+    if type(ud) ~= "table" and type(ud) ~= "userdata" then return end
+    pcall(function()
+      local cur = ud.platform
+      if cur == nil or cur == "" or cur == "android" or cur == "vnsg2" or cur == "android_vnsg2" or cur == "win32" then
+        ud.platform = "vngandroid"
+      end
+    end)
+  end
+
+  local function _patchUserDataModule(udMod)
+    if type(udMod) ~= "table" then return end
+    if rawget(udMod, "_patchedGClientVngUserData") then return end
+    rawset(udMod, "_patchedGClientVngUserData", true)
+    if rawget(udMod, "platform") == nil or rawget(udMod, "platform") == "" or rawget(udMod, "platform") == "android" then
+      rawset(udMod, "platform", "vngandroid")
+    end
+    for _, fnName in ipairs({ "ctor", "parseData", "onUpdateUser" }) do
+      local origFn = rawget(udMod, fnName)
+      if type(origFn) == "function" then
+        udMod[fnName] = function(self, ...)
+          local r1, r2, r3 = origFn(self, ...)
+          _normalizeUserDataTarget(self)
+          return r1, r2, r3
+        end
+      end
+    end
+  end
+
+  local function _getPayPairCandidates(numId)
+    if numId >= 1600 and numId <= 1699 then
+      return { numId + 100 }
+    elseif numId >= 1700 and numId <= 1799 then
+      return { numId - 100 }
+    elseif numId >= 1800 and numId <= 1899 then
+      return { numId + 100 }
+    elseif numId >= 1900 and numId <= 1999 then
+      return { numId - 100 }
+    elseif numId >= 1001 and numId <= 1099 then
+      return { numId + 100, numId + 200 }
+    elseif numId >= 1201 and numId <= 1299 then
+      return { numId - 100, numId - 200 }
+    elseif numId >= 1101 and numId <= 1199 then
+      return { numId - 100, numId + 100 }
+    end
+    return {}
+  end
+
+  local function _probePayReaderRaw(self, origFn, candidateId, ...)
+    if type(origFn) ~= "function" then return nil end
+    local loggerTbl = rawget(_G, "Logger")
+    local origFatal = type(loggerTbl) == "table" and loggerTbl.showFatal or nil
+    if type(loggerTbl) == "table" and type(origFatal) == "function" then
+      loggerTbl.showFatal = function() end
+    end
+    local ok, row = pcall(origFn, self, candidateId, ...)
+    if type(loggerTbl) == "table" and origFatal ~= nil then
+      loggerTbl.showFatal = origFatal
+    end
+    if ok and type(row) == "table" then
+      return row
+    end
+    return nil
+  end
+
+  local _wrappedPayGetRowFns = setmetatable({}, { __mode = "k" })
+
+  local function _makeSafePayGetRowById(origFn)
+    if type(origFn) == "function" and _wrappedPayGetRowFns[origFn] then
+      return origFn
+    end
+    local wrapped
+    wrapped = function(self, id, ...)
+      if id == nil then
+        return nil
+      end
+      local numId = tonumber(id)
+      if numId == nil then
+        return nil
+      end
+      if numId <= 0 then
+        return _probePayReaderRaw(self, origFn, numId, ...)
+      end
+      local row = _probePayReaderRaw(self, origFn, numId, ...)
+      if type(row) == "table" then
+        return row
+      end
+      local cands = _getPayPairCandidates(numId)
+      for i = 1, #cands do
+        local altRow = _probePayReaderRaw(self, origFn, cands[i], ...)
+        if type(altRow) == "table" then
+          return altRow
+        end
+      end
+      return {
+        id = numId,
+        is_open = 1,
+        recharge_type = 5,
+        consume_money = 0,
+        currency_name = "VND",
+        title = "Gift",
+        des = "",
+        vip_exp = 0,
+      }
+    end
+    _wrappedPayGetRowFns[wrapped] = origFn or true
+    return wrapped
+  end
+
+  local function _patchPayReaderTarget(prTbl)
+    if type(prTbl) ~= "table" then return end
+    local curFn = prTbl.getRowById
+    if type(curFn) == "function" and _wrappedPayGetRowFns[curFn] then
+      return
+    end
+    prTbl.getRowById = _makeSafePayGetRowById(curFn)
+  end
+)LUA",
+        R"LUA(
+  local function _plainLuaCopy(val, depth)
+    local d = depth or 0
+    if d > 6 then return nil end
+    local vt = type(val)
+    if vt == "number" or vt == "string" or vt == "boolean" or vt == "nil" then
+      return val
+    end
+    if vt ~= "table" then
+      return nil
+    end
+    local out = {}
+    for k, v in pairs(val) do
+      local kt = type(k)
+      if (kt == "string" or kt == "number") and k ~= "_class" and k ~= "super" then
+        local cv = _plainLuaCopy(v, d + 1)
+        if cv ~= nil then
+          out[k] = cv
+        end
+      end
+    end
+    return out
+  end
+
+  local function _extractPlainPayRow(rawRow)
+    if type(rawRow) ~= "table" then return nil end
+    return {
+      id = tonumber(rawRow.id) or rawRow.id,
+      recharge_type = tonumber(rawRow.recharge_type) or rawRow.recharge_type,
+      consume_money = tonumber(rawRow.consume_money) or rawRow.consume_money,
+      Stall = tonumber(rawRow.Stall) or rawRow.Stall,
+      days = tonumber(rawRow.days) or rawRow.days,
+      vip_exp = tonumber(rawRow.vip_exp) or rawRow.vip_exp,
+      base_reward = _plainLuaCopy(rawRow.base_reward, 0),
+      first_reward = _plainLuaCopy(rawRow.first_reward, 0),
+      general_reward = _plainLuaCopy(rawRow.general_reward, 0),
+      daily_reward = _plainLuaCopy(rawRow.daily_reward, 0),
+    }
+  end
+
+  local function _miniJsonDecode(str)
+    if type(str) ~= "string" or str == "" then return nil end
+    local cj = rawget(_G, "cjson") or (type(package) == "table" and package.loaded and package.loaded["cjson"])
+    if type(cj) == "table" and type(cj.decode) == "function" then
+      local ok, decoded = pcall(cj.decode, str)
+      if ok and decoded ~= nil then
+        return decoded
+      end
+    end
+    local pos = 1
+    local len = #str
+    local function skipWs()
+      while pos <= len do
+        local b = string.byte(str, pos)
+        if b == 32 or b == 9 or b == 10 or b == 13 then
+          pos = pos + 1
+        else
+          break
+        end
+      end
+    end
+    local parseVal
+    local function parseStr()
+      if string.byte(str, pos) ~= 34 then return nil end
+      pos = pos + 1
+      local parts = {}
+      while pos <= len do
+        local b = string.byte(str, pos)
+        pos = pos + 1
+        if b == 34 then
+          return table.concat(parts)
+        elseif b == 92 and pos <= len then
+          local eb = string.byte(str, pos)
+          local esc = string.sub(str, pos, pos)
+          pos = pos + 1
+          if eb == 34 or eb == 92 or eb == 47 then parts[#parts + 1] = esc
+          elseif eb == 110 then parts[#parts + 1] = string.char(10)
+          elseif eb == 114 then parts[#parts + 1] = string.char(13)
+          elseif eb == 116 then parts[#parts + 1] = string.char(9)
+          else parts[#parts + 1] = esc end
+        else
+          parts[#parts + 1] = string.char(b)
+        end
+      end
+      return nil
+    end
+    local function parseArr()
+      pos = pos + 1
+      local arr = {}
+      skipWs()
+      if string.sub(str, pos, pos) == "]" then pos = pos + 1; return arr end
+      while pos <= len do
+        local v = parseVal()
+        arr[#arr + 1] = v
+        skipWs()
+        local sep = string.sub(str, pos, pos)
+        if sep == "]" then pos = pos + 1; return arr end
+        if sep ~= "," then return arr end
+        pos = pos + 1
+      end
+      return arr
+    end
+    local function parseObj()
+      pos = pos + 1
+      local obj = {}
+      skipWs()
+      if string.sub(str, pos, pos) == "}" then pos = pos + 1; return obj end
+      while pos <= len do
+        skipWs()
+        local k = parseStr()
+        if k == nil then return obj end
+        skipWs()
+        if string.sub(str, pos, pos) ~= ":" then return obj end
+        pos = pos + 1
+        obj[k] = parseVal()
+        skipWs()
+        local sep = string.sub(str, pos, pos)
+        if sep == "}" then pos = pos + 1; return obj end
+        if sep ~= "," then return obj end
+        pos = pos + 1
+      end
+      return obj
+    end
+    parseVal = function()
+      skipWs()
+      local c = string.sub(str, pos, pos)
+      if c == '"' then return parseStr()
+      elseif c == "{" then return parseObj()
+      elseif c == "[" then return parseArr()
+      elseif string.sub(str, pos, pos + 3) == "true" then pos = pos + 4; return true
+      elseif string.sub(str, pos, pos + 4) == "false" then pos = pos + 5; return false
+      elseif string.sub(str, pos, pos + 3) == "null" then pos = pos + 4; return nil
+      else
+        local sIdx, eIdx = string.find(str, "^[+-]?%d+%.?%d*[eE]?[+-]?%d*", pos)
+        if sIdx then
+          local numStr = string.sub(str, sIdx, eIdx)
+          pos = eIdx + 1
+          return tonumber(numStr)
+        end
+      end
+      return nil
+    end
+    local okP, out = pcall(parseVal)
+    if okP then return out end
+    return nil
+  end
+)LUA",
+        R"LUA(
+  local _inInstantBuyDispatch = false
+
+  local function _dispatchInstantBuy(payId, payPrice, payType, productName, currencyName, productDesc, extraData)
+    local buyType = tonumber(type(extraData) == "table" and extraData[1]) or 0
+    local itemId = tonumber(type(extraData) == "table" and extraData[2]) or 0
+    local gTbl = rawget(_G, "g")
+
+    local isTM = false
+    if (type(gTbl) == "table" and gTbl.isTM) or rawget(_G, "IS_IN_TM")
+      or buyType == 23 or buyType == 26 or buyType == 27 or buyType == 31 then
+      isTM = true
+    end
+
+    local net = nil
+    if type(gTbl) == "table" then
+      if isTM and type(gTbl.network_TM) == "table" then
+        net = gTbl.network_TM
+      elseif type(gTbl.network) == "table" then
+        net = gTbl.network
+      elseif type(gTbl.network_TM) == "table" then
+        net = gTbl.network_TM
+      end
+    end
+
+    if type(net) ~= "table" or type(net.sendMsg) ~= "function" then
+      return false
+    end
+
+    local method = isTM and "tmPay.instantBuy" or "pay.instantBuy"
+
+    local payRow = nil
+    local numPayId = tonumber(payId)
+    if numPayId ~= nil and type(gTbl) == "table" then
+      local okRow, rawRow = pcall(function()
+        local dm = gTbl.databaseManager
+        if type(dm) == "table" and dm.payReader and type(dm.payReader.getRowById) == "function" then
+          return dm.payReader:getRowById(numPayId)
+        end
+        local dmTm = gTbl.databaseManager_TM
+        if type(dmTm) == "table" and dmTm.payReader and type(dmTm.payReader.getRowById) == "function" then
+          return dmTm.payReader:getRowById(numPayId)
+        end
+        return nil
+      end)
+      if okRow and type(rawRow) == "table" then
+        payRow = _extractPlainPayRow(rawRow)
+      end
+    end
+
+    local plainExtra = type(extraData) == "table" and _plainLuaCopy(extraData, 0) or extraData
+    local payload = {
+      pay_id = tonumber(payId) or 0,
+      pay_id_str = tostring(payId or ""),
+      pay_price = tonumber(payPrice) or 0,
+      pay_type = tostring(payType or "00"),
+      product_name = tostring(productName or ""),
+      extra_data = plainExtra,
+      buy_type = buyType,
+      item_id = itemId,
+      pay_row = payRow,
+    }
+
+    local function rpcCallback(ret)
+      if type(ret) == "table" and ret.show_gain_popup == true and type(ret.reward) == "table" and #ret.reward > 0 then
+        pcall(function()
+          local gt = rawget(_G, "g")
+          if type(gt) ~= "table" then return end
+          local panelName = "gainItemListInfoPanel"
+          if isTM and type(gt.panelNameConst_TM) == "table" and gt.panelNameConst_TM.gainItemListInfoPanel then
+            panelName = gt.panelNameConst_TM.gainItemListInfoPanel
+          elseif type(gt.panelNameConst) == "table" and gt.panelNameConst.gainItemListInfoPanel then
+            panelName = gt.panelNameConst.gainItemListInfoPanel
+          end
+          local opened = false
+          if type(gt.moduleManager) == "table" and type(gt.moduleManager.open) == "function" then
+            local okOpen, resOpen = pcall(gt.moduleManager.open, panelName, ret.reward)
+            if okOpen and resOpen ~= false then
+              opened = true
+            end
+          end
+          if not opened then
+            local rList = (isTM and gt.rewardListInfoManager_TM) or gt.rewardListInfoManager
+            if type(rList) == "table" and type(rList.showInfo) == "function" then
+              pcall(rList.showInfo, rList, ret.reward)
+            elseif type(gt.tipsManager) == "table" and type(gt.tipsManager.showTextTips) == "function" then
+              pcall(gt.tipsManager.showTextTips, gt.tipsManager, tostring(ret.msg or "OK"))
+            elseif type(gt.alertSuspend) == "table" and type(gt.alertSuspend.showAlert) == "function" then
+              pcall(gt.alertSuspend.showAlert, gt.alertSuspend, tostring(ret.msg or "OK"))
+            end
+          end
+        end)
+      end
+    end
+
+    _inInstantBuyDispatch = true
+    local okSend = pcall(net.sendMsg, net, method, rpcCallback, payload)
+    _inInstantBuyDispatch = false
+    return okSend
+  end
+
+  local _wrappedSdkGetPlFns = setmetatable({}, { __mode = "k" })
+  local _wrappedSdkPayFns = setmetatable({}, { __mode = "k" })
+  local _wrappedPlatformPayFns = setmetatable({}, { __mode = "k" })
+
+  local function _patchSDKUtilTable(sdkTbl)
+    if type(sdkTbl) ~= "table" then return end
+    local curGetPl = rawget(sdkTbl, "getPL")
+    if not (type(curGetPl) == "function" and _wrappedSdkGetPlFns[curGetPl]) then
+      local origGetPl = curGetPl
+      local wrappedGetPl = function(...)
+        local rawPl = nil
+        if type(origGetPl) == "function" then
+          local ok, res = pcall(origGetPl, ...)
+          if ok then rawPl = res end
+        else
+          local plat = rawget(_G, "Platform")
+          if type(plat) == "table" and type(plat.getPL) == "function" then
+            local ok, res = pcall(plat.getPL, plat)
+            if ok then rawPl = res end
+          end
+        end
+        return _normalizeVngPlatform(rawPl)
+      end
+      _wrappedSdkGetPlFns[wrappedGetPl] = origGetPl or true
+      sdkTbl.getPL = wrappedGetPl
+    end
+
+    local curPay = rawget(sdkTbl, "pay")
+    if not (type(curPay) == "function" and _wrappedSdkPayFns[curPay]) then
+      local origPay = curPay
+      local wrappedPay = function(payId, payPrice, payType, productName, currencyName, productDesc, extraData)
+        if _dispatchInstantBuy(payId, payPrice, payType, productName, currencyName, productDesc, extraData) then
+          return
+        end
+        if type(origPay) == "function" then
+          pcall(origPay, payId, payPrice, payType, productName, currencyName, productDesc, extraData)
+        end
+      end
+      _wrappedSdkPayFns[wrappedPay] = origPay or true
+      sdkTbl.pay = wrappedPay
+    end
+  end
+
+  local function _patchPlatformTable(platTbl)
+    if type(platTbl) ~= "table" then return end
+    local curPay = rawget(platTbl, "pay")
+    if type(curPay) == "function" and _wrappedPlatformPayFns[curPay] then
+      return
+    end
+    local origPlatPay = curPay
+    local wrappedPlatPay = function(a1, a2, ...)
+      local selfObj = nil
+      local jsonStr = nil
+      if type(a1) == "table" or type(a1) == "userdata" then
+        selfObj = a1
+        jsonStr = a2
+      else
+        jsonStr = a1
+      end
+      if not _inInstantBuyDispatch and type(jsonStr) == "string" and jsonStr ~= "" then
+        local parsed = _miniJsonDecode(jsonStr)
+        if type(parsed) == "table" then
+          local pId = parsed.pay_id or parsed.ProductId or parsed.product_id or parsed.payId or parsed.productId
+          local pPrice = parsed.pay_price or parsed.ProductPrice or parsed.product_price or parsed.price or parsed.payPrice
+          local pType = parsed.pay_type or parsed.PayType or parsed.payType or "00"
+          local pName = parsed.product_name or parsed.ProductName or parsed.productName or ""
+          local cName = parsed.currency_name or parsed.CurrencyName or parsed.currencyName or "VND"
+          local pDesc = parsed.product_desc or parsed.ProductDesc or parsed.productDesc or ""
+          local ex = parsed.extra_data
+          if ex == nil then ex = parsed.ExtraData end
+          if ex == nil then ex = parsed.extraData end
+          if ex == nil then ex = parsed.private_data end
+          if type(ex) == "string" and ex ~= "" then
+            local decEx = _miniJsonDecode(ex)
+            if decEx ~= nil then
+              ex = decEx
+            elseif string.find(ex, "_", 1, true) then
+              local parts = {}
+              for tok in string.gmatch(ex, "[^_]+") do
+                parts[#parts + 1] = tonumber(tok) or tok
+              end
+              if #parts > 0 then ex = parts end
+            end
+          end
+          _dispatchInstantBuy(pId, pPrice, pType, pName, cName, pDesc, ex)
+        end
+      end
+      if type(origPlatPay) == "function" then
+        if selfObj ~= nil then
+          return origPlatPay(selfObj, jsonStr, ...)
+        else
+          return origPlatPay(a1, a2, ...)
+        end
+      end
+    end
+    _wrappedPlatformPayFns[wrappedPlatPay] = origPlatPay or true
+    platTbl.pay = wrappedPlatPay
+  end
+)LUA",
+        R"LUA(
+  local _wrappedReloadFns = setmetatable({}, { __mode = "k" })
+
   local function _normModName(name)
     if type(name) ~= "string" then return "" end
     local s = string.gsub(name, "\\", "/")
@@ -1054,34 +1532,110 @@ do
     return s
   end
 
-  local function _inspectModule(modName, modVal)
-    if type(modVal) ~= "table" then return end
-    local norm = _normModName(modName)
-    if norm == "system.Network" then
-      _patchNetworkModule(modVal, true)
-    elseif norm == "core.BindableData" then
-      _patchBindableClass(modVal)
-    elseif norm == "core.BaseProxy" or norm == "core.BaseProxy_TM" then
-      _patchBaseProxyModule(modVal)
-    elseif string.find(norm, "Network$", 1) and norm ~= "system.NetworkUtil" then
-      if type(rawget(modVal, "onBodyData")) == "function" and type(rawget(modVal, "sendMsg")) == "function" then
-        _patchNetworkModule(modVal, false)
+  local _sweepLoaded
+
+  local function _syncRuntimeGlobals()
+    local gTbl = rawget(_G, "g")
+    if type(gTbl) == "table" then
+      if type(gTbl.network) == "table" and type(gTbl.network.onBodyData) == "function" then
+        _patchNetworkTarget(gTbl.network, true)
       end
-    else
-      local sup = rawget(modVal, "super")
-      local depth = 0
-      while type(sup) == "table" and depth < 8 do
-        if rawget(sup, "_patchedGClientBindableResilience") or (type(sup.toString) == "function" and sup:toString() == "BindableData") then
-          _patchBindableClass(modVal)
-          break
+      if type(gTbl.network_TM) == "table" and type(gTbl.network_TM.onBodyData) == "function" then
+        _patchNetworkTarget(gTbl.network_TM, false)
+      end
+      if type(gTbl.SDKUtil) == "table" then
+        _patchSDKUtilTable(gTbl.SDKUtil)
+      end
+      if type(gTbl.databaseManager) == "table" and type(gTbl.databaseManager.payReader) == "table" then
+        _patchPayReaderTarget(gTbl.databaseManager.payReader)
+      end
+      if type(gTbl.databaseManager_TM) == "table" and type(gTbl.databaseManager_TM.payReader) == "table" then
+        _patchPayReaderTarget(gTbl.databaseManager_TM.payReader)
+      end
+      if type(gTbl.mainData) == "table" and gTbl.mainData.userdata ~= nil then
+        _normalizeUserDataTarget(gTbl.mainData.userdata)
+      end
+      if type(gTbl.mainData_TM) == "table" and gTbl.mainData_TM.userdata ~= nil then
+        _normalizeUserDataTarget(gTbl.mainData_TM.userdata)
+      end
+    end
+
+    local uTbl = rawget(_G, "utils")
+    if type(uTbl) == "table" and type(uTbl.SDKUtil) == "table" then
+      _patchSDKUtilTable(uTbl.SDKUtil)
+    end
+
+    local plat = rawget(_G, "Platform")
+    if type(plat) == "table" then
+      _patchPlatformTable(plat)
+      local mt = getmetatable(plat)
+      if type(mt) == "table" and mt ~= plat then
+        _patchPlatformTable(mt)
+      end
+      if type(plat.getInstance) == "function" then
+        local okI, inst = pcall(plat.getInstance, plat)
+        if okI and type(inst) == "table" and inst ~= plat then
+          _patchPlatformTable(inst)
         end
-        sup = rawget(sup, "super")
-        depth = depth + 1
       end
+    elseif type(plat) == "userdata" and type(debug) == "table" and type(debug.getmetatable) == "function" then
+      local mt = debug.getmetatable(plat)
+      if type(mt) == "table" then
+        _patchPlatformTable(mt)
+      end
+    end
+
+    local curReload = rawget(_G, "reload")
+    if type(curReload) == "function" and not _wrappedReloadFns[curReload] then
+      local origReload = curReload
+      local wrappedReload = function(...)
+        local r1, r2 = origReload(...)
+        if type(_sweepLoaded) == "function" then
+          pcall(_sweepLoaded)
+        end
+        return r1, r2
+      end
+      _wrappedReloadFns[wrappedReload] = origReload
+      _G.reload = wrappedReload
     end
   end
 
-  local function _sweepLoaded()
+  local function _inspectModule(modName, modVal)
+    if type(modVal) == "table" then
+      local norm = _normModName(modName)
+      if norm == "system.Network" then
+        _patchNetworkModule(modVal, true)
+      elseif norm == "core.BindableData" then
+        _patchBindableClass(modVal)
+      elseif norm == "core.BaseProxy" or norm == "core.BaseProxy_TM" then
+        _patchBaseProxyModule(modVal)
+      elseif norm == "utils.SDKUtil" then
+        _patchSDKUtilTable(modVal)
+      elseif norm == "game.dbReader.PayReader" then
+        _patchPayReaderTarget(modVal)
+      elseif norm == "game.gamedata.UserData" or norm == "game.game_TM.gamedata_TM.UserData" then
+        _patchUserDataModule(modVal)
+      elseif string.find(norm, "Network$", 1) and norm ~= "system.NetworkUtil" then
+        if type(rawget(modVal, "onBodyData")) == "function" and type(rawget(modVal, "sendMsg")) == "function" then
+          _patchNetworkModule(modVal, false)
+        end
+      else
+        local sup = rawget(modVal, "super")
+        local depth = 0
+        while type(sup) == "table" and depth < 8 do
+          if rawget(sup, "_patchedGClientBindableResilience") or (type(sup.toString) == "function" and sup:toString() == "BindableData") then
+            _patchBindableClass(modVal)
+            break
+          end
+          sup = rawget(sup, "super")
+          depth = depth + 1
+        end
+      end
+    end
+    _syncRuntimeGlobals()
+  end
+
+  _sweepLoaded = function()
     if type(package) == "table" and type(package.loaded) == "table" then
       local bd = package.loaded["core.BindableData"] or package.loaded["core/BindableData"]
         or package.loaded["scripts/core/BindableData"] or package.loaded["scripts.core.BindableData"]
@@ -1094,9 +1648,7 @@ do
         end
       end
     end
-    if g and type(g.network) == "table" then
-      _patchNetworkTarget(g.network, true)
-    end
+    _syncRuntimeGlobals()
   end
 
   _G.__gclient_apply_net_resilience_sweep = _sweepLoaded
@@ -1105,9 +1657,7 @@ do
   if type(origRequire) == "function" then
     _G.require = function(modName, ...)
       local res = origRequire(modName, ...)
-      if type(res) == "table" then
-        _inspectModule(modName, res)
-      end
+      _inspectModule(modName, res)
       return res
     end
   end
@@ -1118,7 +1668,7 @@ end
     };
 
     std::string fullScript;
-    fullScript.reserve(24576);
+    fullScript.reserve(65536);
     for (const char* chunk : kLuaChunks) {
         if (chunk != nullptr) {
             fullScript.append(chunk);

@@ -84,7 +84,7 @@ def resolve_cobalt_relay(
             "COBALT_RELAY_GIT_URL", "https://github.com/v0ntr3n/cobalt-relay.git"
         )
         clone_dir = temp_root / "cobalt-relay-ci"
-        preferred_ref = os.environ.get("COBALT_RELAY_GIT_REF", "fix/all-modes-rpc-and-gameplay")
+        preferred_ref = os.environ.get("COBALT_RELAY_GIT_REF", "feat/active-events-and-instant-buy")
         print(f"[orchestrator] Attempting ephemeral clone of {clone_url} (ref={preferred_ref}) ...", flush=True)
         res = subprocess.run(
             ["git", "clone", "--depth", "1", "--branch", preferred_ref, clone_url, str(clone_dir)],

@@ -2,7 +2,12 @@
 #include "platform/AccountAuthProvider.h"
 #include "assets/BtDecryptHook.h"
 
+#if __has_include(<curl/curl.h>)
+#define GCLIENT_HAS_LIBCURL 1
 #include <curl/curl.h>
+#else
+#define GCLIENT_HAS_LIBCURL 0
+#endif
 
 #include <algorithm>
 #include <array>
@@ -442,18 +447,22 @@ std::string jsonEscape(const std::string& s) {
     return out;
 }
 
+#if GCLIENT_HAS_LIBCURL
 size_t curlWriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
     const size_t total = size * nmemb;
     auto* response = static_cast<std::string*>(userp);
     response->append(static_cast<const char*>(contents), total);
     return total;
 }
+#endif
 
 void ensureCurlGlobalInit() {
+#if GCLIENT_HAS_LIBCURL
     static std::once_flag onceFlag;
     std::call_once(onceFlag, []() {
         curl_global_init(CURL_GLOBAL_DEFAULT);
     });
+#endif
 }
 
 #ifdef _WIN32
@@ -496,7 +505,7 @@ constexpr int kInternalRetryInteractiveLoginEventId = -1001;
 // Table-driven capability shim for dropped Android/iOS SDK calls
 // ---------------------------------------------------------------------------
 const std::array<CapabilityShimEntry, 26> kCapabilityShimTable = {{
-    {"pay",                       "billing",  true,  kPay,              kHttpFailed,  "{\"code\":-1,\"msg\":\"Win32: in-app billing unsupported\"}"},
+    {"pay",                       "billing",  true,  kPay,              kHttpSuccess, "{\"errornu\":\"0\",\"errordesc\":\"ok\"}"},
     {"issueDJOrders",             "billing",  true,  kIssueDJOrders,    kHttpFailed,  "{\"code\":-1,\"msg\":\"Win32: DJ orders unsupported\"}"},
     {"shareWeixin",               "social",   true,  kShareBack,        kHttpFailed,  "{\"code\":-1,\"msg\":\"Win32: WeChat sharing unsupported\"}"},
     {"playVideo",                 "media",    true,  kPlayFinish,       kHttpSuccess, "{\"code\":0,\"msg\":\"Win32: video playback skipped\"}"},
@@ -1504,6 +1513,7 @@ static std::string getSdkCookieJarPath() {
     return "sdk_cookies.txt";
 }
 
+#if GCLIENT_HAS_LIBCURL
 static void configureSharedCurlTls(CURL* curl) {
     if (!curl) return;
 #ifdef CURLSSLOPT_NATIVE_CA
@@ -1586,6 +1596,19 @@ static bool performSharedHttpGet(const std::string& url,
     outErr = (errBuf[0] != '\0') ? errBuf : curl_easy_strerror(res);
     return false;
 }
+#else
+static bool performSharedHttpGet(const std::string& /*url*/,
+                                 std::string& outBody,
+                                 long& outHttpCode,
+                                 std::string& outErr) {
+    (void)getSdkCookieJarPath;
+    (void)isTruthyPlatformEnv;
+    outBody.clear();
+    outHttpCode = 0;
+    outErr = "libcurl headers unavailable in standalone test build";
+    return false;
+}
+#endif
 
 void Platform::sendHTTPRequest(int eventId, const std::string& url, bool shouldSign) {
     const std::string finalUrl = shouldSign ? signUrl(url) : url;
