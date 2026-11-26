@@ -17,7 +17,7 @@
 #include <vector>
 
 #if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
-#include "cocos2d.h"
+#include "compat/Axmol226Compat.h"
 #include "cocos-ext.h"
 #endif
 
@@ -63,6 +63,28 @@ void LogArmatureWarn(const char* msg) {
     std::fprintf(stderr, "[XmlbArmatureLoader][WARN] %s\n", msg ? msg : "");
 #endif
 }
+
+
+#if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
+ax::backend::BlendFactor GlBlendToAxFactor(uint32_t glEnum) {
+    switch (glEnum) {
+        case 0u:      return ax::backend::BlendFactor::ZERO;
+        case 1u:      return ax::backend::BlendFactor::ONE;
+        case 0x0300u: return ax::backend::BlendFactor::SRC_COLOR;
+        case 0x0301u: return ax::backend::BlendFactor::ONE_MINUS_SRC_COLOR;
+        case 0x0302u: return ax::backend::BlendFactor::SRC_ALPHA;
+        case 0x0303u: return ax::backend::BlendFactor::ONE_MINUS_SRC_ALPHA;
+        case 0x0304u: return ax::backend::BlendFactor::DST_ALPHA;
+        case 0x0305u: return ax::backend::BlendFactor::ONE_MINUS_DST_ALPHA;
+        case 0x0306u: return ax::backend::BlendFactor::DST_COLOR;
+        case 0x0307u: return ax::backend::BlendFactor::ONE_MINUS_DST_COLOR;
+        default:      return ax::backend::BlendFactor::ONE;
+    }
+}
+ax::BlendFunc MakeAxBlendFunc(uint32_t srcGl, uint32_t dstGl) {
+    return ax::BlendFunc{ GlBlendToAxFactor(srcGl), GlBlendToAxFactor(dstGl) };
+}
+#endif
 
 bool ValidateFixedCStringField(const uint8_t* ptr, size_t maxLen, bool requireNonEmpty) {
     const void* nulPos = std::memchr(ptr, '\0', maxLen);
@@ -235,27 +257,9 @@ std::string StripAssetExtension(const std::string& normalizedPath) {
 }
 
 cocos2d::ccBlendFunc MapBitCacheBlendType(uint8_t rawBlend) {
-    switch (rawBlend) {
-        case 0:
-            return { CC_BLEND_SRC, CC_BLEND_DST };
-        case 1:
-            return { CC_BLEND_SRC, GL_ONE };
-        case 2:
-            return { GL_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA };
-        case 3:
-            return { GL_ONE, GL_ONE_MINUS_SRC_COLOR };
-        default:
-            break;
-    }
-
-    switch (static_cast<cocos2d::extension::CCBlendType>(rawBlend)) {
-        case cocos2d::extension::BLEND_ADD:
-            return { CC_BLEND_SRC, GL_ONE };
-        case cocos2d::extension::BLEND_SCREEN:
-            return { GL_ONE, GL_ONE_MINUS_SRC_COLOR };
-        default:
-            return { CC_BLEND_SRC, CC_BLEND_DST };
-    }
+    uint32_t s = 1u, d = 0x0303u;
+    XmlbArmatureLoader::MapBlendTypeToGL(rawBlend, &s, &d);
+    return MakeAxBlendFunc(s, d);
 }
 
 bool IsValidNonEmptyXmlPlist(const std::string& candidatePath) {
@@ -266,7 +270,7 @@ bool IsValidNonEmptyXmlPlist(const std::string& candidatePath) {
         candidatePath.compare(candidatePath.size() - 7, 7, ".plistb") == 0) {
         return false;
     }
-    auto* fu = cocos2d::CCFileUtils::sharedFileUtils();
+    auto* fu = ax::FileUtils::getInstance();
     if (!fu) {
         return false;
     }
@@ -289,7 +293,7 @@ bool DoesAnyFileExist(const std::string& candidatePath) {
     if (candidatePath.empty()) {
         return false;
     }
-    auto* fu = cocos2d::CCFileUtils::sharedFileUtils();
+    auto* fu = ax::FileUtils::getInstance();
     if (!fu) {
         return false;
     }
@@ -321,7 +325,7 @@ cocos2d::CCTexture2D* LoadExplicitTextureWithFallback(const std::string& imagePa
     if (imagePath.empty()) {
         return nullptr;
     }
-    auto* texCache = cocos2d::CCTextureCache::sharedTextureCache();
+    auto* texCache = ax::Director::getInstance()->getTextureCache();
     if (!texCache) {
         return nullptr;
     }
@@ -336,7 +340,7 @@ cocos2d::CCTexture2D* LoadExplicitTextureWithFallback(const std::string& imagePa
         }
     }
 
-    auto* fu = cocos2d::CCFileUtils::sharedFileUtils();
+    auto* fu = ax::FileUtils::getInstance();
     if (fu) {
         for (const std::string& base : basePaths) {
             const std::vector<std::string> cands = PlistbLoader::BuildTextureCandidatePaths(base);
@@ -386,7 +390,7 @@ bool TryLoadSpriteSheetCandidate(const std::string& sheetPath,
             : normSheet;
 
     if (IsValidNonEmptyXmlPlist(xmlPlistPath)) {
-        if (auto* sfc = cocos2d::CCSpriteFrameCache::sharedSpriteFrameCache()) {
+        if (auto* sfc = ax::SpriteFrameCache::getInstance()) {
             if (explicitTex) {
                 sfc->addSpriteFramesWithFile(xmlPlistPath.c_str(), explicitTex);
             } else {
@@ -479,7 +483,7 @@ void SanitizeArmatureBoneParents(cocos2d::extension::CCArmatureData* armData,
             continue;
         }
 
-        if (armData->boneDataDic.objectForKey(bone->parentName) == nullptr) {
+        if (armData->boneDataDic.find(bone->parentName) == armData->boneDataDic.end()) {
             char msg[320];
             std::snprintf(msg,
                           sizeof(msg),
@@ -511,8 +515,9 @@ void SanitizeArmatureBoneParents(cocos2d::extension::CCArmatureData* armData,
                 break;
             }
             visited.insert(currParent);
-            auto* ancestor = static_cast<cocos2d::extension::CCBoneData*>(
-                armData->boneDataDic.objectForKey(currParent));
+            auto ancIt = armData->boneDataDic.find(currParent);
+            cocos2d::extension::CCBoneData* ancestor =
+                (ancIt != armData->boneDataDic.end()) ? ancIt->second : nullptr;
             if (!ancestor) {
                 break;
             }
@@ -556,16 +561,16 @@ void NormalizeMovementBoneSkew(cocos2d::extension::CCMovementBoneData* movBoneDa
     if (!movBoneData) {
         return;
     }
-    const unsigned int count = movBoneData->frameList.count();
+    const unsigned int count = static_cast<unsigned int>(movBoneData->frameList.size());
     if (count < 2) {
         return;
     }
 
     for (int i = static_cast<int>(count) - 1; i > 0; --i) {
         auto* curr = static_cast<cocos2d::extension::CCFrameData*>(
-            movBoneData->frameList.objectAtIndex(static_cast<unsigned int>(i)));
+            movBoneData->frameList.at(i));
         auto* prev = static_cast<cocos2d::extension::CCFrameData*>(
-            movBoneData->frameList.objectAtIndex(static_cast<unsigned int>(i - 1)));
+            movBoneData->frameList.at(i - 1));
         if (!curr || !prev) {
             continue;
         }
@@ -583,11 +588,11 @@ void NormalizeMovementBoneSkew(cocos2d::extension::CCMovementBoneData* movBoneDa
 }
 
 void AppendClosingFrame(cocos2d::extension::CCMovementBoneData* movBoneData) {
-    if (!movBoneData || movBoneData->frameList.count() == 0) {
+    if (!movBoneData || static_cast<unsigned int>(movBoneData->frameList.size()) == 0) {
         return;
     }
     auto* lastFrame =
-        static_cast<cocos2d::extension::CCFrameData*>(movBoneData->frameList.lastObject());
+        static_cast<cocos2d::extension::CCFrameData*>(movBoneData->frameList.back());
     if (!lastFrame) {
         return;
     }
@@ -1048,7 +1053,7 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
     const float rawContentScale = root.has_content_scale() ? root.content_scale() : 1.0f;
     const float contentScale =
         (std::isfinite(rawContentScale) && rawContentScale > 0.0f) ? rawContentScale : 1.0f;
-    auto* manager = cocos2d::extension::CCArmatureDataManager::sharedArmatureDataManager();
+    auto* manager = cocostudio::ArmatureDataManager::getInstance();
     if (!manager) {
         return false;
     }
@@ -1208,7 +1213,7 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
                 int cumulativeDuration    = 0;
                 int nextSequentialFrameId = 0;
                 bool hasStickyBlend       = false;
-                cocos2d::ccBlendFunc stickyBlend = { CC_BLEND_SRC, CC_BLEND_DST };
+                ax::BlendFunc stickyBlend = ax::BlendFunc::ALPHA_PREMULTIPLIED;
 
                 for (int f = 0; f < pbMovBone.frame_data_size(); ++f) {
                     const ArmatureFrameData& pbFrame = pbMovBone.frame_data(f);
@@ -1251,21 +1256,21 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
                         switch (static_cast<cocos2d::extension::CCBlendType>(pbFrame.bd())) {
                             case cocos2d::extension::BLEND_LAYER:
                             case cocos2d::extension::BLEND_ADD:
-                                frameData->blendFunc = { CC_BLEND_SRC, GL_ONE };
+                                frameData->blendFunc = MakeAxBlendFunc(1u, 1u);
                                 break;
                             case cocos2d::extension::BLEND_MULTIPLY:
-                                frameData->blendFunc = { GL_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA };
+                                frameData->blendFunc = MakeAxBlendFunc(0x0306u, 0x0303u);
                                 break;
                             case cocos2d::extension::BLEND_SCREEN:
-                                frameData->blendFunc = { GL_ONE, GL_ONE_MINUS_SRC_COLOR };
+                                frameData->blendFunc = MakeAxBlendFunc(1u, 0x0301u);
                                 break;
                             default:
-                                frameData->blendFunc = { CC_BLEND_SRC, CC_BLEND_DST };
+                                frameData->blendFunc = ax::BlendFunc::ALPHA_PREMULTIPLIED;
                                 break;
                         }
                         if (pbFrame.bd() != 0) { hasStickyBlend = true; stickyBlend = frameData->blendFunc; }
                     } else if (frameData->strEvent == "1") {
-                        frameData->blendFunc = { CC_BLEND_SRC, GL_ONE };
+                        frameData->blendFunc = MakeAxBlendFunc(1u, 1u);
                         hasStickyBlend = true;
                         stickyBlend = frameData->blendFunc;
                     } else if (hasStickyBlend) {
@@ -1286,7 +1291,7 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
                     frameData->release();
                 }
 
-                if (movBoneData->frameList.count() == 0) {
+                if (static_cast<unsigned int>(movBoneData->frameList.size()) == 0) {
                     movBoneData->release();
                     continue;
                 }
@@ -1345,10 +1350,8 @@ bool XmlbArmatureLoader::AddDataFromArmatureRoot(const ArmatureRoot& root,
 
             for (int v = 0; v < pbContour.vertex_size(); ++v) {
                 const ArmatureVertex& pbV = pbContour.vertex(v);
-                auto*                 vtx = new cocos2d::extension::CCContourVertex2(
+                contour->vertexList.emplace_back(
                     pbV.x() * contentScale, pbV.y() * contentScale);
-                contour->vertexList.addObject(vtx);
-                vtx->release();
             }
 
             texData->addContourData(contour);
@@ -1390,7 +1393,7 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
         return false;
     }
 
-    auto* manager = cocos2d::extension::CCArmatureDataManager::sharedArmatureDataManager();
+    auto* manager = cocostudio::ArmatureDataManager::getInstance();
     if (!manager) {
         return false;
     }
@@ -1553,7 +1556,7 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
 
                 int cumulativeFrameId = 0;
                 bool hasStickyBlend = false;
-                uint32_t stickySrc = CC_BLEND_SRC, stickyDst = CC_BLEND_DST;
+                uint32_t stickySrc = 1u, stickyDst = 0x0303u;
                 for (uint16_t f = 0; f < frameCount; ++f) {
                     if (cursor + layout.frameDataStructSize > end) {
                         movBoneData->release();
@@ -1592,10 +1595,7 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
                         static_cast<cocos2d::extension::CCTweenType>(decFrame.tweenEasing);
                     frameData->isTween        = decFrame.isTween;
                     frameData->displayIndex   = decFrame.displayIndex;
-                    frameData->blendFunc      = {
-                        static_cast<GLenum>(decFrame.blendSrc),
-                        static_cast<GLenum>(decFrame.blendDst)
-                    };
+                    frameData->blendFunc      = MakeAxBlendFunc(decFrame.blendSrc, decFrame.blendDst);
                     frameData->strEvent    = decFrame.strEvent;
                     frameData->strMovement = decFrame.strMovement;
 
@@ -1607,7 +1607,7 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
                     frameData->release();
                 }
 
-                if (movBoneData->frameList.count() == 0) {
+                if (static_cast<unsigned int>(movBoneData->frameList.size()) == 0) {
                     movBoneData->release();
                     continue;
                 }

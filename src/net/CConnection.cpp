@@ -70,8 +70,8 @@ lua_State* resolveActiveConnectionLuaState(lua_State* standaloneFallback) {
 #if defined(GCLIENT_USE_COCOS2DX)
     // Check CCScriptEngineManager rather than CCLuaEngine::defaultEngine() so late
     // shutdown never resurrects a brand-new Lua VM after purgeSharedManager()!
-    if (auto* mgr = cocos2d::CCScriptEngineManager::sharedManager()) {
-        if (auto* engine = dynamic_cast<cocos2d::CCLuaEngine*>(mgr->getScriptEngine())) {
+    if (auto* mgr = ax::ScriptEngineManager::getInstance()) {
+        if (auto* engine = dynamic_cast<ax::LuaEngine*>(mgr->getScriptEngine())) {
             if (auto* stack = engine->getLuaStack()) {
                 if (lua_State* liveL = stack->getLuaState()) {
                     return liveL;
@@ -276,7 +276,7 @@ void CConnection::removeLuaScriptHandler(int& handlerSlot) {
         return;
     }
 #if defined(GCLIENT_USE_COCOS2DX)
-    if (auto* mgr = cocos2d::CCScriptEngineManager::sharedManager()) {
+    if (auto* mgr = ax::ScriptEngineManager::getInstance()) {
         if (auto* engine = mgr->getScriptEngine()) {
             engine->removeScriptHandler(handlerSlot);
         }
@@ -707,8 +707,8 @@ uint32_t CConnection::getBodyLength(const char* headerPtr, bool& outZeroBodyOk) 
     }
 #if defined(GCLIENT_USE_COCOS2DX)
     else if (headLuaHandler_ > 0) {
-        if (auto* mgr = cocos2d::CCScriptEngineManager::sharedManager()) {
-            if (auto* engine = dynamic_cast<cocos2d::CCLuaEngine*>(mgr->getScriptEngine())) {
+        if (auto* mgr = ax::ScriptEngineManager::getInstance()) {
+            if (auto* engine = dynamic_cast<ax::LuaEngine*>(mgr->getScriptEngine())) {
                 auto* stack = engine->getLuaStack();
                 stack->pushString(headerPtr, headerSize_);
                 const int ret = stack->executeFunctionByHandler(headLuaHandler_, 1);

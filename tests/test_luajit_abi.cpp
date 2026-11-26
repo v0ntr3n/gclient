@@ -1,9 +1,10 @@
 // ============================================================================
 // tests/test_luajit_abi.cpp
-// LuaJIT 2.0.1 C API / ABI Compatibility, JIT Engine Mode, Error Unwinding,
-// Bytecode Round-Trip, CRT Hygiene, and Native AMF3 Stress Suite.
+// LuaJIT 2.1 x64 C API / ABI Compatibility, JIT Engine Mode, Error Unwinding,
+// Bytecode Round-Trip, Lua 2.2.6 Compat Shim, CRT Hygiene, and AMF3 Suite.
 // ============================================================================
 
+#include "compat/Lua226CompatShim.h"
 #include "net/Amf3Module.h"
 
 extern "C" {
@@ -90,21 +91,23 @@ bool testLuaJitVmBootJitModeAndStackAbi() {
     const int modeOk = luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
     CHECK_ABI(modeOk == 1);
 
-    // Verify jit global table exists and reports LuaJIT
+    // Verify jit global table exists and reports LuaJIT 2.1 on 64-bit targets
     lua_getglobal(L, "jit");
     CHECK_ABI(lua_istable(L, -1));
     lua_getfield(L, -1, "version");
     CHECK_ABI(lua_isstring(L, -1));
     const std::string jitVer = lua_tostring(L, -1);
-    std::printf("       Active VM: %s\n", jitVer.c_str());
+    std::printf("       Active VM: %s (sizeof(void*)=%zu)\n", jitVer.c_str(), sizeof(void*));
     CHECK_ABI(jitVer.find("LuaJIT") != std::string::npos);
-#ifdef _WIN32
-    // On Win32 x86 shipping builds, strictly enforce LuaJIT 2.0.1 (20001) contract!
+
     lua_getfield(L, -2, "version_num");
-    CHECK_ABI(lua_tointeger(L, -1) == 20001);
-    lua_pop(L, 1);
-#endif
-    lua_pop(L, 2);
+    const lua_Integer jitVerNum = lua_tointeger(L, -1);
+    if constexpr (sizeof(void*) == 8) {
+        CHECK_ABI(jitVerNum >= 20100);
+    } else {
+        CHECK_ABI(jitVerNum >= 20001);
+    }
+    lua_pop(L, 3);
 
     // Register C++ callback and execute hot JIT loop (10,000 iterations)
     lua_register(L, "c_mul_add", &nativeCallbackMultiplyAdd);
@@ -117,7 +120,6 @@ bool testLuaJitVmBootJitModeAndStackAbi() {
     CHECK_ABI(luaL_loadstring(L, jitScript) == 0);
     CHECK_ABI(lua_pcall(L, 0, 1, 0) == 0);
     const double result = lua_tonumber(L, -1);
-    // sum_{i=1..10000} (2.5 * i) = 2.5 * (10000 * 10001 / 2) = 125012500
     CHECK_ABI(std::fabs(result - 125012500.0) < 0.5);
     lua_pop(L, 1);
     CHECK_ABI(lua_gettop(L) == 0);
@@ -152,7 +154,6 @@ bool testLuaJitErrorUnwindAndBytecodeRoundTrip() {
     CHECK_ABI(lua_dump(L, &dumpWriterToVector, &bytecode) == 0);
     lua_pop(L, 1);
     CHECK_ABI(bytecode.size() > 5);
-    // LuaJIT 2.x bytecode starts with "\x1bLJ"
     CHECK_ABI(static_cast<unsigned char>(bytecode[0]) == 0x1Bu);
     CHECK_ABI(bytecode[1] == 'L' && bytecode[2] == 'J');
 
@@ -173,7 +174,6 @@ bool testAmf3NativeModuleRoundTripAndFuzzGuards() {
     luaopen_amf3_extensions(L);
     lua_settop(L, 0);
 
-    // 1. Round-trip dense arrays, strings, negative/float/huge numeric keys (AUD-28 UB fix!), and nested objects
     const char* amfScript = R"LUA(
         local amf3 = require("amf3")
         local payload = {
@@ -203,13 +203,10 @@ bool testAmf3NativeModuleRoundTripAndFuzzGuards() {
         assert(decoded.flags[3] == "repeat_str" and decoded.flags[4] == "repeat_str")
         assert(decoded.sparse["-5"] == "negative_key")
 
-        -- 2. Malformed / truncated / OOM-bomb AMF3 inputs must raise clean Lua errors via pcall without OOM or C++ UB
-        -- Array marker (0x09) + huge U29 denseCount ((0x0FFFFFFF << 1) | 1) with only 6 bytes in buffer!
         local forgedBomb = string.char(0x09, 0xFF, 0xFF, 0xFF, 0xFF, 0x01)
         local okBomb, bombErr = pcall(amf3.decode, forgedBomb)
         assert(not okBomb and type(bombErr) == "string" and string.find(bombErr, "truncated", 1, true), tostring(bombErr))
 
-        -- Truncated double (0x05 + 3 bytes instead of 8)
         local okTrunc, truncErr = pcall(amf3.decode, string.char(0x05, 0x40, 0x09, 0x21))
         assert(not okTrunc and type(truncErr) == "string", tostring(truncErr))
 
@@ -230,9 +227,111 @@ bool testAmf3NativeModuleRoundTripAndFuzzGuards() {
     return true;
 }
 
+bool testLua226CompatShimRuntimeBridges() {
+    lua_State* L = luaL_newstate();
+    CHECK_ABI(L != nullptr);
+    luaL_openlibs(L);
+
+    // Seed mock ax / axui / tolua tables to exercise the 2.2.6 compatibility bridge
+    const char* mockAxScript = R"LUA(
+        ax = {
+            Node = { setLocalZOrder = function(s, z) s._z = z end, getLocalZOrder = function(s) return s._z end },
+            Layer = {},
+            Sequence = { create = function(cls, ...) return { actions = {...} } end },
+            Spawn    = { create = function(cls, ...) return { actions = {...} } end },
+            Label    = {
+                create = function() return { kind = "empty" } end,
+                createWithBMFont = function(cls, fnt, str) return { kind = "bmf", fnt = fnt, str = str } end,
+                createWithSystemFont = function(cls, str, fnt, sz) return { kind = "sys", str = str, fnt = fnt, sz = sz } end,
+            },
+        }
+        axui = {
+            Widget = {
+                addTouchEventListener = function(self, cb) self._cb = cb end,
+            },
+            Text = {
+                setString = function(self, s) self._s = s end,
+                getString = function(self) return self._s end,
+            },
+        }
+        tolua = {
+            cast = function(obj, typeName)
+                return { casted = obj, targetType = typeName }
+            end
+        }
+    )LUA";
+    CHECK_ABI(luaL_dostring(L, mockAxScript) == 0);
+    CHECK_ABI(gclient::compat::InstallLua226CompatShim(L));
+
+    const char* verifyShimScript = R"LUA(
+        -- 1. Lua 5.1 module(..., package.seeall) & string.gfind
+        assert(type(module) == "function" and type(package.seeall) == "function")
+        assert(type(string.gfind) == "function")
+
+        -- 2. Geometry & color value tables
+        local p = ccp(12, 34)
+        local q = ccpAdd(p, CCPoint(8, 6))
+        assert(q.x == 20 and q.y == 40)
+        local sz = CCSizeMake(1136, 640)
+        assert(sz.width == 1136 and sz.height == 640)
+        local rc = CCRectMake(10, 10, 100, 50)
+        assert(CCRectContainsPoint(rc, ccp(50, 30)) == true)
+        assert(CCRectContainsPoint(rc, ccp(5, 30)) == false)
+        local col = ccc4(255, 128, 64, 200)
+        assert(col.r == 255 and col.g == 128 and col.b == 64 and col.a == 200)
+
+        -- 3. Self-contained ax.Handler constants
+        assert(ax.Handler.EVENT_TOUCH_BEGAN == 40)
+        assert(ax.Handler.EVENT_SPINE_ANIMATION_COMPLETE == 66)
+
+        -- 4. CCLabelBMFont -> ax.Label:createWithBMFont
+        local bmf = CCLabelBMFont:create("999", "res/fonts/dmg.fnt")
+        assert(bmf.kind == "bmf" and bmf.fnt == "res/fonts/dmg.fnt" and bmf.str == "999")
+
+        -- 5. CCSequence unpacking table / multi-arg actions
+        local seq = CCSequence:create({ "act1", "act2", "act3" })
+        assert(#seq.actions == 3 and seq.actions[2] == "act2")
+
+        -- 6. CCNotificationCenter post / unregister
+        local hit = 0
+        local target = {}
+        CCNotificationCenter:sharedNotificationCenter():registerScriptObserver(
+            target, function(name) if name == "EVT_WIN" then hit = hit + 1 end end, "EVT_WIN")
+        CCNotificationCenter:sharedNotificationCenter():postNotification("EVT_WIN")
+        CCNotificationCenter:sharedNotificationCenter():unregisterScriptObserver(target, "EVT_WIN")
+        CCNotificationCenter:sharedNotificationCenter():postNotification("EVT_WIN")
+        assert(hit == 1)
+
+        -- 7. 2-arg legacy Widget:addTouchEventListener(target, selector)
+        local w = setmetatable({}, { __index = axui.Widget })
+        local gotTarget, gotEvent = nil, nil
+        local uiOwner = { id = 77 }
+        w:addTouchEventListener(uiOwner, function(self, sender, ev)
+            gotTarget = self.id
+            gotEvent  = ev
+        end)
+        w._cb(w, TOUCH_EVENT_ENDED)
+        assert(gotTarget == 77 and gotEvent == 2)
+
+        return "shim_verified"
+    )LUA";
+
+    CHECK_ABI(luaL_loadstring(L, verifyShimScript) == 0);
+    if (lua_pcall(L, 0, 1, 0) != 0) {
+        std::fprintf(stderr, "[Shim Lua Error] %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return false;
+    }
+    CHECK_ABI(std::string(lua_tostring(L, -1)) == "shim_verified");
+    lua_pop(L, 1);
+    CHECK_ABI(lua_gettop(L) == 0);
+
+    lua_close(L);
+    return true;
+}
+
 bool testWin32InProcessCrtHygiene() {
 #ifdef _WIN32
-    // Verify lua51.dll is loaded in-process and ZERO legacy VS2010/VS2012/VS2013 or Debug CRTs exist!
     HMODULE hLua = ::GetModuleHandleW(L"lua51.dll");
     CHECK_ABI(hLua != nullptr);
     CHECK_ABI(::GetProcAddress(hLua, "luaL_newstate") != nullptr);
@@ -266,7 +365,7 @@ bool testWin32InProcessCrtHygiene() {
 
 int main() {
     std::printf("======================================================================\n");
-    std::printf("Kestrel Canvas LuaJIT 2.0.1 ABI, Bytecode & Native AMF3 Test Suite\n");
+    std::printf("Kestrel Canvas LuaJIT 2.1 x64 ABI, Shim & Native AMF3 Test Suite\n");
     std::printf("======================================================================\n");
 
     runAbiTest("01_LuaJIT_VmBoot_JitModeOn_And_HotLoopStackDiscipline",
@@ -275,7 +374,9 @@ int main() {
                testLuaJitErrorUnwindAndBytecodeRoundTrip);
     runAbiTest("03_Amf3NativeModule_SparseFloatKeys_And_MalformedOomGuard",
                testAmf3NativeModuleRoundTripAndFuzzGuards);
-    runAbiTest("04_Win32InProcess_Lua51Exports_And_ZeroLegacyCrtHygiene",
+    runAbiTest("04_Lua226CompatShim_Geometry_Handler_BMFont_And_WidgetCallbacks",
+               testLua226CompatShimRuntimeBridges);
+    runAbiTest("05_Win32InProcess_Lua51Exports_And_ZeroLegacyCrtHygiene",
                testWin32InProcessCrtHygiene);
 
     std::printf("======================================================================\n");

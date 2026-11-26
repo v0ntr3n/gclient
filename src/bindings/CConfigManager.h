@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cocos2d.h"
+#include "compat/Axmol226Compat.h"
 #include "sqlite3.h"
 
 #include <cstddef>

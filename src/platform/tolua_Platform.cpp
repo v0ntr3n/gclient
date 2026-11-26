@@ -37,7 +37,7 @@ LuaCallbackRegistry& getLuaCallbacks() {
 // Falls back to fallbackState only in standalone unit tests where CCLuaEngine is uninitialized.
 lua_State* resolveLiveMainLuaState(lua_State* fallbackState) {
 #if defined(GCLIENT_USE_COCOS2DX)
-    if (auto* engine = cocos2d::CCLuaEngine::defaultEngine()) {
+    if (auto* engine = ax::LuaEngine::getInstance()) {
         if (auto* stack = engine->getLuaStack()) {
             if (lua_State* mainL = stack->getLuaState()) {
                 return mainL;

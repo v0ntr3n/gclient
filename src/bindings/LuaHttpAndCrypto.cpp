@@ -19,7 +19,7 @@
 #include <curl/curl.h>
 #include <openssl/evp.h>
 
-#include "cocos2d.h"
+#include "compat/Axmol226Compat.h"
 #include "CCLuaEngine.h"
 
 #ifdef _WIN32
@@ -514,7 +514,7 @@ public:
     int headerDataScriptFunc = 0;
 
     ~WinHttpRequest() override {
-        CCScriptEngineProtocol* engine = CCScriptEngineManager::sharedManager()->getScriptEngine();
+        CCScriptEngineProtocol* engine = ax::ScriptEngineManager::getInstance()->getScriptEngine();
         if (engine) {
             if (responseScriptFunc != 0) engine->removeScriptHandler(responseScriptFunc);
             if (bodyDataScriptFunc != 0) engine->removeScriptHandler(bodyDataScriptFunc);
@@ -551,7 +551,7 @@ public:
             WinHttpClient* inst = instance_;
             instance_ = nullptr;
             inst->scheduled_ = false;
-            if (auto* director = CCDirector::sharedDirector()) {
+            if (auto* director = ax::Director::getInstance()) {
                 if (auto* scheduler = director->getScheduler()) {
                     scheduler->unscheduleAllForTarget(inst);
                 }
@@ -565,9 +565,9 @@ public:
         if (!instance_) {
             return;
         }
-        if (auto* director = CCDirector::sharedDirector()) {
+        if (auto* director = ax::Director::getInstance()) {
             if (auto* scheduler = director->getScheduler()) {
-                scheduler->unscheduleSelector(
+                scheduler->unschedule(
                     schedule_selector(WinHttpClient::dispatchCallbacks), instance_);
                 instance_->scheduled_ = false;
                 instance_->ensureScheduled();
@@ -635,7 +635,7 @@ public:
 
         for (PendingEvent& ev : batch) {
             CCLuaEngine* engine = dynamic_cast<CCLuaEngine*>(
-                CCScriptEngineManager::sharedManager()->getScriptEngine());
+                ax::ScriptEngineManager::getInstance()->getScriptEngine());
             lua_State* L = (engine && engine->getLuaStack())
                 ? engine->getLuaStack()->getLuaState()
                 : nullptr;
@@ -662,16 +662,16 @@ public:
                 if (L && resp->request && resp->request->responseScriptFunc != 0) {
                     CCObject* baseClient = static_cast<CCObject*>(this);
                     CCObject* baseResp = static_cast<CCObject*>(resp);
-                    toluafix_pushusertype_ccobject(
+                    toluafix_pushusertype_object(
                         L,
-                        static_cast<int>(baseClient->m_uID),
-                        &baseClient->m_nLuaID,
+                        static_cast<int>(baseClient->_ID),
+                        &baseClient->_luaID,
                         static_cast<void*>(baseClient),
                         "CCHttpClient");
-                    toluafix_pushusertype_ccobject(
+                    toluafix_pushusertype_object(
                         L,
-                        static_cast<int>(baseResp->m_uID),
-                        &baseResp->m_nLuaID,
+                        static_cast<int>(baseResp->_ID),
+                        &baseResp->_luaID,
                         static_cast<void*>(baseResp),
                         "LuaHttpResponse");
                     engine->getLuaStack()->executeFunctionByHandler(
@@ -869,10 +869,10 @@ private:
 
     void ensureScheduled() {
         if (!scheduled_) {
-            if (auto* director = CCDirector::sharedDirector()) {
+            if (auto* director = ax::Director::getInstance()) {
                 if (auto* scheduler = director->getScheduler()) {
                     scheduled_ = true;
-                    scheduler->scheduleSelector(
+                    scheduler->schedule(
                         schedule_selector(WinHttpClient::dispatchCallbacks),
                         this,
                         0.0f,
@@ -904,7 +904,7 @@ T* getSafeHttpObject(lua_State* L, int idx, const char* expectedBaseType) {
     tolua_Error err{};
     if (lua_type(L, absIdx) == LUA_TUSERDATA) {
         if (tolua_isusertype(L, absIdx, expectedBaseType, 0, &err) ||
-            tolua_isusertype(L, absIdx, "CCObject", 0, &err)) {
+            (tolua_isusertype(L, absIdx, "ax.Object", 0, &err) || tolua_isusertype(L, absIdx, "CCObject", 0, &err))) {
             auto* obj = static_cast<CCObject*>(tolua_tousertype(L, absIdx, nullptr));
             return obj ? dynamic_cast<T*>(obj) : nullptr;
         }
@@ -925,7 +925,7 @@ T* getSafeHttpObject(lua_State* L, int idx, const char* expectedBaseType) {
             if (lua_type(L, -1) == LUA_TUSERDATA) {
                 T* out = nullptr;
                 if (tolua_isusertype(L, -1, expectedBaseType, 0, &err) ||
-                    tolua_isusertype(L, -1, "CCObject", 0, &err)) {
+                    (tolua_isusertype(L, -1, "ax.Object", 0, &err) || tolua_isusertype(L, -1, "CCObject", 0, &err))) {
                     if (auto* obj = static_cast<CCObject*>(tolua_tousertype(L, -1, nullptr))) {
                         out = dynamic_cast<T*>(obj);
                     }
@@ -1054,8 +1054,8 @@ int lua_LuaHttpReq_newRequest(lua_State* L) {
     // Http.lua / Platform.lua / Downloader.lua which call request:release() after send(request).
     auto* req = new WinHttpRequest();
     CCObject* baseReq = static_cast<CCObject*>(req);
-    toluafix_pushusertype_ccobject(
-        L, static_cast<int>(baseReq->m_uID), &baseReq->m_nLuaID, static_cast<void*>(baseReq), "LuaHttpRequest");
+    toluafix_pushusertype_object(
+        L, static_cast<int>(baseReq->_ID), &baseReq->_luaID, static_cast<void*>(baseReq), "LuaHttpRequest");
     return 1;
 }
 int lua_LuaHttpReq_setHeaders(lua_State* L) {
@@ -1098,7 +1098,7 @@ int lua_LuaHttpReq_setResponseScriptFunc(lua_State* L) {
         tolua_Error err;
         if (toluafix_isfunction(L, 2, "LUA_FUNCTION", 0, &err)) {
             if (r->responseScriptFunc != 0) {
-                if (auto* eng = CCScriptEngineManager::sharedManager()->getScriptEngine()) {
+                if (auto* eng = ax::ScriptEngineManager::getInstance()->getScriptEngine()) {
                     eng->removeScriptHandler(r->responseScriptFunc);
                 }
             }
@@ -1112,7 +1112,7 @@ int lua_LuaHttpReq_setBodyDataScriptFunc(lua_State* L) {
         tolua_Error err;
         if (toluafix_isfunction(L, 2, "LUA_FUNCTION", 0, &err)) {
             if (r->bodyDataScriptFunc != 0) {
-                if (auto* eng = CCScriptEngineManager::sharedManager()->getScriptEngine()) {
+                if (auto* eng = ax::ScriptEngineManager::getInstance()->getScriptEngine()) {
                     eng->removeScriptHandler(r->bodyDataScriptFunc);
                 }
             }
@@ -1126,7 +1126,7 @@ int lua_LuaHttpReq_setHeaderDataScriptFunc(lua_State* L) {
         tolua_Error err;
         if (toluafix_isfunction(L, 2, "LUA_FUNCTION", 0, &err)) {
             if (r->headerDataScriptFunc != 0) {
-                if (auto* eng = CCScriptEngineManager::sharedManager()->getScriptEngine()) {
+                if (auto* eng = ax::ScriptEngineManager::getInstance()->getScriptEngine()) {
                     eng->removeScriptHandler(r->headerDataScriptFunc);
                 }
             }
@@ -1177,10 +1177,10 @@ int lua_LuaHttpResp_getRequest(lua_State* L) {
     auto* r = checkResp(L);
     if (r && r->request) {
         CCObject* baseReq = static_cast<CCObject*>(r->request);
-        toluafix_pushusertype_ccobject(
+        toluafix_pushusertype_object(
             L,
-            static_cast<int>(baseReq->m_uID),
-            &baseReq->m_nLuaID,
+            static_cast<int>(baseReq->_ID),
+            &baseReq->_luaID,
             static_cast<void*>(baseReq),
             "LuaHttpRequest");
     } else {
@@ -1192,8 +1192,8 @@ int lua_LuaHttpResp_getRequest(lua_State* L) {
 int lua_HttpClient_getInstance(lua_State* L) {
     auto* c = WinHttpClient::getInstance();
     CCObject* baseClient = static_cast<CCObject*>(c);
-    toluafix_pushusertype_ccobject(
-        L, static_cast<int>(baseClient->m_uID), &baseClient->m_nLuaID, static_cast<void*>(baseClient), "CCHttpClient");
+    toluafix_pushusertype_object(
+        L, static_cast<int>(baseClient->_ID), &baseClient->_luaID, static_cast<void*>(baseClient), "CCHttpClient");
     return 1;
 }
 int lua_HttpClient_destroyInstance(lua_State* /*L*/) {
@@ -1223,7 +1223,7 @@ void registerLuaHttpAndCrypto(lua_State* tolua_S) {
     tolua_usertype(tolua_S, "LuaHttpResponse");
     tolua_usertype(tolua_S, "CCCrypto");
 
-    tolua_cclass(tolua_S, "CCHttpRequest", "CCHttpRequest", "CCObject", nullptr);
+    tolua_cclass(tolua_S, "CCHttpRequest", "CCHttpRequest", "ax.Object", nullptr);
     tolua_beginmodule(tolua_S, "CCHttpRequest");
     tolua_constant(tolua_S, "kHttpGet", 0.0);
     tolua_constant(tolua_S, "kHttpPost", 1.0);
@@ -1250,14 +1250,14 @@ void registerLuaHttpAndCrypto(lua_State* tolua_S) {
     tolua_function(tolua_S, "getLowSpeed", lua_HttpReq_getLowSpeed);
     tolua_endmodule(tolua_S);
 
-    tolua_cclass(tolua_S, "CCHttpResponse", "CCHttpResponse", "CCObject", nullptr);
+    tolua_cclass(tolua_S, "CCHttpResponse", "CCHttpResponse", "ax.Object", nullptr);
     tolua_beginmodule(tolua_S, "CCHttpResponse");
     tolua_function(tolua_S, "isSucceed", lua_HttpResp_isSucceed);
     tolua_function(tolua_S, "getResponseCode", lua_HttpResp_getResponseCode);
     tolua_function(tolua_S, "getErrorBuffer", lua_HttpResp_getErrorBuffer);
     tolua_endmodule(tolua_S);
 
-    tolua_cclass(tolua_S, "CCHttpClient", "CCHttpClient", "CCObject", nullptr);
+    tolua_cclass(tolua_S, "CCHttpClient", "CCHttpClient", "ax.Object", nullptr);
     tolua_beginmodule(tolua_S, "CCHttpClient");
     tolua_function(tolua_S, "getInstance", lua_HttpClient_getInstance);
     tolua_function(tolua_S, "destroyInstance", lua_HttpClient_destroyInstance);

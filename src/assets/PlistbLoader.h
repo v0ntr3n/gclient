@@ -5,11 +5,18 @@
 #include <string>
 #include <vector>
 
-namespace cocos2d {
+#if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
+#include "compat/Axmol226Compat.h"
+#else
+namespace ax {
 class CCDictionary;
-class CCSpriteFrameCache;
-class CCTexture2D;
+class SpriteFrameCache;
+class Texture2D;
+using CCSpriteFrameCache = SpriteFrameCache;
+using CCTexture2D = Texture2D;
 }
+namespace cocos2d = ax;
+#endif
 
 namespace gclient {
 namespace assets {

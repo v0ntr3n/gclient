@@ -444,7 +444,7 @@ int GameUtil::getDPI() {
 }
 
 std::string GameUtil::getExternalStorageLocation() {
-    return CCFileUtils::sharedFileUtils()->getWritablePath();
+    return ax::FileUtils::getInstance()->getWritablePath();
 }
 
 // Matches 0x2b4520: returns 0 (EUnzipOk), 1 (EUnzipFileNotExist), 2 (EUnzipBadFile), 3 (EUnzipOutOfStorage).
@@ -573,7 +573,7 @@ std::string GameUtil::convertEncoding(const char* str, const char* /*encoding*/)
 }
 
 CCArray* GameUtil::getAssetFiles(const char* subDir) {
-    std::string base = CCFileUtils::sharedFileUtils()->fullPathForFilename(subDir ? subDir : "");
+    std::string base = ax::FileUtils::getInstance()->fullPathForFilename(subDir ? subDir : "");
     return readdir(base.c_str());
 }
 

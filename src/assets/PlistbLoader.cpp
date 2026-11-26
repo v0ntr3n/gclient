@@ -10,7 +10,7 @@
 #include <unordered_set>
 
 #if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
-#include "cocos2d.h"
+#include "compat/Axmol226Compat.h"
 #endif
 
 namespace gclient {
@@ -601,10 +601,10 @@ std::vector<std::string> PlistbLoader::BuildTextureCandidatePaths(const std::str
     }
 
     const std::string stem = StripTextureExtension(norm);
+    AppendUniqueCandidate(candidates, stem + ".png");
     AppendUniqueCandidate(candidates, norm);
     AppendUniqueCandidate(candidates, stem + ".pvr.ccz");
     AppendUniqueCandidate(candidates, stem + ".pkm");
-    AppendUniqueCandidate(candidates, stem + ".png");
     AppendUniqueCandidate(candidates, stem + ".webp");
     AppendUniqueCandidate(candidates, stem + ".jpg");
     return candidates;
@@ -650,14 +650,14 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
 
     cocos2d::CCTexture2D* targetTexture = texture;
     if (!targetTexture) {
-        auto* texCache = cocos2d::CCTextureCache::sharedTextureCache();
+        auto* texCache = ax::Director::getInstance()->getTextureCache();
         if (!texCache) {
             return false;
         }
 
         const std::string texRelPath  = NormalizeAssetPath(parsed.textureFileName);
         const std::string relBaseTex  = ResolveRelativeAssetPath(texRelPath, plistbPath);
-        auto*             fu          = cocos2d::CCFileUtils::sharedFileUtils();
+        auto*             fu          = ax::FileUtils::getInstance();
 
         std::vector<std::string> candidateList = BuildTextureCandidatePaths(relBaseTex);
         if (fu) {
@@ -700,7 +700,7 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
     }
 
     cocos2d::CCSpriteFrameCache* targetCache =
-        cache ? cache : cocos2d::CCSpriteFrameCache::sharedSpriteFrameCache();
+        cache ? cache : ax::SpriteFrameCache::getInstance();
     if (!targetCache) {
         return false;
     }
@@ -777,7 +777,7 @@ bool PlistbLoader::RemoveSpriteFramesWithBinary(const std::string& plistPath,
     }
 
     cocos2d::CCSpriteFrameCache* targetCache =
-        cache ? cache : cocos2d::CCSpriteFrameCache::sharedSpriteFrameCache();
+        cache ? cache : ax::SpriteFrameCache::getInstance();
     if (!targetCache) {
         return false;
     }

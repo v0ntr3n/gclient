@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string>
 
-#include "cocos2d.h"
+#include "compat/Axmol226Compat.h"
 
 struct lua_State;
 
@@ -19,14 +19,14 @@ struct AppConfig {
     std::string logsDir;
     std::string dumpsDir;
 
-    int windowWidth = 1136;
+    int windowWidth  = 1136;
     int windowHeight = 640;
 
-    bool muteAudio = false;
+    bool muteAudio          = false;
     bool validateAssetsOnly = false;
 };
 
-class AppDelegate final : private cocos2d::CCApplication {
+class AppDelegate final : public ax::Application {
 public:
     enum class LifecycleState : uint8_t {
         Uninitialized = 0,
@@ -43,15 +43,17 @@ public:
     AppDelegate(const AppDelegate&) = delete;
     AppDelegate& operator=(const AppDelegate&) = delete;
 
-    // CCApplication lifecycle overrides
+    // ax::Application lifecycle overrides
+    void initGfxContextAttrs() override;
     bool applicationDidFinishLaunching() override;
     void applicationDidEnterBackground() override;
     void applicationWillEnterForeground() override;
+    void applicationWillQuit() override;
 
-    // Headless CLI --validate-assets entrypoint (runs without requiring an OpenGL 2.0 context)
+    // Headless CLI --validate-assets entrypoint (runs without requiring an OpenGL context)
     bool executeHeadlessAssetValidation();
 
-    // Explicit ordered teardown (safe & idempotent; called by wWinMain prior to telemetry shutdown)
+    // Explicit ordered teardown (safe & idempotent; called prior to telemetry shutdown)
     void shutdown();
 
     LifecycleState lifecycleState() const noexcept {
@@ -84,18 +86,18 @@ private:
     void scheduleNativeLoops();
     void unscheduleNativeLoops();
     bool runAssetValidation();
-    void reconcileInitialWindowLifecycleState(cocos2d::CCDirector* director,
-                                              cocos2d::CCEGLView* eglView);
+    void reconcileInitialWindowLifecycleState(ax::Director* director,
+                                              ax::RenderViewImpl* renderView);
     void teardownSubsystems(LifecycleState terminalState);
 
-    AppConfig m_config;
-    FrameTicker* m_ticker = nullptr;
-    bool m_assetValidationOk = false;
+    AppConfig    m_config;
+    FrameTicker* m_ticker            = nullptr;
+    bool         m_assetValidationOk = false;
 
     std::atomic<LifecycleState> m_lifecycleState{LifecycleState::Uninitialized};
-    std::atomic<bool> m_isInBackground{false};
-    std::atomic<bool> m_pendingForeground{false};
-    std::atomic<bool> m_pendingBackground{false};
+    std::atomic<bool>           m_isInBackground{false};
+    std::atomic<bool>           m_pendingForeground{false};
+    std::atomic<bool>           m_pendingBackground{false};
 };
 
 } // namespace gclient

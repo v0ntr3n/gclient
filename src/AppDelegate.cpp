@@ -1,7 +1,7 @@
 // ============================================================================
-// Game Client Win32 Port — AppDelegate Implementation
-// Reconstructed from libcocos2dlua.so AppDelegate::applicationDidFinishLaunching
-// (0x2a25d8) and hardened with an explicit atomic Win32 lifecycle state machine.
+// Game Client Axmol v2.11.5 Port — AppDelegate Implementation
+// Preserves atomic lifecycle state machine, hotfix health checks, writable path
+// isolation, Lua 2.2.6 compatibility shims, and ordered teardown.
 // ============================================================================
 
 #ifdef _WIN32
@@ -32,7 +32,10 @@
 
 #include "CCLuaEngine.h"
 #include "SimpleAudioEngine.h"
+#include "lua-bindings/manual/lua_module_register.h"
 
+#include "compat/Axmol226Compat.h"
+#include "compat/Lua226CompatShim.h"
 #include "diagnostics/CrashAndTelemetry.h"
 
 #include "assets/BTAssetDecryptor.h"
@@ -52,14 +55,14 @@ namespace gclient {
 
 namespace {
 
-std::mutex g_writableDirMutex;
-std::string g_configuredWritableDir;
-std::atomic<bool> g_validateAssetsOnly{false};
+std::mutex               g_writableDirMutex;
+std::string              g_configuredWritableDir;
+std::atomic<bool>        g_validateAssetsOnly{false};
 std::atomic<AppDelegate*> g_activeAppInstance{nullptr};
 
-constexpr float kDesignWidth = 1136.0f;
-constexpr float kDesignHeight = 640.0f;
-constexpr double kTargetAnimationInterval = 0.0333333333; // 30 FPS
+constexpr float  kDesignWidth             = 1136.0f;
+constexpr float  kDesignHeight            = 640.0f;
+constexpr float  kTargetAnimationInterval = 1.0f / 60.0f; // Smooth 60 FPS on Axmol x64
 
 std::string getConfiguredWritableDirSnapshot() {
     std::lock_guard<std::mutex> lock(g_writableDirMutex);
@@ -73,18 +76,14 @@ void setConfiguredWritableDirSnapshot(std::string dir) {
 
 #ifdef _WIN32
 std::wstring utf8ToWidePath(const std::string& utf8) {
-    if (utf8.empty()) {
-        return {};
-    }
+    if (utf8.empty()) return {};
     int req = ::MultiByteToWideChar(
         CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
     if (req <= 0) {
         req = ::MultiByteToWideChar(
             CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
     }
-    if (req <= 0) {
-        return {};
-    }
+    if (req <= 0) return {};
     std::wstring wide(static_cast<std::size_t>(req), L'\0');
     ::MultiByteToWideChar(
         CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), req);
@@ -92,14 +91,10 @@ std::wstring utf8ToWidePath(const std::string& utf8) {
 }
 
 std::string wideToUtf8Path(const std::wstring& wide) {
-    if (wide.empty()) {
-        return {};
-    }
+    if (wide.empty()) return {};
     const int req = ::WideCharToMultiByte(
         CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
-    if (req <= 0) {
-        return {};
-    }
+    if (req <= 0) return {};
     std::string out(static_cast<std::size_t>(req), '\0');
     ::WideCharToMultiByte(
         CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), out.data(), req, nullptr, nullptr);
@@ -127,115 +122,24 @@ void clearTelemetryLuaStateBeforeTeardown() {
     }
 }
 
-template <typename T, typename = void>
-struct HasGetFrameSize : std::false_type {};
-template <typename T>
-struct HasGetFrameSize<T, std::void_t<decltype(std::declval<T*>()->getFrameSize())>> : std::true_type {};
-
-template <typename T, typename = void>
-struct HasGetHWnd : std::false_type {};
-template <typename T>
-struct HasGetHWnd<T, std::void_t<decltype(std::declval<T*>()->getHWnd())>> : std::true_type {};
-
-template <typename T, typename = void>
-struct HasGetFrameZoomFactor : std::false_type {};
-template <typename T>
-struct HasGetFrameZoomFactor<T, std::void_t<decltype(std::declval<T*>()->getFrameZoomFactor())>> : std::true_type {};
-
-template <typename T>
-bool isEglViewZeroOrMinimized(T* eglView) {
-    if (!eglView) {
-        return true;
-    }
+bool isRenderViewZeroOrMinimized(ax::RenderViewImpl* rv) {
+    if (!rv) return true;
 #ifdef _WIN32
-    if constexpr (HasGetHWnd<T>::value) {
-        HWND hwnd = eglView->getHWnd();
-        if (hwnd != nullptr) {
-            if (!::IsWindow(hwnd) || ::IsIconic(hwnd)) {
-                return true;
-            }
-            RECT rc{};
-            if (::GetClientRect(hwnd, &rc)) {
-                if ((rc.right - rc.left) < 1 || (rc.bottom - rc.top) < 1) {
-                    return true;
-                }
-            }
+    if (HWND hwnd = rv->getWin32Window()) {
+        if (!::IsWindow(hwnd) || ::IsIconic(hwnd)) return true;
+        RECT rc{};
+        if (::GetClientRect(hwnd, &rc)) {
+            if ((rc.right - rc.left) < 1 || (rc.bottom - rc.top) < 1) return true;
         }
     }
 #endif
-    if constexpr (HasGetFrameSize<T>::value) {
-        const cocos2d::CCSize frameSz = eglView->getFrameSize();
-        if (frameSz.width < 1.0f || frameSz.height < 1.0f ||
-            !std::isfinite(frameSz.width) || !std::isfinite(frameSz.height)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-template <typename T>
-void ensureNonZeroEglFrameSize(T* eglView, int fallbackW, int fallbackH) {
-    if (!eglView) {
-        return;
-    }
-    float zoom = 1.0f;
-    if constexpr (HasGetFrameZoomFactor<T>::value) {
-        const float rawZoom = eglView->getFrameZoomFactor();
-        if (std::isfinite(rawZoom) && rawZoom > 0.0f) {
-            zoom = rawZoom;
-        }
-    }
-#ifdef _WIN32
-    // Synchronize m_obScreenSize to the actual Win32 client rect (divided by m_fFrameZoomFactor)
-    // whenever SetWindowPos clamped an oversized window (e.g. 1920x1080 + caption on a 1080p monitor)
-    // so glViewport and Win32 mouse Y-flip (m_obScreenSize.height - pt.y) never drift!
-    if constexpr (HasGetHWnd<T>::value && HasGetFrameSize<T>::value) {
-        HWND hwnd = eglView->getHWnd();
-        if (hwnd != nullptr && ::IsWindow(hwnd) && !::IsIconic(hwnd)) {
-            RECT rc{};
-            if (::GetClientRect(hwnd, &rc)) {
-                const int clientW = rc.right - rc.left;
-                const int clientH = rc.bottom - rc.top;
-                if (clientW > 0 && clientH > 0) {
-                    const float actualFrameW = static_cast<float>(clientW) / zoom;
-                    const float actualFrameH = static_cast<float>(clientH) / zoom;
-                    const cocos2d::CCSize curSz = eglView->getFrameSize();
-                    if (!std::isfinite(curSz.width) || !std::isfinite(curSz.height) ||
-                        std::fabs(curSz.width - actualFrameW) > 0.5f ||
-                        std::fabs(curSz.height - actualFrameH) > 0.5f) {
-                        if constexpr (std::is_base_of_v<cocos2d::CCEGLViewProtocol, T>) {
-                            eglView->cocos2d::CCEGLViewProtocol::setFrameSize(actualFrameW, actualFrameH);
-                        } else {
-                            eglView->setFrameSize(actualFrameW, actualFrameH);
-                        }
-                    }
-                    return;
-                }
-            }
-        }
-    }
-#endif
-    if constexpr (HasGetFrameSize<T>::value) {
-        const cocos2d::CCSize frameSz = eglView->getFrameSize();
-        if (frameSz.width < 1.0f || frameSz.height < 1.0f ||
-            !std::isfinite(frameSz.width) || !std::isfinite(frameSz.height)) {
-            const float safeW = static_cast<float>(fallbackW > 0 ? fallbackW : 1136);
-            const float safeH = static_cast<float>(fallbackH > 0 ? fallbackH : 640);
-            // Qualify CCEGLViewProtocol::setFrameSize so we never invoke Win32 MoveWindow
-            // on an iconic window or trigger recursive synchronous WM_SIZE messages!
-            if constexpr (std::is_base_of_v<cocos2d::CCEGLViewProtocol, T>) {
-                eglView->cocos2d::CCEGLViewProtocol::setFrameSize(safeW, safeH);
-            } else {
-                eglView->setFrameSize(safeW, safeH);
-            }
-        }
-    }
+    const ax::Vec2 frameSz = rv->getFrameSize();
+    return frameSz.width < 1.0f || frameSz.height < 1.0f ||
+           !std::isfinite(frameSz.width) || !std::isfinite(frameSz.height);
 }
 
 bool isEnvFlagEnabled(const char* name) {
-    if (!name || !*name) {
-        return false;
-    }
+    if (!name || !*name) return false;
     std::string val;
 #ifdef _WIN32
     char buf[32] = {};
@@ -245,9 +149,7 @@ bool isEnvFlagEnabled(const char* name) {
     }
 #endif
     if (val.empty()) {
-        if (const char* raw = std::getenv(name)) {
-            val = raw;
-        }
+        if (const char* raw = std::getenv(name)) val = raw;
     }
     return val == "1" || val == "true" || val == "TRUE" || val == "yes" || val == "YES";
 }
@@ -260,25 +162,19 @@ public:
                             bool validateAssetsOnly,
                             bool suppressMessageBoxEnv,
                             bool headlessEnv) {
-        if (validateAssetsOnly || suppressMessageBoxEnv || headlessEnv) {
-            return false;
-        }
+        if (validateAssetsOnly || suppressMessageBoxEnv || headlessEnv) return false;
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_seenMessages.find(messageText) != m_seenMessages.end()) {
-            return false;
-        }
-        if (m_shownCount >= kMaxPopupsPerProcess) {
-            return false;
-        }
+        if (m_seenMessages.find(messageText) != m_seenMessages.end()) return false;
+        if (m_shownCount >= kMaxPopupsPerProcess) return false;
         m_seenMessages.insert(messageText);
         ++m_shownCount;
         return true;
     }
 
 private:
-    std::mutex m_mutex;
+    std::mutex                      m_mutex;
     std::unordered_set<std::string> m_seenMessages;
-    std::size_t m_shownCount = 0;
+    std::size_t                     m_shownCount = 0;
 };
 
 AlertDialogGate& sharedAlertDialogGate() {
@@ -289,33 +185,38 @@ AlertDialogGate& sharedAlertDialogGate() {
 #ifdef _WIN32
 void showAsyncWin32Alert(std::string title, std::string message) {
     std::thread([t = std::move(title), m = std::move(message)]() {
-        // Immortal heap mutex avoids static-destruction-order UB if process exits while popup is open.
         static std::mutex* s_dialogMutex = new std::mutex();
-        std::lock_guard<std::mutex> lock(*s_dialogMutex);
-        const std::wstring wideTitle = utf8ToWidePath(t.empty() ? "Game Client" : t);
-        const std::wstring wideMsg = utf8ToWidePath(m);
+        std::lock_guard<std::mutex> guard(*s_dialogMutex);
+        const std::wstring wTitle = utf8ToWidePath(t);
+        const std::wstring wMsg   = utf8ToWidePath(m);
         ::MessageBoxW(
             nullptr,
-            wideMsg.c_str(),
-            wideTitle.empty() ? L"Game Client" : wideTitle.c_str(),
+            wMsg.empty() ? L"(error)" : wMsg.c_str(),
+            wTitle.empty() ? L"Game Client" : wTitle.c_str(),
             MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
     }).detach();
 }
 #endif
+
+void maybeShowWin32AlertPopup(const std::string& titleStr, const std::string& msgStr, bool showAlert) {
+#ifdef _WIN32
+    if (showAlert) showAsyncWin32Alert(titleStr, msgStr);
+#else
+    (void)titleStr;
+    (void)msgStr;
+    (void)showAlert;
+#endif
+}
 
 void appendSearchLayer(std::vector<std::string>& searchPaths,
                        std::unordered_set<std::string>& seen,
                        std::string layerRoot) {
     std::replace(layerRoot.begin(), layerRoot.end(), '\\', '/');
     while (layerRoot.size() > 1 && layerRoot.back() == '/') {
-        if (layerRoot.size() == 3 && layerRoot[1] == ':') {
-            break;
-        }
+        if (layerRoot.size() == 3 && layerRoot[1] == ':') break;
         layerRoot.pop_back();
     }
-    if (layerRoot.empty()) {
-        return;
-    }
+    if (layerRoot.empty()) return;
 
     const std::string prefix = (layerRoot.back() == '/') ? layerRoot : (layerRoot + "/");
     const std::string subpaths[] = {
@@ -333,29 +234,15 @@ void appendSearchLayer(std::vector<std::string>& searchPaths,
     }
 }
 
-void maybeShowWin32AlertPopup(const std::string& titleStr, const std::string& msgStr, bool showAlert) {
-#ifdef _WIN32
-    if (showAlert) {
-        showAsyncWin32Alert(titleStr, msgStr);
-    }
-#else
-    (void)titleStr;
-    (void)msgStr;
-    (void)showAlert;
-#endif
-}
-
 } // namespace
 
 // ----------------------------------------------------------------------------
-// FrameTicker: CCObject bridge scheduled on CCScheduler (replaces loom::tick)
+// FrameTicker: ax::Object bridge scheduled on ax::Scheduler
 // ----------------------------------------------------------------------------
-class AppDelegate::FrameTicker final : public cocos2d::CCObject {
+class AppDelegate::FrameTicker final : public ax::Object {
 public:
     void onTick(float dt) {
-        if (!AppDelegate::isLifecycleReady()) {
-            return;
-        }
+        if (!AppDelegate::isLifecycleReady()) return;
         if (bt::Platform* platform = bt::Platform::getInstance()) {
             platform->tickLoop();
         }
@@ -363,30 +250,31 @@ public:
             network->update(dt);
         }
         diagnostics::CrashAndTelemetry::recordFrame(dt);
+
         static int s_frame = 0;
         if (++s_frame == 60) {
-            auto* scene = cocos2d::CCDirector::sharedDirector()->getRunningScene();
+            auto* scene = ax::Director::getInstance()->getRunningScene();
             diagnostics::CrashAndTelemetry::log(
                 diagnostics::LogLevel::Info,
                 "AppDelegate",
-                "Frame 60: runningScene=%p children=%u",
+                "Frame 60: runningScene=%p children=%zu",
                 static_cast<void*>(scene),
-                scene ? scene->getChildrenCount() : 0u);
+                scene ? static_cast<std::size_t>(scene->getChildrenCount()) : 0u);
         } else if (s_frame == 90) {
             if (const char* shotName = std::getenv("GCLIENT_SCREENSHOT_NAME")) {
-                auto* director = cocos2d::CCDirector::sharedDirector();
-                auto* eglView = cocos2d::CCEGLView::sharedOpenGLView();
-                if (director && !isEglViewZeroOrMinimized(eglView)) {
+                auto* director = ax::Director::getInstance();
+                auto* rv = director ? dynamic_cast<ax::RenderViewImpl*>(director->getRenderView()) : nullptr;
+                if (director && !isRenderViewZeroOrMinimized(rv)) {
                     if (auto* scene = director->getRunningScene()) {
                         const auto winSize = director->getWinSize();
                         if (std::isfinite(winSize.width) && std::isfinite(winSize.height) &&
                             winSize.width >= 1.0f && winSize.height >= 1.0f) {
-                            if (auto* rt = cocos2d::CCRenderTexture::create(
+                            if (auto* rt = ax::RenderTexture::create(
                                     static_cast<int>(winSize.width), static_cast<int>(winSize.height))) {
                                 rt->begin();
                                 scene->visit();
                                 rt->end();
-                                rt->saveToFile(shotName, cocos2d::kCCImageFormatPNG);
+                                rt->saveToFile(shotName, ax::Image::Format::PNG);
                                 diagnostics::CrashAndTelemetry::log(
                                     diagnostics::LogLevel::Info, "AppDelegate", "Saved screenshot %s", shotName);
                             }
@@ -434,7 +322,7 @@ static int gclientLuaLoader(lua_State* L) {
 }
 
 // ----------------------------------------------------------------------------
-// AppDelegate lifecycle
+// AppDelegate Lifecycle
 // ----------------------------------------------------------------------------
 bool AppDelegate::hasActiveInstance() noexcept {
     return g_activeAppInstance.load(std::memory_order_acquire) != nullptr;
@@ -456,6 +344,15 @@ AppDelegate::~AppDelegate() {
     shutdown();
     AppDelegate* expected = this;
     g_activeAppInstance.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+}
+
+void AppDelegate::initGfxContextAttrs() {
+    GfxContextAttrs gfxContextAttrs = {8, 8, 8, 8, 24, 8, 0};
+    ax::RenderView::setGfxContextAttrs(gfxContextAttrs);
+}
+
+void AppDelegate::applicationWillQuit() {
+    shutdown();
 }
 
 bool AppDelegate::executeHeadlessAssetValidation() {
@@ -509,9 +406,7 @@ bool AppDelegate::executeHeadlessAssetValidation() {
 
     fs::path resolvedScriptFs;
     for (const fs::path& root : searchRoots) {
-        if (root.empty()) {
-            continue;
-        }
+        if (root.empty()) continue;
         const fs::path cand1 = root / "scripts" / "main.lua";
         ec.clear();
         if (fs::is_regular_file(cand1, ec)) {
@@ -563,7 +458,7 @@ bool AppDelegate::executeHeadlessAssetValidation() {
     diagnostics::CrashAndTelemetry::log(
         diagnostics::LogLevel::Info,
         "AssetValidation",
-        "Validated '%s' (%lu bytes decrypted/loaded successfully)",
+        "Validated '%s' (%lu bytes loaded successfully)",
         resolvedUtf8.c_str(),
         dataSize);
     diagnostics::CrashAndTelemetry::flushLogs();
@@ -609,17 +504,15 @@ void AppDelegate::teardownSubsystems(LifecycleState terminalState) {
         cfgMgr->closeAllDbs();
     }
 
-    // Clear CrashAndTelemetry's cached lua_State* BEFORE Lua engine teardown so
-    // background/telemetry collectors never touch a closed lua_State*!
     clearTelemetryLuaStateBeforeTeardown();
-    cocos2d::CCScriptEngineManager::purgeSharedManager();
+    ax::ScriptEngineManager::destroyInstance();
     CocosDenshion::SimpleAudioEngine::end();
 
     m_lifecycleState.store(terminalState, std::memory_order_release);
 }
 
 void AppDelegate::configureFileUtils() {
-    cocos2d::CCFileUtils* fileUtils = cocos2d::CCFileUtils::sharedFileUtils();
+    ax::FileUtils* fileUtils = ax::FileUtils::getInstance();
     if (m_config.validateAssetsOnly ||
         isEnvFlagEnabled("GCLIENT_HEADLESS") ||
         isEnvFlagEnabled("GCLIENT_SUPPRESS_MESSAGEBOX") ||
@@ -645,13 +538,13 @@ void AppDelegate::configureFileUtils() {
         std::string w = normPath(m_config.writableDir);
         if (!w.empty() && w.back() != '/') w.push_back('/');
         setConfiguredWritableDirSnapshot(w);
+        fileUtils->setWritablePath(w);
 #ifdef _WIN32
         ::SetEnvironmentVariableW(L"GCLIENT_WRITABLE_DIR", utf8ToWidePath(w).c_str());
 #endif
         appendSearchLayer(searchPaths, seenPaths, w + "Resources");
     }
 
-    // Check AtomicHotUpdater active overlay health before wiring hotfix search paths.
     if (!m_config.hotfixDir.empty()) {
         update::HotUpdaterConfig hotCfg;
         hotCfg.patchRootDir = toSafeFsPath(m_config.hotfixDir);
@@ -687,6 +580,17 @@ void AppDelegate::configureFileUtils() {
         appendSearchLayer(searchPaths, seenPaths, normBase);
     }
 
+    const std::string appRoot = normPath(fileUtils->getAppRoot());
+    if (!appRoot.empty()) {
+        const std::string axslcPath = (appRoot.back() == '/') ? (appRoot + "axslc") : (appRoot + "/axslc");
+        if (seenPaths.insert(axslcPath).second) {
+            searchPaths.push_back(axslcPath);
+        }
+        if (seenPaths.insert(appRoot).second) {
+            searchPaths.push_back(appRoot);
+        }
+    }
+
     fileUtils->setSearchPaths(searchPaths);
 
     if (bt::Platform* platform = bt::Platform::getInstance()) {
@@ -701,9 +605,7 @@ void AppDelegate::configureFileUtils() {
         });
         platform->setWebViewBridgeHandler(
             [](const std::string& action, int x, int y, int width, int height, const std::string& url) {
-                if (!AppDelegate::isLifecycleReady()) {
-                    return;
-                }
+                if (!AppDelegate::isLifecycleReady()) return;
                 auto* webView = gclient::ui::ZYWebViewWin32::getInstance();
                 if (!webView) return;
                 if (action == "displayWebView") {
@@ -716,11 +618,18 @@ void AppDelegate::configureFileUtils() {
             });
     }
 
-    fileUtils->setDecrypt(&bt_decrypt);
     gclient::assets::InstallBtDecryptHook(fileUtils);
 }
 
 void AppDelegate::registerLuaBindings(lua_State* L) {
+    // 1. Register Axmol's standard C++ -> Lua modules (core, ui, cocostudio, spine, audio, cjson)
+    lua_module_register(L);
+
+    // 2. Register Cocos2d-x 2.2.6 container/UI/audio C++ classes & Lua 2.2.6 runtime compatibility shim
+    gclient::compat::RegisterAxmol226CompatLuaBindings(L);
+    gclient::compat::InstallLua226CompatShim(L);
+
+    // 3. Register Kestrel-Canvas first-party bindings (GameTemplate, BTUtil, AMF3, HTTP/Crypto, Platform)
     tolua_extensions_ccb_open(L);
     tolua_GameTemplate_open(L);
     luaopen_lua_extensions(L);
@@ -739,10 +648,7 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
     const lua_CFunction logErrFn = [](lua_State* L) -> int {
         const char* msg = lua_tostring(L, 1);
         diagnostics::CrashAndTelemetry::log(
-            diagnostics::LogLevel::Error,
-            "LuaErr",
-            "%s",
-            msg ? msg : "(null)");
+            diagnostics::LogLevel::Error, "LuaErr", "%s", msg ? msg : "(null)");
         diagnostics::CrashAndTelemetry::flushLogs();
         return 0;
     };
@@ -755,9 +661,7 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
         lua_getglobal(L, "tostring");
         const bool hasToString = lua_isfunction(L, -1);
         for (int i = 1; i <= nargs; ++i) {
-            if (i > 1) {
-                out.push_back('\t');
-            }
+            if (i > 1) out.push_back('\t');
             if (hasToString) {
                 lua_pushvalue(L, -1);
                 lua_pushvalue(L, i);
@@ -774,11 +678,7 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
             }
         }
         lua_pop(L, 1);
-        diagnostics::CrashAndTelemetry::log(
-            diagnostics::LogLevel::Info,
-            "Lua",
-            "%s",
-            out.c_str());
+        diagnostics::CrashAndTelemetry::log(diagnostics::LogLevel::Info, "Lua", "%s", out.c_str());
         return 0;
     };
     lua_pushcfunction(L, logInfoFn);
@@ -786,118 +686,6 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
 
     static constexpr const char* kLuaBootstrapShim =
         "do "
-        "local _gmt = getmetatable(_G) or {} "
-        "local _old_ni = _gmt.__newindex "
-        "local _old_idx = _gmt.__index "
-        "local _hooks = {} "
-        "local _already_mirrored = {} "
-        "local _in_tb = false "
-        "local _in_print = false "
-        "local function _get_tb(lvl) "
-        "  if type(debug) == 'table' and type(debug.traceback) == 'function' then "
-        "    return debug.traceback('', lvl or 2) "
-        "  end "
-        "  return '' "
-        "end "
-        "local function _wrap_tb(fn) "
-        "  return function(msg) "
-        "    local full = tostring(msg) .. '\\n' .. tostring(_get_tb(2)) "
-        "    if not _in_tb then "
-        "      _in_tb = true "
-        "      __GCLIENT_LOG_ERR__(full) "
-        "      if type(fn) == 'function' then "
-        "        local ok, res = pcall(fn, msg) "
-        "        _in_tb = false "
-        "        if not ok then "
-        "          __GCLIENT_LOG_ERR__('TRACKBACK_HANDLER_ERR:' .. tostring(res)) "
-        "        else "
-        "          return res "
-        "        end "
-        "      else "
-        "        _in_tb = false "
-        "      end "
-        "    end "
-        "    return full "
-        "  end "
-        "end "
-        "local _native_print = rawget(_G, '__GCLIENT_NATIVE_PRINT__') "
-        "if type(_native_print) == 'function' then _already_mirrored[_native_print] = true end "
-        "local function _wrap_print(fn) "
-        "  if type(fn) == 'function' and _already_mirrored[fn] then return fn end "
-        "  local orig = (type(fn) == 'function' and fn ~= __GCLIENT_LOG_INFO__) and fn or nil "
-        "  local w "
-        "  w = function(...) "
-        "    if _in_print then "
-        "      if orig then return orig(...) end "
-        "      return "
-        "    end "
-        "    _in_print = true "
-        "    __GCLIENT_LOG_INFO__(...) "
-        "    if orig then "
-        "      local ok, r1, r2 = pcall(orig, ...) "
-        "      _in_print = false "
-        "      if not ok then error(r1, 0) end "
-        "      return r1, r2 "
-        "    end "
-        "    _in_print = false "
-        "  end "
-        "  _already_mirrored[w] = true "
-        "  return w "
-        "end "
-        "local function _wrap_existing_mirrored(fn) "
-        "  local w "
-        "  w = function(...) "
-        "    if _in_print then return end "
-        "    _in_print = true "
-        "    local ok, r1, r2 = pcall(fn, ...) "
-        "    _in_print = false "
-        "    if not ok then error(r1, 0) end "
-        "    return r1, r2 "
-        "  end "
-        "  _already_mirrored[fn] = true "
-        "  _already_mirrored[w] = true "
-        "  return w "
-        "end "
-        "local _init_tb = rawget(_G, '__G__TRACKBACK__') "
-        "local _native_tb = rawget(_G, '__GCLIENT_NATIVE_TRACKBACK__') "
-        "rawset(_G, '__G__TRACKBACK__', nil) "
-        "_hooks.__G__TRACKBACK__ = _wrap_tb((_init_tb ~= _native_tb) and _init_tb or nil) "
-        "local _pnames = {'print', 'release_print', 'CCLuaLog'} "
-        "for i = 1, #_pnames do "
-        "  local pn = _pnames[i] "
-        "  local cur = rawget(_G, pn) "
-        "  rawset(_G, pn, nil) "
-        "  if _native_print ~= nil and type(cur) == 'function' then "
-        "    _hooks[pn] = _wrap_existing_mirrored(cur) "
-        "  else "
-        "    _hooks[pn] = _wrap_print(cur) "
-        "  end "
-        "end "
-        "_gmt.__index = function(t, k) "
-        "  local h = _hooks[k] "
-        "  if h ~= nil then return h end "
-        "  if type(_old_idx) == 'function' then return _old_idx(t, k) "
-        "  elseif type(_old_idx) == 'table' then return _old_idx[k] end "
-        "  return nil "
-        "end "
-        "_gmt.__newindex = function(t, k, v) "
-        "  if k == '__G__TRACKBACK__' then "
-        "    _hooks.__G__TRACKBACK__ = _wrap_tb(v) "
-        "    return "
-        "  elseif k == 'print' or k == 'release_print' or k == 'CCLuaLog' then "
-        "    _hooks[k] = _wrap_print(v) "
-        "    return "
-        "  elseif k == 'g' and type(v) == 'table' then "
-        "    local mt = getmetatable(v) or {} "
-        "    mt.__newindex = function(gt, gk, gv) "
-        "      if gk == 'isRefresh' then gv = true end "
-        "      rawset(gt, gk, gv) "
-        "    end "
-        "    setmetatable(v, mt) "
-        "  end "
-        "  if _old_ni then _old_ni(t, k, v) else rawset(t, k, v) end "
-        "end "
-        "setmetatable(_G, _gmt) "
         "local _r = require "
         "require = function(n) "
         "  local res = _r(n) "
@@ -914,31 +702,12 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
         "    return _io_open(path, mode) "
         "  end "
         "end "
-        "local _xp = xpcall "
-        "xpcall = function(f, eh, ...) "
-        "  local wrapped_eh = function(m) "
-        "    if eh ~= _hooks.__G__TRACKBACK__ then "
-        "      __GCLIENT_LOG_ERR__('ORIG:' .. tostring(m) .. '\\n' .. tostring(_get_tb(2))) "
-        "    end "
-        "    if type(eh) == 'function' then "
-        "      local ok2, e2 = pcall(eh, m) "
-        "      if not ok2 then __GCLIENT_LOG_ERR__('EH_ERR:' .. tostring(e2)) end "
-        "      return e2 "
-        "    end "
-        "    return m "
-        "  end "
-        "  if select('#', ...) > 0 then return _xp(f, wrapped_eh, ...) end "
-        "  return _xp(f, wrapped_eh) "
-        "end "
         "end";
 
     if (luaL_dostring(L, kLuaBootstrapShim) != 0) {
         const char* err = lua_tostring(L, -1);
         diagnostics::CrashAndTelemetry::log(
-            diagnostics::LogLevel::Error,
-            "AppDelegate",
-            "Config shim error: %s",
-            err ? err : "(null)");
+            diagnostics::LogLevel::Error, "AppDelegate", "Bootstrap shim error: %s", err ? err : "(null)");
         lua_pop(L, 1);
     }
 
@@ -950,11 +719,7 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
         const std::string titleStr = (title && title[0] != '\0') ? title : "Game Client";
 
         diagnostics::CrashAndTelemetry::log(
-            diagnostics::LogLevel::Error,
-            "CCMessageBox",
-            "[%s] %s",
-            titleStr.c_str(),
-            msgStr.c_str());
+            diagnostics::LogLevel::Error, "CCMessageBox", "[%s] %s", titleStr.c_str(), msgStr.c_str());
         diagnostics::CrashAndTelemetry::flushLogs();
 
         const std::string dedupKey = titleStr + "\n" + msgStr;
@@ -969,14 +734,11 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
     lua_pushcfunction(L, ccMessageBoxFn);
     lua_setglobal(L, "CCMessageBox");
 
-    luaL_getmetatable(L, "CCFileUtils");
+    // Extend ax.FileUtils metatable with writable path override & removeSearchPath
+    luaL_getmetatable(L, "ax.FileUtils");
     if (lua_istable(L, -1)) {
         const lua_CFunction removeSearchPathFn = [](lua_State* L) -> int {
-            tolua_Error err{};
-            auto* self = (lua_type(L, 1) == LUA_TUSERDATA &&
-                          tolua_isusertype(L, 1, "CCFileUtils", 0, &err))
-                ? static_cast<cocos2d::CCFileUtils*>(tolua_tousertype(L, 1, nullptr))
-                : cocos2d::CCFileUtils::sharedFileUtils();
+            auto* self = ax::FileUtils::getInstance();
             const char* target = lua_tostring(L, 2);
             if (self && target) {
                 std::string targetStr(target);
@@ -995,114 +757,35 @@ void AppDelegate::registerLuaBindings(lua_State* L) {
         lua_pushcfunction(L, removeSearchPathFn);
         lua_setfield(L, -2, "removeSearchPath");
 
-        lua_getfield(L, -1, "getWritablePath");
-        if (lua_isfunction(L, -1)) {
-            const lua_CFunction getWritablePathClosure = [](lua_State* L) -> int {
-                const std::string configuredWritable = getConfiguredWritableDirSnapshot();
-                if (!configuredWritable.empty()) {
-                    lua_pushlstring(L, configuredWritable.data(), configuredWritable.size());
-                    return 1;
-                }
-                lua_pushvalue(L, lua_upvalueindex(1));
-                lua_pushvalue(L, 1);
-                lua_call(L, 1, 1);
-                const char* p = lua_tostring(L, -1);
-                if (p && *p) {
-                    std::string s(p);
-                    std::replace(s.begin(), s.end(), '\\', '/');
-                    if (s.back() != '/') s.push_back('/');
-                    lua_pop(L, 1);
-                    lua_pushlstring(L, s.data(), s.size());
-                }
+        const lua_CFunction getWritablePathFn = [](lua_State* L) -> int {
+            const std::string configured = getConfiguredWritableDirSnapshot();
+            if (!configured.empty()) {
+                lua_pushlstring(L, configured.data(), configured.size());
                 return 1;
-            };
-            lua_pushcclosure(L, getWritablePathClosure, 1);
-            lua_setfield(L, -2, "getWritablePath");
-        } else {
-            lua_pop(L, 1);
-        }
-
-        std::vector<std::string> initialPaths;
-        if (auto* fu = cocos2d::CCFileUtils::sharedFileUtils()) {
-            initialPaths = fu->getSearchPaths();
-        }
-        lua_newtable(L);
-        for (size_t i = 0; i < initialPaths.size(); ++i) {
-            lua_pushlstring(L, initialPaths[i].data(), initialPaths[i].size());
-            lua_rawseti(L, -2, static_cast<int>(i + 1));
-        }
-        lua_getfield(L, -2, "removeAllPaths");
-        const lua_CFunction removeAllPathsClosure = [](lua_State* L) -> int {
-            if (lua_isfunction(L, lua_upvalueindex(2))) {
-                lua_pushvalue(L, lua_upvalueindex(2));
-                lua_pushvalue(L, 1);
-                lua_call(L, 1, 0);
             }
-            tolua_Error err{};
-            auto* self = (lua_type(L, 1) == LUA_TUSERDATA &&
-                          tolua_isusertype(L, 1, "CCFileUtils", 0, &err))
-                ? static_cast<cocos2d::CCFileUtils*>(tolua_tousertype(L, 1, nullptr))
-                : cocos2d::CCFileUtils::sharedFileUtils();
-            if (self) {
-                int n = static_cast<int>(lua_objlen(L, lua_upvalueindex(1)));
-                for (int i = 1; i <= n; ++i) {
-                    lua_rawgeti(L, lua_upvalueindex(1), i);
-                    if (const char* p = lua_tostring(L, -1)) {
-                        self->addSearchPath(p);
-                    }
-                    lua_pop(L, 1);
-                }
-            }
-            return 0;
+            std::string s = ax::FileUtils::getInstance()->getWritablePath();
+            std::replace(s.begin(), s.end(), '\\', '/');
+            if (!s.empty() && s.back() != '/') s.push_back('/');
+            lua_pushlstring(L, s.data(), s.size());
+            return 1;
         };
-        lua_pushcclosure(L, removeAllPathsClosure, 2);
-        lua_setfield(L, -2, "removeAllPaths");
-
-        lua_getfield(L, -1, "fullPathForFilename");
-        if (lua_isfunction(L, -1)) {
-            const lua_CFunction fullPathClosure = [](lua_State* L) -> int {
-                tolua_Error err{};
-                auto* self = (lua_type(L, 1) == LUA_TUSERDATA &&
-                              tolua_isusertype(L, 1, "CCFileUtils", 0, &err))
-                    ? static_cast<cocos2d::CCFileUtils*>(tolua_tousertype(L, 1, nullptr))
-                    : cocos2d::CCFileUtils::sharedFileUtils();
-                const char* rel = lua_tostring(L, 2);
-                if (self && rel && rel[0] != '\0') {
-                    for (const auto& base : self->getSearchPaths()) {
-                        if (base.empty()) continue;
-                        std::string cand = base;
-                        if (cand.back() != '/' && cand.back() != '\\') cand.push_back('/');
-                        cand += rel;
-                        std::error_code ec;
-                        if (std::filesystem::is_directory(toSafeFsPath(cand), ec)) {
-                            std::replace(cand.begin(), cand.end(), '\\', '/');
-                            lua_pushlstring(L, cand.data(), cand.size());
-                            return 1;
-                        }
-                    }
-                }
-                lua_pushvalue(L, lua_upvalueindex(1));
-                lua_pushvalue(L, 1);
-                lua_pushvalue(L, 2);
-                lua_call(L, 2, 1);
-                return 1;
-            };
-            lua_pushcclosure(L, fullPathClosure, 1);
-            lua_setfield(L, -2, "fullPathForFilename");
-        } else {
-            lua_pop(L, 1);
-        }
+        lua_pushcfunction(L, getWritablePathFn);
+        lua_setfield(L, -2, "getWritablePath");
     }
     lua_pop(L, 1);
 
+    // Install custom gclientLuaLoader in package.loaders (Lua 5.1 / LuaJIT) or package.searchers
     lua_getglobal(L, "package");
     if (lua_istable(L, -1)) {
         lua_pushstring(L, "");
         lua_setfield(L, -2, "path");
         lua_getfield(L, -1, "loaders");
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            lua_getfield(L, -1, "searchers");
+        }
         if (lua_istable(L, -1)) {
-            const lua_CFunction loaderFn = &gclientLuaLoader;
-            lua_pushcfunction(L, loaderFn);
+            lua_pushcfunction(L, &gclientLuaLoader);
             lua_rawseti(L, -2, 2);
         }
         lua_pop(L, 1);
@@ -1116,25 +799,21 @@ void AppDelegate::scheduleNativeLoops() {
     }
 
     auto bindNativeSchedulers = [this]() {
-        if (m_ticker == nullptr) {
-            return;
-        }
-        if (cocos2d::CCDirector* director = cocos2d::CCDirector::sharedDirector()) {
-            if (cocos2d::CCScheduler* scheduler = director->getScheduler()) {
-                using cocos2d::SEL_SCHEDULE;
-                scheduler->unscheduleSelector(schedule_selector(FrameTicker::onTick), m_ticker);
-                scheduler->scheduleSelector(
-                    schedule_selector(FrameTicker::onTick),
+        if (m_ticker == nullptr) return;
+        if (ax::Director* director = ax::Director::getInstance()) {
+            if (ax::Scheduler* scheduler = director->getScheduler()) {
+                scheduler->unschedule(AX_SCHEDULE_SELECTOR(FrameTicker::onTick), m_ticker);
+                scheduler->schedule(
+                    AX_SCHEDULE_SELECTOR(FrameTicker::onTick),
                     m_ticker,
                     0.0f,
                     false);
                 if (CTimer* timer = CTimer::sharedTimer()) {
                     scheduler->unscheduleAllForTarget(timer);
-                    scheduler->scheduleUpdateForTarget(timer, 0, false);
+                    scheduler->scheduleUpdate(timer, 0, false);
                 }
             }
         }
-        gclient_rescheduleHttpClientCallbacks();
         RescheduleLuaHelpersCallbacks();
     };
 
@@ -1147,11 +826,9 @@ void AppDelegate::scheduleNativeLoops() {
 
 void AppDelegate::unscheduleNativeLoops() {
     BTUtil::setPostUnscheduleAllHook(nullptr);
-    if (m_ticker == nullptr) {
-        return;
-    }
-    if (cocos2d::CCDirector* director = cocos2d::CCDirector::sharedDirector()) {
-        if (cocos2d::CCScheduler* scheduler = director->getScheduler()) {
+    if (m_ticker == nullptr) return;
+    if (ax::Director* director = ax::Director::getInstance()) {
+        if (ax::Scheduler* scheduler = director->getScheduler()) {
             scheduler->unscheduleAllForTarget(m_ticker);
         }
     }
@@ -1162,13 +839,7 @@ void AppDelegate::unscheduleNativeLoops() {
 bool AppDelegate::runAssetValidation() {
     namespace fs = std::filesystem;
 
-    diagnostics::CrashAndTelemetry::log(
-        diagnostics::LogLevel::Info,
-        "AssetValidation",
-        "Running --validate-assets check against '%s'",
-        m_config.resourcesDir.c_str());
-
-    cocos2d::CCFileUtils* fileUtils = cocos2d::CCFileUtils::sharedFileUtils();
+    ax::FileUtils* fileUtils = ax::FileUtils::getInstance();
     const std::string mainScriptPath = fileUtils->fullPathForFilename("scripts/main.lua");
 
     std::error_code ec;
@@ -1184,35 +855,21 @@ bool AppDelegate::runAssetValidation() {
     unsigned long dataSize = 0;
     unsigned char* data = gclient::assets::LoadAndDecryptFileData(mainScriptPath, &dataSize);
     if (data == nullptr || dataSize == 0) {
-        diagnostics::CrashAndTelemetry::log(
-            diagnostics::LogLevel::Error,
-            "AssetValidation",
-            "Failed to read or decrypt '%s'",
-            mainScriptPath.c_str());
         delete[] data;
         return false;
     }
-
     delete[] data;
-    diagnostics::CrashAndTelemetry::log(
-        diagnostics::LogLevel::Info,
-        "AssetValidation",
-        "Validated '%s' (%lu bytes decrypted/loaded successfully)",
-        mainScriptPath.c_str(),
-        dataSize);
     return true;
 }
 
-void AppDelegate::reconcileInitialWindowLifecycleState(cocos2d::CCDirector* director,
-                                                       cocos2d::CCEGLView* eglView) {
+void AppDelegate::reconcileInitialWindowLifecycleState(ax::Director* director,
+                                                       ax::RenderViewImpl* renderView) {
     const bool earlyBg = m_pendingBackground.exchange(false, std::memory_order_acq_rel);
     (void)m_pendingForeground.exchange(false, std::memory_order_acq_rel);
 
-    if (earlyBg || isEglViewZeroOrMinimized(eglView)) {
+    if (earlyBg || isRenderViewZeroOrMinimized(renderView)) {
         m_isInBackground.store(true, std::memory_order_release);
-        if (director) {
-            director->stopAnimation();
-        }
+        if (director) director->stopAnimation();
         if (auto* audio = CocosDenshion::SimpleAudioEngine::sharedEngine()) {
             audio->pauseBackgroundMusic();
             audio->pauseAllEffects();
@@ -1220,11 +877,12 @@ void AppDelegate::reconcileInitialWindowLifecycleState(cocos2d::CCDirector* dire
         diagnostics::CrashAndTelemetry::flushLogs();
     } else {
         m_isInBackground.store(false, std::memory_order_release);
-        if (director && eglView) {
-            const cocos2d::CCSize winSz = director->getWinSize();
+        if (director && renderView) {
+            const ax::Vec2 winSz = director->getWinSize();
             if (!std::isfinite(winSz.width) || !std::isfinite(winSz.height) ||
                 winSz.width < 1.0f || winSz.height < 1.0f) {
-                eglView->setDesignResolutionSize(kDesignWidth, kDesignHeight, kResolutionFixedWidth);
+                renderView->setDesignResolutionSize(
+                    kDesignWidth, kDesignHeight, ResolutionPolicy::FIXED_WIDTH);
             }
         }
     }
@@ -1237,40 +895,51 @@ bool AppDelegate::applicationDidFinishLaunching() {
         return expectedState == LifecycleState::Ready;
     }
 
-    cocos2d::CCDirector* pDirector = cocos2d::CCDirector::sharedDirector();
-    cocos2d::CCEGLView* pEGLView = cocos2d::CCEGLView::sharedOpenGLView();
-    if (!pDirector || !pEGLView) {
-        diagnostics::CrashAndTelemetry::log(
-            diagnostics::LogLevel::Fatal,
-            "AppDelegate",
-            "CCDirector or CCEGLView is null during applicationDidFinishLaunching()");
-        diagnostics::CrashAndTelemetry::flushLogs();
+    // 1. Configure FileUtils search paths, hotfix overlay, and writable path isolation FIRST.
+    configureFileUtils();
+
+    // 2. Initialize Director and create/bind Axmol GLFW RenderViewImpl if not yet created.
+    ax::Director* director = ax::Director::getInstance();
+    if (!director) {
         teardownSubsystems(LifecycleState::Failed);
         return false;
     }
 
-    // 1. Configure CCFileUtils search paths, hotfix overlay, writable path isolation, and bt_decrypt hook
-    //    FIRST before any texture, font, or stats label can be loaded by CCDirector!
-    configureFileUtils();
+    auto* renderView = dynamic_cast<ax::RenderViewImpl*>(director->getRenderView());
+    if (!renderView) {
+        const float w = static_cast<float>(m_config.windowWidth > 0 ? m_config.windowWidth : 1136);
+        const float h = static_cast<float>(m_config.windowHeight > 0 ? m_config.windowHeight : 640);
+        renderView = ax::RenderViewImpl::createWithRect(
+            "Kestrel Canvas (Axmol x64)", ax::Rect(0.0f, 0.0f, w, h), 1.0f, true);
+        if (!renderView) {
+            diagnostics::CrashAndTelemetry::log(
+                diagnostics::LogLevel::Fatal, "AppDelegate", "Failed to create RenderViewImpl");
+            diagnostics::CrashAndTelemetry::flushLogs();
+            teardownSubsystems(LifecycleState::Failed);
+            return false;
+        }
+        director->setRenderView(renderView);
+    }
 
-    // 2. Bind OpenGL view to CCDirector, enable premultiplied alpha for game .pvr.ccz atlases,
-    //    and configure 1136x640 design resolution and 30 FPS cap.
-    pDirector->setOpenGLView(pEGLView);
-    cocos2d::CCTexture2D::PVRImagesHavePremultipliedAlpha(true);
-    ensureNonZeroEglFrameSize(pEGLView, m_config.windowWidth, m_config.windowHeight);
-    pEGLView->setDesignResolutionSize(kDesignWidth, kDesignHeight, kResolutionFixedWidth);
-    pDirector->setAnimationInterval(kTargetAnimationInterval);
-    pDirector->setDisplayStats(true);
+#ifdef _WIN32
+    if (HWND hwnd = renderView->getWin32Window()) {
+        gclient::ui::Win32DesktopBridge::instance().attachToWindow(hwnd);
+    }
+#endif
 
-    // 3. Handle headless --validate-assets mode if requested on CLI.
+    renderView->setDesignResolutionSize(kDesignWidth, kDesignHeight, ResolutionPolicy::FIXED_WIDTH);
+    director->setAnimationInterval(kTargetAnimationInterval);
+    director->setStatsDisplay(true);
+
+    // 3. Handle --validate-assets if invoked through full application launch.
     if (m_config.validateAssetsOnly) {
         m_assetValidationOk = runAssetValidation();
-        pDirector->end();
+        director->end();
         teardownSubsystems(m_assetValidationOk ? LifecycleState::Terminated : LifecycleState::Failed);
         return false;
     }
 
-    // 4. Honor --mute CLI flag and sync Win32DesktopBridge before Lua scripts initialize audio.
+    // 4. Honor --mute CLI flag.
     gclient::ui::Win32DesktopBridge::instance().setInitialMuted(m_config.muteAudio);
     if (m_config.muteAudio) {
         if (auto* audio = CocosDenshion::SimpleAudioEngine::sharedEngine()) {
@@ -1279,98 +948,28 @@ bool AppDelegate::applicationDidFinishLaunching() {
         }
     }
 
-    // 5. Initialize Lua engine and attach global debug.traceback() error hook.
-    cocos2d::CCLuaEngine* pEngine = cocos2d::CCLuaEngine::defaultEngine();
-    if (!pEngine || !pEngine->getLuaStack() || !pEngine->getLuaStack()->getLuaState()) {
+    // 5. Initialize Axmol LuaEngine and register bindings + 2.2.6 compatibility shims.
+    ax::LuaEngine* engine = ax::LuaEngine::getInstance();
+    if (!engine || !engine->getLuaStack() || !engine->getLuaStack()->getLuaState()) {
         diagnostics::CrashAndTelemetry::log(
-            diagnostics::LogLevel::Fatal,
-            "AppDelegate",
-            "Failed to initialize CCLuaEngine / lua_State");
+            diagnostics::LogLevel::Fatal, "AppDelegate", "Failed to initialize ax::LuaEngine");
         diagnostics::CrashAndTelemetry::flushLogs();
-        pDirector->end();
+        director->end();
         teardownSubsystems(LifecycleState::Failed);
         return false;
     }
-    cocos2d::CCScriptEngineManager::sharedManager()->setScriptEngine(pEngine);
+    ax::ScriptEngineManager::getInstance()->setScriptEngine(engine);
 
-    lua_State* L = pEngine->getLuaStack()->getLuaState();
+    lua_State* L = engine->getLuaStack()->getLuaState();
     diagnostics::CrashAndTelemetry::installLuaHooks(L);
-
-    // 6. Register all native tolua++ / Lua extension modules.
     registerLuaBindings(L);
-
-    // 7. Schedule native per-frame loops (bt::Platform::tickLoop, CNetwork::update, telemetry) + BTUtil hook.
     scheduleNativeLoops();
 
-    // 8. Boot Lua game entry point.
+    // 6. Boot Lua game entry point.
     diagnostics::CrashAndTelemetry::log(
-        diagnostics::LogLevel::Info,
-        "AppDelegate",
-        "Executing Lua entry point: require \"scripts/main\"");
+        diagnostics::LogLevel::Info, "AppDelegate", "Executing Lua entry point: require \"scripts/main\"");
 
-    const int status = pEngine->executeString("require \"scripts/main\"");
-#ifdef _WIN32
-    if (status == 0) {
-        wchar_t wideAutoScript[4096] = {};
-        const DWORD len = ::GetEnvironmentVariableW(
-            L"GCLIENT_AUTOTEST_SCRIPT", wideAutoScript, static_cast<DWORD>(_countof(wideAutoScript)));
-        if (len > 0 && len < _countof(wideAutoScript)) {
-            const std::string autoScriptUtf8 = wideToUtf8Path(std::wstring(wideAutoScript, len));
-            diagnostics::CrashAndTelemetry::log(
-                diagnostics::LogLevel::Info, "AutoTest", "Loading autotest script: %s", autoScriptUtf8.c_str());
-            unsigned long scriptBytes = 0;
-            unsigned char* scriptBuf = gclient::assets::LoadAndDecryptFileData(autoScriptUtf8, &scriptBytes);
-            if (scriptBuf && scriptBytes > 0) {
-                const std::string chunkName = "@" + autoScriptUtf8;
-                if (luaL_loadbuffer(L, reinterpret_cast<const char*>(scriptBuf), scriptBytes, chunkName.c_str()) != 0 ||
-                    lua_pcall(L, 0, 0, 0) != 0) {
-                    const char* err = lua_tostring(L, -1);
-                    diagnostics::CrashAndTelemetry::log(
-                        diagnostics::LogLevel::Error, "AutoTest", "Script error: %s", err ? err : "(null)");
-                    lua_pop(L, 1);
-                }
-            } else {
-                diagnostics::CrashAndTelemetry::log(
-                    diagnostics::LogLevel::Error, "AutoTest", "Cannot read autotest script: %s", autoScriptUtf8.c_str());
-            }
-            delete[] scriptBuf;
-        }
-    }
-#endif
-    {
-        lua_getglobal(L, "cjson");
-        const bool hasCjson = !lua_isnil(L, -1);
-        lua_pop(L, 1);
-        lua_getglobal(L, "g");
-        bool hasLoginProxy = false;
-        std::string curOS = "<nil>";
-        if (lua_istable(L, -1)) {
-            lua_getfield(L, -1, "loginProxy");
-            hasLoginProxy = !lua_isnil(L, -1);
-            lua_pop(L, 1);
-            lua_getfield(L, -1, "config");
-            if (lua_istable(L, -1)) {
-                lua_getfield(L, -1, "currentOS");
-                if (lua_isstring(L, -1)) curOS = lua_tostring(L, -1);
-                lua_pop(L, 1);
-            }
-            lua_pop(L, 1);
-        }
-        lua_pop(L, 1);
-        diagnostics::CrashAndTelemetry::log(
-            diagnostics::LogLevel::Info,
-            "AppDelegate",
-            "Lua DIAG: hasCjson=%d curOS=%s hasLoginProxy=%d",
-            hasCjson ? 1 : 0,
-            curOS.c_str(),
-            hasLoginProxy ? 1 : 0);
-    }
-    diagnostics::CrashAndTelemetry::log(
-        diagnostics::LogLevel::Info,
-        "AppDelegate",
-        "After require scripts/main: status=%d runningScene=%p",
-        status,
-        static_cast<void*>(pDirector->getRunningScene()));
+    const int status = engine->executeString("require \"scripts/main\"");
     if (status != 0) {
         diagnostics::CrashAndTelemetry::log(
             diagnostics::LogLevel::Fatal,
@@ -1378,13 +977,11 @@ bool AppDelegate::applicationDidFinishLaunching() {
             "Lua bootstrap failed (status=%d) while executing require \"scripts/main\"",
             status);
         diagnostics::CrashAndTelemetry::flushLogs();
-        pDirector->end();
+        director->end();
         teardownSubsystems(LifecycleState::Failed);
         return false;
     }
 
-    // 9. Mark application Ready ONLY after all initialization succeeded, then reconcile any
-    //    foreground/background transitions captured during native window creation or boot.
     m_lifecycleState.store(LifecycleState::Ready, std::memory_order_release);
     if (!m_config.hotfixDir.empty()) {
         update::HotUpdaterConfig hotCfg;
@@ -1395,32 +992,21 @@ bool AppDelegate::applicationDidFinishLaunching() {
             hotCfg.baseResourcesDir = toSafeFsPath(m_config.resourcesDir);
         }
         update::AtomicHotUpdater updater(hotCfg);
-        const auto confirmRes = updater.confirmStartupSuccess();
-        if (!confirmRes.ok()) {
-            diagnostics::CrashAndTelemetry::log(
-                diagnostics::LogLevel::Warn,
-                "AppDelegate",
-                "Hotfix startup confirmation warning: %s",
-                confirmRes.message.c_str());
-        }
+        (void)updater.confirmStartupSuccess();
     }
-    reconcileInitialWindowLifecycleState(pDirector, pEGLView);
+    reconcileInitialWindowLifecycleState(director, renderView);
     return true;
 }
 
 void AppDelegate::applicationDidEnterBackground() {
     if (m_lifecycleState.load(std::memory_order_acquire) != LifecycleState::Ready) {
-        // Defer background state until applicationDidFinishLaunching() completes.
         m_pendingBackground.store(true, std::memory_order_release);
         m_pendingForeground.store(false, std::memory_order_release);
         return;
     }
+    if (m_isInBackground.exchange(true, std::memory_order_acq_rel)) return;
 
-    if (m_isInBackground.exchange(true, std::memory_order_acq_rel)) {
-        return;
-    }
-
-    if (auto* director = cocos2d::CCDirector::sharedDirector()) {
+    if (auto* director = ax::Director::getInstance()) {
         director->stopAnimation();
     }
     if (auto* audio = CocosDenshion::SimpleAudioEngine::sharedEngine()) {
@@ -1431,35 +1017,27 @@ void AppDelegate::applicationDidEnterBackground() {
 }
 
 void AppDelegate::applicationWillEnterForeground() {
-    // Guard against synchronous Win32 WM_SIZE(SIZE_RESTORED) fired inside CCEGLView::setFrameSize
-    // BEFORE applicationDidFinishLaunching() has bound the GL context, stats texture, or Lua VM
-    // (root cause of 0xC0000094 EXCEPTION_INT_DIVIDE_BY_ZERO in CCLabelAtlas::updateAtlasValues).
     if (m_lifecycleState.load(std::memory_order_acquire) != LifecycleState::Ready) {
         m_pendingForeground.store(true, std::memory_order_release);
         m_pendingBackground.store(false, std::memory_order_release);
         return;
     }
 
-    cocos2d::CCDirector* director = cocos2d::CCDirector::sharedDirector();
-    cocos2d::CCEGLView* eglView = cocos2d::CCEGLView::sharedOpenGLView();
-    if (!director || isEglViewZeroOrMinimized(eglView)) {
-        // Window is still minimized/iconic (0x0 client surface); keep m_isInBackground latched
-        // until a non-zero restore/maximize arrives.
+    ax::Director* director = ax::Director::getInstance();
+    auto* rv = director ? dynamic_cast<ax::RenderViewImpl*>(director->getRenderView()) : nullptr;
+    if (!director || isRenderViewZeroOrMinimized(rv)) {
         m_pendingForeground.store(true, std::memory_order_release);
         return;
     }
 
     m_pendingForeground.store(false, std::memory_order_release);
-    const cocos2d::CCSize winSz = director->getWinSize();
+    const ax::Vec2 winSz = director->getWinSize();
     if (!std::isfinite(winSz.width) || !std::isfinite(winSz.height) ||
         winSz.width < 1.0f || winSz.height < 1.0f) {
-        eglView->setDesignResolutionSize(kDesignWidth, kDesignHeight, kResolutionFixedWidth);
+        rv->setDesignResolutionSize(kDesignWidth, kDesignHeight, ResolutionPolicy::FIXED_WIDTH);
     }
 
-    const bool wasInBackground = m_isInBackground.exchange(false, std::memory_order_acq_rel);
-    if (!wasInBackground) {
-        return;
-    }
+    if (!m_isInBackground.exchange(false, std::memory_order_acq_rel)) return;
 
     director->startAnimation();
     if (!m_config.muteAudio && !gclient::ui::Win32DesktopBridge::instance().isMuted()) {

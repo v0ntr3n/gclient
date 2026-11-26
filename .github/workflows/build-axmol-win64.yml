@@ -1,0 +1,195 @@
+name: Build & Verify Kestrel Canvas Axmol Win64 (VS2022 x64 + Axmol v2.11.5)
+
+on:
+  push:
+    branches: [ feat/axmol-port, 'feat/axmol*' ]
+  pull_request:
+    branches: [ main, feat/axmol-port ]
+  workflow_dispatch:
+
+concurrency:
+  group: build-axmol-win64-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-axmol-win64:
+    name: Build, CTest, Audit PE32+ & Smoke-Test Axmol x64 Release
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Python offline validator & PE32/PE32+ auditor unit tests
+        shell: pwsh
+        run: |
+          $env:PYTHONDONTWRITEBYTECODE = "1"
+          python -B -m py_compile tools/validate_resources.py tools/audit_pe_dependencies.py
+          python -B tests/test_patch_and_pe_validator.py
+          $tracked = @(git ls-files '*.dll' '*.exe' '*.pdb' '*.pyc')
+          if ($tracked.Count -gt 0) {
+            throw ("Prohibited binary artifacts tracked in repository: " + ($tracked -join ", "))
+          }
+
+      - name: Locate Visual Studio 2022 x64 VC143 Redist & dumpbin
+        id: vs-env
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = (& $vswhere -version "[17.0,18.0)" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          if (-not $installPath) { throw "Visual Studio 2022 not found." }
+
+          $vcRedistRoot = Join-Path $installPath "VC\Redist\MSVC"
+          $vcRedistCrt = Get-ChildItem -LiteralPath $vcRedistRoot -Directory |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName "x64\Microsoft.VC143.CRT" } |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+          if (-not $vcRedistCrt) { throw "Unable to locate x64 Microsoft.VC143.CRT under $vcRedistRoot" }
+
+          $dumpbin = Get-ChildItem -LiteralPath (Join-Path $installPath "VC\Tools\MSVC") -Recurse -Filter "dumpbin.exe" |
+            Where-Object { $_.FullName -match "Hostx64\\x64" } |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          "vcredist_x64=$vcRedistCrt" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding UTF8
+          "dumpbin=$dumpbin" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding UTF8
+
+      - name: Restore cached vcpkg x64-windows (protobuf + sqlite3)
+        id: cache-vcpkg
+        uses: actions/cache/restore@v4
+        with:
+          path: C:/vcpkg/installed
+          key: vcpkg-axmol-x64-win-v1-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-axmol-x64-win-
+
+      - name: Install Protobuf & SQLite3 (x64-windows /MD) via vcpkg
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $vcpkg = "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe"
+          & $vcpkg install protobuf:x64-windows sqlite3:x64-windows
+
+      - name: Save vcpkg x64-windows cache
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:/vcpkg/installed
+          key: vcpkg-axmol-x64-win-v1-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Restore cached Axmol v2.11.5 LTS & 1k prebuilts
+        id: cache-axmol
+        uses: actions/cache/restore@v4
+        with:
+          path: external/axmol
+          key: axmol-v2.11.5-win64-luajit-v1
+
+      - name: Clone Axmol v2.11.5 LTS & provision axslcc shader compiler
+        shell: pwsh
+        run: |
+          $axRoot = "${{ github.workspace }}/external/axmol"
+          if (-not (Test-Path -LiteralPath "$axRoot/core/axmol.h")) {
+            New-Item -ItemType Directory -Force -Path external | Out-Null
+            git clone --branch v2.11.5 --depth 1 https://github.com/axmolengine/axmol.git "$axRoot"
+          }
+          $env:AX_ROOT = $axRoot
+          New-Item -ItemType Directory -Force -Path "$axRoot/tools/external" | Out-Null
+          pwsh -NoProfile -ExecutionPolicy Bypass -File "$axRoot/1k/1kiss.ps1" -setupOnly -prefix "$axRoot/tools/external"
+          if (-not (Test-Path -LiteralPath "$axRoot/tools/external/axslcc/axslcc.exe")) {
+            throw "axslcc.exe was not provisioned under $axRoot/tools/external/axslcc"
+          }
+
+      - name: Configure CMake (Visual Studio 17 2022, -A x64, Axmol v2.11.5, LuaJIT 2.1)
+        shell: pwsh
+        run: |
+          $axRoot = "${{ github.workspace }}/external/axmol"
+          $env:AX_ROOT = $axRoot
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+            -DGCLIENT_AXMOL_ROOT="$axRoot" `
+            -DGCLIENT_VCPKG_INSTALLED_DIR="$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" `
+            -DGCLIENT_SHIPPING_RELEASE=ON `
+            -DGCLIENT_BUILD_TESTS=ON
+
+      - name: Save Axmol v2.11.5 + fetched 1k cache
+        if: steps.cache-axmol.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: external/axmol
+          key: axmol-v2.11.5-win64-luajit-v1
+
+      - name: Build GCLIENT.exe & CTest Targets (Release x64)
+        shell: pwsh
+        run: |
+          $env:AX_ROOT = "${{ github.workspace }}/external/axmol"
+          cmake --build build --config Release --parallel
+
+      - name: Run CTest C++20 Regression, LuaJIT 2.1 x64 ABI/Shim & Cobalt Relay Suites
+        shell: pwsh
+        run: |
+          $env:PYTHONDONTWRITEBYTECODE = "1"
+          $env:PATH = "${{ github.workspace }}\build\bin\gclient\Release;$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
+          ctest --test-dir build -C Release --output-on-failure --verbose
+
+      - name: Stage Clean PE32+ Release Closure, ANGLE DLLs & Compiled axslc Shaders
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/gclient-axmol-win64-release | Out-Null
+          New-Item -ItemType Directory -Force -Path dist/gclient-axmol-win64-symbols | Out-Null
+
+          $exePath = "build/bin/gclient/Release/GCLIENT.exe"
+          if (-not (Test-Path -LiteralPath $exePath)) {
+            throw "Compiled GCLIENT.exe not found at $exePath"
+          }
+
+          $angleDir = "external/axmol/3rdparty/angle/_x/lib/windows/x64"
+          python tools/audit_pe_dependencies.py dist/gclient-axmol-win64-release `
+            --arch x64 `
+            --stage-from-root-exe "$exePath" `
+            --dynamic-root-dll libEGL.dll `
+            --dynamic-root-dll libGLESv2.dll `
+            --dynamic-root-dll d3dcompiler_47.dll `
+            --search-dir "build/bin/gclient/Release" `
+            --search-dir "$angleDir" `
+            --search-dir "build/bin/Release" `
+            --search-dir "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin" `
+            --search-dir "${{ steps.vs-env.outputs.vcredist_x64 }}" `
+            --pdb-output-dir dist/gclient-axmol-win64-symbols `
+            --require-app-local-vc-redist `
+            --fail-on-unreferenced `
+            --dumpbin "${{ steps.vs-env.outputs.dumpbin }}"
+
+          if (Test-Path -LiteralPath "build/runtime/axslc") {
+            Copy-Item -Recurse -Force "build/runtime/axslc" "dist/gclient-axmol-win64-release/axslc"
+          } else {
+            throw "Compiled Axmol runtime shaders not found at build/runtime/axslc"
+          }
+
+      - name: Run Deterministic Windows x64 Startup & Unicode Smoke Harness
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/smoke_test_win32.ps1 `
+            -ArtifactDir "${{ github.workspace }}/dist/gclient-axmol-win64-release" `
+            -ReportPath "${{ github.workspace }}/dist/gclient-axmol-win64-release/smoke-test-report.json"
+
+          python -c "import pathlib, sys; sys.path.insert(0, 'tools'); import audit_pe_dependencies as a; d = pathlib.Path('dist/gclient-axmol-win64-release'); a.write_sha256_sums(d, d / 'SHA256SUMS.txt')"
+
+      - name: Upload Clean Axmol Win64 Release Artifact (gclient-axmol-win64-release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gclient-axmol-win64-release
+          path: dist/gclient-axmol-win64-release/**
+          if-no-files-found: error
+
+      - name: Upload Axmol Win64 PDB Symbol Bundle (gclient-axmol-win64-symbols)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gclient-axmol-win64-symbols
+          path: dist/gclient-axmol-win64-symbols/**
+          if-no-files-found: ignore

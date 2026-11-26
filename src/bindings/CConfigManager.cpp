@@ -1,5 +1,6 @@
 #include "CConfigManager.h"
 #include "../diagnostics/CrashAndTelemetry.h"
+#include "../assets/BtDecryptHook.h"
 
 #include <cctype>
 #include <cerrno>
@@ -411,7 +412,7 @@ CCArray* CTable::getRowById(const std::string& id) {
         return nullptr;
     }
 
-    CCFileUtils* fu = CCFileUtils::sharedFileUtils();
+    CCFileUtils* fu = ax::FileUtils::getInstance();
     for (int col = 0; col < colCount; ++col) {
         const std::string& rawCol = copiedCols[static_cast<size_t>(col)];
         if (rawCol.empty()) {
@@ -431,7 +432,7 @@ CCArray* CTable::getRowById(const std::string& id) {
             if (isEvenHexRange(rawCol.data(), trimmedLen)) {
                 std::vector<unsigned char> decoded = hexDecode(rawCol.data(), trimmedLen);
                 unsigned long decSize = static_cast<unsigned long>(decoded.size());
-                if (!decoded.empty() && fu->doDecrypt(decoded.data(), &decSize)) {
+                if (!decoded.empty() && bt_decrypt(decoded.data(), &decSize)) {
                     const size_t safeLen = (decSize <= decoded.size())
                         ? static_cast<size_t>(decSize)
                         : decoded.size();
@@ -446,7 +447,7 @@ CCArray* CTable::getRowById(const std::string& id) {
                        static_cast<unsigned char>(rawCol[3]) == 0xFE) {
                 std::vector<unsigned char> workBuf(rawCol.begin(), rawCol.end());
                 unsigned long decSize = static_cast<unsigned long>(workBuf.size());
-                if (fu->doDecrypt(workBuf.data(), &decSize)) {
+                if (bt_decrypt(workBuf.data(), &decSize)) {
                     const size_t safeLen = (decSize <= workBuf.size())
                         ? static_cast<size_t>(decSize)
                         : workBuf.size();
@@ -666,7 +667,7 @@ std::string CConfigurationManager::getDbFile(const std::string& dbFile) {
     if (dbFile.empty()) {
         return {};
     }
-    CCFileUtils* fu = CCFileUtils::sharedFileUtils();
+    CCFileUtils* fu = ax::FileUtils::getInstance();
     if (!fu) {
         return {};
     }
@@ -677,7 +678,7 @@ std::string CConfigurationManager::getDbFile(const std::string& dbFile) {
         "res/database/" + dbFile,
     };
     for (const std::string& cand : candidates) {
-        const std::string full = fu->fullPathForFilename(cand.c_str());
+        const std::string full = fu->fullPathForFilename(cand);
         if (!full.empty() && isRegularFileUtf8(full)) {
             return full;
         }

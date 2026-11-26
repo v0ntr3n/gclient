@@ -22,10 +22,10 @@ inline void pushCCObject(lua_State* tolua_S, T* obj, const char* typeName) {
         return;
     }
     CCObject* baseObj = static_cast<CCObject*>(obj);
-    const int nID = static_cast<int>(baseObj->m_uID);
-    int* pLuaID = &baseObj->m_nLuaID;
-    toluafix_pushusertype_ccobject(
-        tolua_S, nID, pLuaID, static_cast<void*>(baseObj), typeName ? typeName : "CCObject");
+    const int nID = static_cast<int>(baseObj->_ID);
+    int* pLuaID = &baseObj->_luaID;
+    toluafix_pushusertype_object(
+        tolua_S, nID, pLuaID, static_cast<void*>(baseObj), typeName ? typeName : "ax.Object");
 }
 
 CCObject* extractSafeBTCCObject(lua_State* L, int idx) {
@@ -35,7 +35,7 @@ CCObject* extractSafeBTCCObject(lua_State* L, int idx) {
 
     tolua_Error err{};
     if (lua_type(L, absIdx) == LUA_TUSERDATA) {
-        if (tolua_isusertype(L, absIdx, "CCObject", 0, &err)) {
+        if ((tolua_isusertype(L, absIdx, "ax.Object", 0, &err) || tolua_isusertype(L, absIdx, "CCObject", 0, &err))) {
             return static_cast<CCObject*>(tolua_tousertype(L, absIdx, nullptr));
         }
         return nullptr;
@@ -53,7 +53,7 @@ CCObject* extractSafeBTCCObject(lua_State* L, int idx) {
             lua_remove(L, -2);
             if (lua_type(L, -1) == LUA_TUSERDATA) {
                 CCObject* obj = nullptr;
-                if (tolua_isusertype(L, -1, "CCObject", 0, &err)) {
+                if ((tolua_isusertype(L, -1, "ax.Object", 0, &err) || tolua_isusertype(L, -1, "CCObject", 0, &err))) {
                     obj = static_cast<CCObject*>(tolua_tousertype(L, -1, nullptr));
                 }
                 lua_pop(L, 1);

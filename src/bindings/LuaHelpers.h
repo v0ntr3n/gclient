@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cocos2d.h"
+#include "compat/Axmol226Compat.h"
 #include "CCLuaEngine.h"
 
 #include <ctime>
@@ -37,7 +37,7 @@ public:
     virtual ~CTimer();
 
     void addEvent(int delaySeconds, int luaFuncRef);
-    void update(float dt) override;
+    void update(float dt);
 
 private:
     struct Event {
@@ -62,11 +62,11 @@ class SpriteBlur : public cocos2d::CCSprite {
 public:
     static SpriteBlur* create(const char* filename);
     static SpriteBlur* createWithTexture(cocos2d::CCTexture2D* texture);
-    bool initWithTexture(cocos2d::CCTexture2D* texture, const cocos2d::CCRect& rect) override;
+    bool initWithTexture(cocos2d::CCTexture2D* texture, const cocos2d::CCRect& rect);
     void initProgram();
     void setBlurSize(float size);
     void listenBack2Foreground(cocos2d::CCObject* obj);
-    void draw() override;
+    void draw(ax::Renderer* renderer, const ax::Mat4& transform, uint32_t flags) override;
 
 private:
     float m_blurSize = 0.0f;

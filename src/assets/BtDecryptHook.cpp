@@ -19,7 +19,7 @@
 #endif
 
 #if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
-#include "cocos2d.h"
+#include "compat/Axmol226Compat.h"
 #endif
 
 #if !defined(GCLIENT_STANDALONE_BUILD)
@@ -582,26 +582,34 @@ unsigned char* LoadAndDecryptFileData(const std::string& filePath,
 #endif
 
     if (!buffer) {
-        auto* fu = cocos2d::CCFileUtils::sharedFileUtils();
+        auto* fu = ax::FileUtils::getInstance();
         if (!fu) {
             return nullptr;
         }
-        const std::string resolved = fu->fullPathForFilename(normPath.c_str());
+        const std::string compatNorm = gclient::compat::ResolveConvertedAssetPath(normPath);
+        const std::string resolved = fu->fullPathForFilename(compatNorm);
         if (!resolved.empty()) {
             fullPath = resolved;
+        } else {
+            fullPath = compatNorm;
         }
 #if defined(_WIN32)
         buffer = ReadRawBinaryWin32(fullPath, &rawSize);
-        if (!buffer && fullPath != normPath) {
-            buffer = ReadRawBinaryWin32(normPath, &rawSize);
+        if (!buffer && fullPath != compatNorm) {
+            buffer = ReadRawBinaryWin32(compatNorm, &rawSize);
         }
 #endif
         if (!buffer) {
             const bool prevPopup = fu->isPopupNotify();
             fu->setPopupNotify(false);
-            buffer = fu->getFileData(fullPath.c_str(), "rb", &rawSize);
+            ax::Data fileData = fu->getDataFromFile(fullPath);
             fu->setPopupNotify(prevPopup);
-            fromCocosHeap = true;
+            if (!fileData.isNull() && fileData.getSize() > 0) {
+                rawSize = static_cast<unsigned long>(fileData.getSize());
+                buffer = new unsigned char[fileData.getSize() + kBtDecryptHeaderSize + 1u];
+                std::memcpy(buffer, fileData.getBytes(), fileData.getSize());
+                buffer[fileData.getSize()] = '\0';
+            }
         }
     }
 
@@ -665,19 +673,12 @@ void InstallBtDecryptHook(cocos2d::CCFileUtils* fileUtils) {
     WarnIfKeysMissingOnce();
 
 #if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
-    cocos2d::CCFileUtils* fu = fileUtils ? fileUtils : cocos2d::CCFileUtils::sharedFileUtils();
+    cocos2d::CCFileUtils* fu = fileUtils ? fileUtils : ax::FileUtils::getInstance();
     if (!fu) {
         LogMessage("ERROR", "InstallBtDecryptHook called before CCFileUtils::sharedFileUtils() is ready");
         return;
     }
-#if defined(GCLIENT_CCFILEUTILS_HAS_SET_DECRYPT)
-    fu->setDecrypt(bt_decrypt);
-    fu->setDecryptor(bt_decrypt);
-    LogMessage("INFO", "Registered bt_decrypt callback on CCFileUtils");
-#else
-    (void)fu;
-    LogMessage("INFO", "BtDecryptHook initialized (using explicit LoadAndDecryptFileData path)");
-#endif
+// Axmol 2.11.5 uses pre-converted assets + LoadAndDecryptFileData pass-through.
 #else
     (void)fileUtils;
 #endif

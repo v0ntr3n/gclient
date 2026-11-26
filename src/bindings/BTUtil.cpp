@@ -1,16 +1,12 @@
 #include "BTUtil.h"
 #include "CCCrypto.h"
 
-#if defined(__has_include)
-#  if __has_include("cocos-ext.h")
-#    include "cocos-ext.h"
-#    define GCLIENT_BTUTIL_HAS_COCOS_EXT 1
-#  endif
-#  if __has_include("CocoStudio/GUI/UIWidgets/UIRichText.h")
-#    include "CocoStudio/GUI/UIWidgets/UIRichText.h"
-#    define GCLIENT_BTUTIL_HAS_UIRICHTEXT 1
-#  endif
-#endif
+#include "compat/Axmol226Compat.h"
+#include "cocos-ext.h"
+#include "ui/UIRichText.h"
+#include "spine/SkeletonRenderer.h"
+#define GCLIENT_BTUTIL_HAS_COCOS_EXT 1
+#define GCLIENT_BTUTIL_HAS_UIRICHTEXT 1
 
 #include <algorithm>
 #include <chrono>
@@ -164,7 +160,7 @@ bool BTUtil::checkType(CCObject* obj, const std::string& typeName) {
         typeName == "SkeletonAnimation" ||
         typeName == "CCSkeletonAnimation" ||
         typeName == "CCSkeleton") {
-        if (dynamic_cast<cocos2d::extension::CCSkeleton*>(obj) != nullptr) return true;
+        if (dynamic_cast<spine::SkeletonRenderer*>(obj) != nullptr) return true;
     }
     if (typeName == "CCScale9Sprite" || typeName == "Scale9Sprite") {
         if (dynamic_cast<cocos2d::extension::CCScale9Sprite*>(obj) != nullptr) return true;
@@ -263,7 +259,7 @@ std::string BTUtil::getLuaOrigPackagePath() {
 std::string BTUtil::insertToSearchPathBegin(const std::string& path) {
     std::string norm = path;
     std::replace(norm.begin(), norm.end(), '\\', '/');
-    auto* fu = CCFileUtils::sharedFileUtils();
+    auto* fu = ax::FileUtils::getInstance();
     if (fu) {
         std::vector<std::string> paths = fu->getSearchPaths();
         paths.insert(paths.begin(), norm);
@@ -292,13 +288,15 @@ std::string BTUtil::sortUrlString(const std::string& url) {
 void BTUtil::exitNow() {
     // Request clean Cocos2d-x / Win32 message-loop exit rather than std::exit(0),
     // which would skip wWinMain stack unwinding, AppDelegate::shutdown(), and race worker threads!
-    if (auto* director = CCDirector::sharedDirector()) {
+    if (auto* director = ax::Director::getInstance()) {
         director->end();
     }
 #ifdef _WIN32
-    if (auto* eglView = CCEGLView::sharedOpenGLView()) {
-        if (HWND hwnd = eglView->getHWnd(); hwnd != nullptr && ::IsWindow(hwnd)) {
-            ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    if (auto* director = ax::Director::getInstance()) {
+        if (auto* rv = director->getRenderView()) {
+            if (HWND hwnd = rv->getWin32Window(); hwnd != nullptr && ::IsWindow(hwnd)) {
+                ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
         }
     }
 #endif

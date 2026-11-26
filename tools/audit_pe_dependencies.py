@@ -163,6 +163,18 @@ WINDOWS_INBOX_OS_DLLS: Set[str] = {
     "powrprof.dll",
     "msvcrt.dll",
     "ucrtbase.dll",
+    "d3d9.dll",
+    "d3d11.dll",
+    "d3d12.dll",
+    "dxgi.dll",
+    "avrt.dll",
+    "mmdevapi.dll",
+    "propsys.dll",
+    "hid.dll",
+    "dinput8.dll",
+    "xinput1_4.dll",
+    "xinput9_1_0.dll",
+    "combase.dll",
 }
 
 REQUIRED_LUA51_EXPORTS: Tuple[str, ...] = (
@@ -543,6 +555,7 @@ def stage_transitive_closure(
     dest_dir: Path,
     search_dirs: Sequence[Path],
     pdb_dest_dir: Optional[Path] = None,
+    dynamic_root_dlls: Sequence[str] = (),
 ) -> List[str]:
     """Deterministically copy root_exe and ONLY its transitive non-OS DLL closure into dest_dir."""
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -577,6 +590,20 @@ def stage_transitive_closure(
     if pdb_dest_dir is not None and exe_pdb.is_file():
         shutil.copy2(exe_pdb, pdb_dest_dir / exe_pdb.name)
 
+    for dyn_name in dynamic_root_dlls:
+        low_dyn = dyn_name.strip().lower()
+        if low_dyn and low_dyn not in visited and low_dyn in dll_index:
+            src_dll = dll_index[low_dyn]
+            dst_dll = dest_dir / src_dll.name
+            shutil.copy2(src_dll, dst_dll)
+            staged.append(src_dll.name)
+            visited.add(low_dyn)
+            queue.append(dst_dll)
+            if pdb_dest_dir is not None:
+                pdb_key = src_dll.with_suffix(".pdb").name.lower()
+                if pdb_key in pdb_index:
+                    shutil.copy2(pdb_index[pdb_key], pdb_dest_dir / pdb_index[pdb_key].name)
+
     while queue:
         cur_bin = queue.popleft()
         entry, _ = parse_pe_file(cur_bin, cur_bin.parent)
@@ -603,7 +630,7 @@ def stage_transitive_closure(
     return staged
 
 
-def cross_check_with_dumpbin(dumpbin_exe: str, bin_path: Path) -> List[str]:
+def cross_check_with_dumpbin(dumpbin_exe: str, bin_path: Path, arch: str = "x86") -> List[str]:
     """Optional cross-check with MSVC dumpbin.exe on Windows runners."""
     issues: List[str] = []
     proc = subprocess.run(
@@ -617,8 +644,9 @@ def cross_check_with_dumpbin(dumpbin_exe: str, bin_path: Path) -> List[str]:
     if proc.returncode != 0:
         issues.append(f"dumpbin exited with code {proc.returncode} on {bin_path.name}")
         return issues
-    if "14C machine (x86)" not in proc.stdout:
-        issues.append(f"dumpbin /headers did not report 14C machine (x86) for {bin_path.name}")
+    expected_token = "8664 machine (x64)" if arch == "x64" else "14C machine (x86)"
+    if expected_token not in proc.stdout:
+        issues.append(f"dumpbin /headers did not report {expected_token} for {bin_path.name}")
     return issues
 
 
@@ -628,6 +656,8 @@ def audit_artifact_directory(
     expected_lua51_sha256: str = "",
     allow_system_vc_redist: bool = True,
     dumpbin_exe: str = "",
+    arch: str = "x86",
+    dynamic_root_dlls: Sequence[str] = (),
 ) -> AuditManifest:
     pe_files: List[Path] = sorted(
         [
@@ -653,10 +683,12 @@ def audit_artifact_directory(
         by_lower[p.name.lower()] = entry
         exports_by_lower[p.name.lower()] = exps
 
-        if entry.machine != IMAGE_FILE_MACHINE_I386 or entry.pe_format != "PE32":
+        expected_machine = IMAGE_FILE_MACHINE_AMD64 if arch == "x64" else IMAGE_FILE_MACHINE_I386
+        expected_pe_fmt = "PE32+" if arch == "x64" else "PE32"
+        if entry.machine != expected_machine or entry.pe_format != expected_pe_fmt:
             violations.append(
                 f"Architecture violation in '{entry.relative_path}': got {entry.machine_name} ({entry.pe_format}), "
-                "expected IMAGE_FILE_MACHINE_I386 (PE32 x86)"
+                f"expected {MACHINE_NAMES[expected_machine]} ({expected_pe_fmt} {arch})"
             )
 
         low_self = entry.filename.lower()
@@ -685,10 +717,11 @@ def audit_artifact_directory(
                 )
 
         if dumpbin_exe and platform.system().lower().startswith("win"):
-            violations.extend(cross_check_with_dumpbin(dumpbin_exe, p))
+            violations.extend(cross_check_with_dumpbin(dumpbin_exe, p, arch=arch))
 
-    # Mandatory binary checks
-    for mandatory in (root_exe_name, "libcocos2d.dll", "lua51.dll"):
+    # Mandatory binary checks (Axmol x64 links axmol core statically; Cocos2d-x 2.2.6 x86 ships libcocos2d.dll)
+    mandatory_bins = (root_exe_name, "lua51.dll") if arch == "x64" else (root_exe_name, "libcocos2d.dll", "lua51.dll")
+    for mandatory in mandatory_bins:
         if mandatory.lower() not in by_lower:
             violations.append(f"Mandatory binary missing from artifact: '{mandatory}'")
 
@@ -722,6 +755,12 @@ def audit_artifact_directory(
         bfs: deque[str] = deque([root_exe_name.lower()])
         reachable_shipped.add(by_lower[root_exe_name.lower()].filename)
         visited_low: Set[str] = {root_exe_name.lower()}
+        for dyn_name in dynamic_root_dlls:
+            dlow = dyn_name.strip().lower()
+            if dlow in by_lower and dlow not in visited_low:
+                reachable_shipped.add(by_lower[dlow].filename)
+                visited_low.add(dlow)
+                bfs.append(dlow)
 
         while bfs:
             cur_low = bfs.popleft()
@@ -845,6 +884,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Output path for SHA256SUMS.txt.",
     )
     parser.add_argument(
+        "--arch",
+        choices=("x86", "x64"),
+        default="x86",
+        help="Expected PE architecture: x86 (PE32) or x64 (PE32+).",
+    )
+    parser.add_argument(
+        "--dynamic-root-dll",
+        action="append",
+        default=[],
+        help="Dynamically loaded runtime DLL (e.g. ANGLE libEGL.dll / libGLESv2.dll / d3dcompiler_47.dll) to stage and include in BFS closure.",
+    )
+    parser.add_argument(
         "--fail-on-unreferenced",
         action="store_true",
         help="Fail if any unreferenced .dll/.exe exists in artifact_dir.",
@@ -860,6 +911,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             dest_dir=args.artifact_dir,
             search_dirs=args.search_dir,
             pdb_dest_dir=args.pdb_output_dir,
+            dynamic_root_dlls=args.dynamic_root_dll,
         )
         print(f"[PE-Stage] Staged {len(staged)} transitive binaries into {args.artifact_dir}: {', '.join(staged)}")
 
@@ -878,6 +930,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         expected_lua51_sha256=expected_lua_sha,
         allow_system_vc_redist=(not args.require_app_local_vc_redist),
         dumpbin_exe=args.dumpbin,
+        arch=args.arch,
+        dynamic_root_dlls=args.dynamic_root_dll,
     )
 
     if args.fail_on_unreferenced and manifest.unreferenced_staged_binaries:

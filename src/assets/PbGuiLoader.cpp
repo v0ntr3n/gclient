@@ -17,10 +17,8 @@
 #include <vector>
 
 #if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
-#include "cocos2d.h"
+#include "compat/Axmol226Compat.h"
 #include "cocos-ext.h"
-#include "CocoStudio/Action/CCActionFrame.h"
-#include "CocoStudio/Action/CCActionNode.h"
 #endif
 
 #if !defined(GCLIENT_STANDALONE_BUILD)
@@ -139,7 +137,7 @@ bool DoesExactAssetFileExist(const std::string& candidatePath, std::string* outF
     if (candidatePath.empty()) {
         return false;
     }
-    auto* fu = cocos2d::CCFileUtils::sharedFileUtils();
+    auto* fu = ax::FileUtils::getInstance();
     if (!fu) {
         return false;
     }
@@ -190,44 +188,28 @@ std::string ResolveLocalAssetPath(const std::string& rawRelPath, const std::stri
     return candidates.front();
 }
 
-// Stock Cocos2d-x 2.2.6 declares Layout::doLayout() as `protected: virtual void doLayout()`.
-struct LayoutDoLayoutAccessor : public cocos2d::ui::Layout {
-    static void Invoke(cocos2d::ui::Layout* layout) {
-        if (!layout) {
-            return;
-        }
-        void (cocos2d::ui::Layout::*doLayoutFn)() = &LayoutDoLayoutAccessor::doLayout;
-        (layout->*doLayoutFn)();
-    }
-};
-
-void TriggerLayoutPass(cocos2d::ui::Layout* layout) {
-    if (!layout) {
-        return;
-    }
+void TriggerLayoutPass(ax::ui::Layout* layout) {
+    if (!layout) return;
     layout->requestDoLayout();
-    LayoutDoLayoutAccessor::Invoke(layout);
+    layout->forceDoLayout();
 }
 
-// Standard C++ [class.protected] accessor for CCTextureCache::m_pTextures so split-root
-// BMFont / Atlas textures (e.g. .fnt in Resources/ and .pkm/.png in assets/) can be
-// pre-aliased under the exact key CCLabelBMFont / CCTextureAtlas queries.
-struct TextureCacheAccessor : public cocos2d::CCTextureCache {
-    static cocos2d::CCDictionary* GetTexturesDict(cocos2d::CCTextureCache* cache) {
-        if (!cache) {
-            return nullptr;
+struct TextureCacheAccessor : public ax::TextureCache {
+    static void AliasTextureKey(ax::TextureCache* cache, const std::string& key, ax::Texture2D* tex) {
+        if (!cache || key.empty() || !tex) return;
+        auto& mapRef = cache->*(&TextureCacheAccessor::_textures);
+        if (mapRef.find(key) == mapRef.end()) {
+            tex->retain();
+            mapRef.emplace(key, tex);
         }
-        cocos2d::CCDictionary* cocos2d::CCTextureCache::*memberPtr =
-            &TextureCacheAccessor::m_pTextures;
-        return cache->*memberPtr;
     }
 };
 
 cocos2d::CCTexture2D* ProbeAndLoadTextureAcrossRoots(const std::string& rawTexPath,
                                                      const std::string& baseDir,
                                                      std::string* outResolvedCand = nullptr) {
-    auto* texCache = cocos2d::CCTextureCache::sharedTextureCache();
-    auto* fu       = cocos2d::CCFileUtils::sharedFileUtils();
+    auto* texCache = ax::Director::getInstance()->getTextureCache();
+    auto* fu       = ax::FileUtils::getInstance();
     if (!texCache) {
         return nullptr;
     }
@@ -444,8 +426,8 @@ bool CanLoadWidgetTexture(const std::string& path, cocos2d::ui::TextureResType r
         return false;
     }
     if (rt == cocos2d::ui::UI_TEX_TYPE_PLIST) {
-        auto* sfc = cocos2d::CCSpriteFrameCache::sharedSpriteFrameCache();
-        return sfc && sfc->spriteFrameByName(path.c_str()) != nullptr;
+        auto* sfc = ax::SpriteFrameCache::getInstance();
+        return sfc && sfc->getSpriteFrameByName(path.c_str()) != nullptr;
     }
     return DoesAssetOrTextureVariantExist(path) ||
            ProbeAndLoadTextureAcrossRoots(path, std::string()) != nullptr;
@@ -469,9 +451,9 @@ void ApplyBaseWidgetOptions(cocos2d::ui::Widget* widget,
     }
 
     if (opt.has_width() || opt.has_height()) {
-        const float w = opt.has_width() ? opt.width() : widget->getSize().width;
-        const float h = opt.has_height() ? opt.height() : widget->getSize().height;
-        widget->setSize(cocos2d::CCSize(w, h));
+        const float w = opt.has_width() ? opt.width() : widget->getContentSize().width;
+        const float h = opt.has_height() ? opt.height() : widget->getContentSize().height;
+        widget->setContentSize(cocos2d::CCSize(w, h));
     }
     if (opt.has_sizepercentx() || opt.has_sizepercenty()) {
         const float sx = opt.has_sizepercentx() ? opt.sizepercentx() : 0.0f;
@@ -515,13 +497,13 @@ void ApplyBaseWidgetOptions(cocos2d::ui::Widget* widget,
         widget->setVisible(opt.visible());
     }
     if (opt.has_zorder()) {
-        widget->setZOrder(opt.zorder());
+        widget->setLocalZOrder(opt.zorder());
     }
     if (opt.has_flipx()) {
-        widget->setFlipX(opt.flipx());
+        widget->setFlippedX(opt.flipx());
     }
     if (opt.has_flipy()) {
-        widget->setFlipY(opt.flipy());
+        widget->setFlippedY(opt.flipy());
     }
 
     if (opt.has_anchorpointx() || opt.has_anchorpointy()) {
@@ -646,8 +628,8 @@ void ApplyLayoutOptions(cocos2d::ui::Layout* layout,
     }
 
     if (opt.has_adaptscreen() && opt.adaptscreen()) {
-        const cocos2d::CCSize winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
-        layout->setSize(winSize);
+        const cocos2d::CCSize winSize = ax::Director::getInstance()->getWinSize();
+        layout->setContentSize(winSize);
     }
 }
 
@@ -692,7 +674,7 @@ void ApplyButtonOptions(cocos2d::ui::Button* button,
             opt.has_capinsetswidth() ? opt.capinsetswidth() : 0.0f,
             opt.has_capinsetsheight() ? opt.capinsetsheight() : 0.0f));
         if (opt.has_scale9width() && opt.has_scale9height()) {
-            button->setSize(cocos2d::CCSize(opt.scale9width(), opt.scale9height()));
+            button->setContentSize(cocos2d::CCSize(opt.scale9width(), opt.scale9height()));
         }
     }
 
@@ -774,7 +756,7 @@ void ApplyImageViewOptions(cocos2d::ui::ImageView* img,
                 opt.has_capinsetswidth() ? opt.capinsetswidth() : 0.0f,
                 opt.has_capinsetsheight() ? opt.capinsetsheight() : 0.0f));
             if (opt.has_scale9width() && opt.has_scale9height()) {
-                img->setSize(cocos2d::CCSize(opt.scale9width(), opt.scale9height()));
+                img->setContentSize(cocos2d::CCSize(opt.scale9width(), opt.scale9height()));
             }
         }
     }
@@ -805,7 +787,7 @@ void ApplyLabelOptions(cocos2d::ui::Label* label, const CSOptions& opt) {
             static_cast<cocos2d::CCVerticalTextAlignment>(opt.valignment()));
     }
     if (opt.has_text()) {
-        label->setText(opt.text());
+        label->setString(opt.text());
     }
 
     const bool  optIgnoreSize = opt.has_ignoresize() ? opt.ignoresize() : true;
@@ -828,21 +810,21 @@ void ApplyLabelOptions(cocos2d::ui::Label* label, const CSOptions& opt) {
         label->ignoreContentAdaptWithSize(false);
         label->setTextAreaSize(cocos2d::CCSize(areaW, 0.0f));
 
-        if (auto* ttf = dynamic_cast<cocos2d::CCLabelTTF*>(label->getVirtualRenderer())) {
-            ttf->setDimensions(cocos2d::CCSize(areaW, 0.0f));
+        if (auto* ttf = dynamic_cast<ax::Label*>(label->getVirtualRenderer())) {
+            ttf->setDimensions(areaW, 0.0f);
             const cocos2d::CCSize naturalSize = ttf->getContentSize();
             const float           targetH     = std::max(areaH, naturalSize.height);
-            label->setSize(cocos2d::CCSize(areaW, targetH));
+            label->setContentSize(cocos2d::CCSize(areaW, targetH));
             label->setTextAreaSize(cocos2d::CCSize(areaW, 0.0f));
-            ttf->setDimensions(cocos2d::CCSize(areaW, 0.0f));
+            ttf->setDimensions(areaW, 0.0f);
             ttf->setScaleX(1.0f);
             ttf->setScaleY(1.0f);
         }
     } else {
         label->ignoreContentAdaptWithSize(true);
         label->setTextAreaSize(cocos2d::CCSizeZero);
-        if (auto* ttf = dynamic_cast<cocos2d::CCLabelTTF*>(label->getVirtualRenderer())) {
-            ttf->setDimensions(cocos2d::CCSizeZero);
+        if (auto* ttf = dynamic_cast<ax::Label*>(label->getVirtualRenderer())) {
+            ttf->setDimensions(0.0f, 0.0f);
             ttf->setScaleX(1.0f);
             ttf->setScaleY(1.0f);
         }
@@ -914,14 +896,12 @@ void ApplyLabelAtlasOptions(cocos2d::ui::LabelAtlas* atlas,
 
     // Alias under fullPathForFilename(resolvedTexPath) in CCTextureCache::m_pTextures so
     // CCTextureAtlas::initWithFile never misses if extension fallback (.pkm/.pvr.ccz) occurred.
-    auto* fu       = cocos2d::CCFileUtils::sharedFileUtils();
-    auto* texCache = cocos2d::CCTextureCache::sharedTextureCache();
+    auto* fu       = ax::FileUtils::getInstance();
+    auto* texCache = ax::Director::getInstance()->getTextureCache();
     if (fu && texCache) {
-        if (cocos2d::CCDictionary* texDict = TextureCacheAccessor::GetTexturesDict(texCache)) {
-            const std::string expectedKey = fu->fullPathForFilename(resolvedTexPath.c_str());
-            if (!expectedKey.empty() && texDict->objectForKey(expectedKey) == nullptr) {
-                texDict->setObject(tex, expectedKey);
-            }
+        const std::string expectedKey = fu->fullPathForFilename(resolvedTexPath);
+        if (!expectedKey.empty()) {
+            TextureCacheAccessor::AliasTextureKey(texCache, expectedKey, tex);
         }
     }
 
@@ -991,8 +971,8 @@ void ApplyLabelBMFontOptions(cocos2d::ui::LabelBMFont* bmfont,
         }
 
         const std::string fntDir   = ExtractDirectoryPrefix(chosenFnt);
-        auto*             fu       = cocos2d::CCFileUtils::sharedFileUtils();
-        auto*             texCache = cocos2d::CCTextureCache::sharedTextureCache();
+        auto*             fu       = ax::FileUtils::getInstance();
+        auto*             texCache = ax::Director::getInstance()->getTextureCache();
         bool              allPagesLoaded = true;
 
         for (const std::string& pageFile : pageFiles) {
@@ -1013,14 +993,9 @@ void ApplyLabelBMFontOptions(cocos2d::ui::LabelBMFont* bmfont,
             // so when .fnt is in Resources/ and page texture is in assets/, CCLabelBMFont's
             // internal CCTextureCache::addImage lookup hits immediately instead of NULL->retain()!
             if (fu && texCache) {
-                if (cocos2d::CCDictionary* texDict =
-                        TextureCacheAccessor::GetTexturesDict(texCache)) {
-                    const std::string expectedAtlasKey =
-                        fu->fullPathFromRelativeFile(pageFile.c_str(), chosenFnt.c_str());
-                    if (!expectedAtlasKey.empty() &&
-                        texDict->objectForKey(expectedAtlasKey) == nullptr) {
-                        texDict->setObject(pageTex, expectedAtlasKey);
-                    }
+                const std::string expectedAtlasKey = fu->fullPathFromRelativeFile(pageFile, chosenFnt);
+                if (!expectedAtlasKey.empty()) {
+                    TextureCacheAccessor::AliasTextureKey(texCache, expectedAtlasKey, pageTex);
                 }
             }
         }
@@ -1034,7 +1009,7 @@ void ApplyLabelBMFontOptions(cocos2d::ui::LabelBMFont* bmfont,
     }
 
     if (fntReady && opt.has_text()) {
-        bmfont->setText(opt.text().c_str());
+        bmfont->setString(opt.text().c_str());
     }
 }
 
@@ -1045,7 +1020,7 @@ void ApplyLoadingBarOptions(cocos2d::ui::LoadingBar* bar,
         return;
     }
 
-    const cocos2d::CCSize preLoadSize  = bar->getSize();
+    const cocos2d::CCSize preLoadSize  = bar->getContentSize();
     const bool            scale9Enable = opt.has_scale9enable() && opt.scale9enable();
 
     float targetW = preLoadSize.width;
@@ -1094,20 +1069,20 @@ void ApplyLoadingBarOptions(cocos2d::ui::LoadingBar* bar,
             opt.has_capinsetsy() ? opt.capinsetsy() : 0.0f,
             opt.has_capinsetswidth() ? opt.capinsetswidth() : 0.0f,
             opt.has_capinsetsheight() ? opt.capinsetsheight() : 0.0f));
-        if (targetW <= 0.0f && bar->getSize().width > 0.0f) {
-            targetW = bar->getSize().width;
+        if (targetW <= 0.0f && bar->getContentSize().width > 0.0f) {
+            targetW = bar->getContentSize().width;
         }
-        if (targetH <= 0.0f && bar->getSize().height > 0.0f) {
-            targetH = bar->getSize().height;
+        if (targetH <= 0.0f && bar->getContentSize().height > 0.0f) {
+            targetH = bar->getContentSize().height;
         }
-        bar->setSize(cocos2d::CCSize(targetW, targetH));
+        bar->setContentSize(cocos2d::CCSize(targetW, targetH));
     } else {
         const bool ignoreSize = opt.has_ignoresize() ? opt.ignoresize() : true;
         if (!ignoreSize && (targetW > 0.0f || targetH > 0.0f)) {
-            const float resolvedW = (targetW > 0.0f) ? targetW : bar->getSize().width;
-            const float resolvedH = (targetH > 0.0f) ? targetH : bar->getSize().height;
+            const float resolvedW = (targetW > 0.0f) ? targetW : bar->getContentSize().width;
+            const float resolvedH = (targetH > 0.0f) ? targetH : bar->getContentSize().height;
             bar->ignoreContentAdaptWithSize(false);
-            bar->setSize(cocos2d::CCSize(resolvedW, resolvedH));
+            bar->setContentSize(cocos2d::CCSize(resolvedW, resolvedH));
         }
     }
 
@@ -1161,7 +1136,7 @@ void ApplySliderOptions(cocos2d::ui::Slider* slider,
     }
 
     if (opt.has_bartexturescale9enable() && opt.bartexturescale9enable() && opt.has_length()) {
-        slider->setSize(cocos2d::CCSize(opt.length(), slider->getSize().height));
+        slider->setContentSize(cocos2d::CCSize(opt.length(), slider->getContentSize().height));
     }
     if (opt.has_percent()) {
         slider->setPercent(opt.percent());
@@ -1180,7 +1155,7 @@ void ApplyTextFieldOptions(cocos2d::ui::TextField* tf, const CSOptions& opt) {
         tf->setPlaceHolder(opt.placeholder());
     }
     if (opt.has_text()) {
-        tf->setText(opt.text());
+        tf->setString(opt.text());
     }
     if (opt.has_fontsize()) {
         tf->setFontSize(opt.fontsize());
@@ -1241,40 +1216,21 @@ void ApplyListViewOptions(cocos2d::ui::ListView* lv,
     }
 }
 
-struct ActionManagerAccessor : public cocos2d::extension::ActionManager {
-    static cocos2d::CCDictionary* GetActionDic(cocos2d::extension::ActionManager* mgr) {
-        if (!mgr) {
-            return nullptr;
-        }
-        cocos2d::CCDictionary* cocos2d::extension::ActionManager::*memberPtr =
-            &ActionManagerAccessor::m_pActionDic;
-        return mgr->*memberPtr;
+struct ActionManagerExAccessor : public cocostudio::ActionManagerEx {
+    static std::unordered_map<std::string, ax::Vector<cocostudio::ActionObject*>>*
+    GetActionMap(cocostudio::ActionManagerEx* mgr) {
+        if (!mgr) return nullptr;
+        return &(mgr->*(&ActionManagerExAccessor::_actionDic));
     }
 };
 
-// ============================================================================
-// WidgetActionGroup & WidgetActionGuardComponent
-//
-// Stock Cocos2d-x 2.2.6 ActionNode stores its target `CCObject* m_pObject` as a
-// RAW unretained pointer while ActionManager::m_pActionDic retains ActionObject
-// globally. When panels (e.g. CopyEndGetFragmentPanel) close and destroy their
-// Widgets without stopping/releasing every alias key in ActionManager, ticking
-// ActionNodes dereference freed Widget memory (UAF).
-//
-// Attaching a CCComponent guard to both `rootWidget` and each `targetWidget`:
-//   - Stops playing ActionObjects on `onExit()` so off-stage panels never tick.
-//   - On `~Widget()` (`~CCNode()` -> `~CCComponentContainer()`), immediately
-//     stops ActionObjects, nulls `ActionNode::setObject(nullptr)` before Widget
-//     memory is freed, and evicts stale `actionArray` entries from `m_pActionDic`.
-// ============================================================================
 struct TrackedActionNodeEntry {
-    cocos2d::extension::ActionObject* actionObj    = nullptr;
-    cocos2d::extension::ActionNode*   actionNode   = nullptr;
-    cocos2d::ui::Widget*              targetWidget = nullptr;
+    cocostudio::ActionObject* actionObj    = nullptr;
+    cocostudio::ActionNode*   actionNode   = nullptr;
+    ax::ui::Widget*           targetWidget = nullptr;
 };
 
 struct WidgetActionGroup {
-    cocos2d::CCArray*                   actionArray = nullptr;
     std::vector<std::string>            registeredKeys;
     std::vector<TrackedActionNodeEntry> entries;
 
@@ -1293,13 +1249,9 @@ struct WidgetActionGroup {
                 e.actionNode = nullptr;
             }
         }
-        if (actionArray) {
-            actionArray->release();
-            actionArray = nullptr;
-        }
     }
 
-    void stopPlayingForWidget(cocos2d::ui::Widget* widget, bool allIfRoot) {
+    void stopPlayingForWidget(ax::ui::Widget* widget, bool allIfRoot) {
         for (auto& e : entries) {
             if ((allIfRoot || e.targetWidget == widget) && e.actionObj && e.actionObj->isPlaying()) {
                 e.actionObj->stop();
@@ -1307,10 +1259,8 @@ struct WidgetActionGroup {
         }
     }
 
-    void detachDestroyedWidget(cocos2d::ui::Widget* widget) {
-        if (!widget) {
-            return;
-        }
+    void detachDestroyedWidget(ax::ui::Widget* widget) {
+        if (!widget) return;
         for (auto& e : entries) {
             if (e.targetWidget == widget) {
                 if (e.actionObj && e.actionObj->isPlaying()) {
@@ -1334,62 +1284,20 @@ struct WidgetActionGroup {
             }
             e.targetWidget = nullptr;
         }
-        if (!actionArray || registeredKeys.empty()) {
-            return;
-        }
-        auto* mgr       = cocos2d::extension::ActionManager::shareManager();
-        auto* actionDic = ActionManagerAccessor::GetActionDic(mgr);
-        if (!actionDic) {
-            return;
-        }
+        if (registeredKeys.empty()) return;
+        auto* mgr = cocostudio::ActionManagerEx::getInstance();
+        auto* actionMap = ActionManagerExAccessor::GetActionMap(mgr);
+        if (!actionMap) return;
         for (const std::string& key : registeredKeys) {
-            if (actionDic->objectForKey(key) == actionArray) {
-                actionDic->removeObjectForKey(key);
-            }
+            actionMap->erase(key);
         }
         registeredKeys.clear();
     }
 };
 
-std::mutex                                                                g_actionGroupsMutex;
-std::unordered_map<cocos2d::CCArray*, std::weak_ptr<WidgetActionGroup>>   g_activeActionGroups;
-
-void DetachOverwrittenActionArray(cocos2d::CCArray* prevArray) {
-    if (!prevArray) {
-        return;
-    }
-    std::shared_ptr<WidgetActionGroup> group;
-    {
-        std::lock_guard<std::mutex> lock(g_actionGroupsMutex);
-        auto it = g_activeActionGroups.find(prevArray);
-        if (it != g_activeActionGroups.end()) {
-            group = it->second.lock();
-        }
-    }
-    if (group) {
-        for (auto& e : group->entries) {
-            if (e.actionObj && e.actionObj->isPlaying()) {
-                e.actionObj->stop();
-            }
-            if (e.actionNode) {
-                e.actionNode->setObject(nullptr);
-            }
-            e.targetWidget = nullptr;
-        }
-    } else {
-        for (unsigned int i = 0; i < prevArray->count(); ++i) {
-            auto* prevObj = dynamic_cast<cocos2d::extension::ActionObject*>(
-                prevArray->objectAtIndex(i));
-            if (prevObj && prevObj->isPlaying()) {
-                prevObj->stop();
-            }
-        }
-    }
-}
-
-class WidgetActionGuardComponent final : public cocos2d::CCComponent {
+class WidgetActionGuardComponent final : public ax::Component {
 public:
-    WidgetActionGuardComponent(cocos2d::ui::Widget* ownerWidget,
+    WidgetActionGuardComponent(ax::ui::Widget* ownerWidget,
                                bool isRootGuard,
                                const char* compName)
         : m_ownerWidget(ownerWidget),
@@ -1400,15 +1308,9 @@ public:
 
     ~WidgetActionGuardComponent() override {
         for (const auto& group : m_groups) {
-            if (!group) {
-                continue;
-            }
+            if (!group) continue;
             if (m_isRootGuard) {
                 group->detachAllAndEvictFromActionManager();
-                if (group->actionArray) {
-                    std::lock_guard<std::mutex> lock(g_actionGroupsMutex);
-                    g_activeActionGroups.erase(group->actionArray);
-                }
             } else {
                 group->detachDestroyedWidget(m_ownerWidget);
             }
@@ -1416,7 +1318,7 @@ public:
     }
 
     void onExit() override {
-        cocos2d::CCComponent::onExit();
+        ax::Component::onExit();
         for (const auto& group : m_groups) {
             if (group) {
                 group->stopPlayingForWidget(m_ownerWidget, m_isRootGuard);
@@ -1425,33 +1327,26 @@ public:
     }
 
     void addGroup(const std::shared_ptr<WidgetActionGroup>& group) {
-        if (!group) {
-            return;
-        }
+        if (!group) return;
         for (const auto& existing : m_groups) {
-            if (existing == group) {
-                return;
-            }
+            if (existing == group) return;
         }
         m_groups.push_back(group);
     }
 
 private:
-    cocos2d::ui::Widget*                            m_ownerWidget = nullptr;
+    ax::ui::Widget*                                 m_ownerWidget = nullptr;
     bool                                            m_isRootGuard = false;
     std::vector<std::shared_ptr<WidgetActionGroup>> m_groups;
 };
 
-void AttachActionGuardToWidget(cocos2d::ui::Widget* widget,
+void AttachActionGuardToWidget(ax::ui::Widget* widget,
                                bool isRootGuard,
                                const std::shared_ptr<WidgetActionGroup>& group) {
-    if (!widget || !group) {
-        return;
-    }
+    if (!widget || !group) return;
     const char* compName =
         isRootGuard ? "__gclient_action_root_guard__" : "__gclient_action_target_guard__";
-    if (auto* existing =
-            dynamic_cast<WidgetActionGuardComponent*>(widget->getComponent(compName))) {
+    if (auto* existing = dynamic_cast<WidgetActionGuardComponent*>(widget->getComponent(compName))) {
         existing->addGroup(group);
         return;
     }
@@ -1464,38 +1359,23 @@ void AttachActionGuardToWidget(cocos2d::ui::Widget* widget,
     }
 }
 
-cocos2d::ui::Widget* SeekActionWidgetByActionTag(cocos2d::ui::Widget* root, int actionTag) {
-    if (!root) {
-        return nullptr;
-    }
-    if (root->getActionTag() == actionTag) {
-        return root;
-    }
-    cocos2d::CCArray* children = root->getChildren();
-    if (!children) {
-        return nullptr;
-    }
-    const unsigned int count = children->count();
-    for (unsigned int i = 0; i < count; ++i) {
-        auto* childWidget = dynamic_cast<cocos2d::ui::Widget*>(children->objectAtIndex(i));
-        if (!childWidget) {
-            continue;
-        }
-        if (cocos2d::ui::Widget* found = SeekActionWidgetByActionTag(childWidget, actionTag)) {
-            return found;
+ax::ui::Widget* SeekActionWidgetByActionTag(ax::ui::Widget* root, int actionTag) {
+    if (!root) return nullptr;
+    if (root->getActionTag() == actionTag) return root;
+    for (ax::Node* child : root->getChildren()) {
+        if (auto* childWidget = dynamic_cast<ax::ui::Widget*>(child)) {
+            if (ax::ui::Widget* found = SeekActionWidgetByActionTag(childWidget, actionTag)) {
+                return found;
+            }
         }
     }
     return nullptr;
 }
 
 void AddUniqueAnimationKey(std::vector<std::string>& keys, const std::string& candidate) {
-    if (candidate.empty()) {
-        return;
-    }
+    if (candidate.empty()) return;
     for (const std::string& existing : keys) {
-        if (existing == candidate) {
-            return;
-        }
+        if (existing == candidate) return;
     }
     keys.push_back(candidate);
 }
@@ -1503,11 +1383,9 @@ void AddUniqueAnimationKey(std::vector<std::string>& keys, const std::string& ca
 std::vector<std::string> BuildActionDictionaryKeys(const std::string& sourceFileName) {
     std::vector<std::string> keys;
     const std::string normPath = NormalizeAssetPath(sourceFileName);
-    if (normPath.empty()) {
-        return keys;
-    }
+    if (normPath.empty()) return keys;
 
-    const size_t      slashPos = normPath.find_last_of('/');
+    const size_t slashPos = normPath.find_last_of('/');
     const std::string baseName =
         (slashPos == std::string::npos) ? normPath : normPath.substr(slashPos + 1);
 
@@ -1525,115 +1403,87 @@ std::vector<std::string> BuildActionDictionaryKeys(const std::string& sourceFile
 
 void RegisterGuiAnimations(const CSAnimation& anim,
                            const std::string& sourceFileName,
-                           cocos2d::ui::Widget* rootWidget) {
-    if (!rootWidget || anim.actionlist_size() == 0) {
-        return;
-    }
+                           ax::ui::Widget* rootWidget) {
+    if (!rootWidget || anim.actionlist_size() == 0) return;
 
-    auto* actionMgr = cocos2d::extension::ActionManager::shareManager();
-    if (!actionMgr) {
-        return;
-    }
+    auto* actionMgr = cocostudio::ActionManagerEx::getInstance();
+    auto* actionMap = ActionManagerExAccessor::GetActionMap(actionMgr);
+    if (!actionMap) return;
 
-    cocos2d::CCDictionary* actionDic = ActionManagerAccessor::GetActionDic(actionMgr);
-    if (!actionDic) {
-        return;
-    }
-
-    auto* actionArray = cocos2d::CCArray::create();
-    if (!actionArray) {
-        return;
-    }
-
-    auto group         = std::make_shared<WidgetActionGroup>();
-    group->actionArray = actionArray;
-    actionArray->retain();
-
-    std::vector<cocos2d::ui::Widget*> boundTargets;
+    ax::Vector<cocostudio::ActionObject*> actionVec;
+    auto group = std::make_shared<WidgetActionGroup>();
+    std::vector<ax::ui::Widget*> boundTargets;
 
     for (int i = 0; i < anim.actionlist_size(); ++i) {
-        const CSAction& pbAction   = anim.actionlist(i);
-        const float     unitTime   = (pbAction.has_unittime() && pbAction.unittime() > 0.0f)
-                                         ? pbAction.unittime()
-                                         : (1.0f / 60.0f);
-        auto*           actionObj  = new cocos2d::extension::ActionObject();
+        const CSAction& pbAction = anim.actionlist(i);
+        const float unitTime = (pbAction.has_unittime() && pbAction.unittime() > 0.0f)
+                                   ? pbAction.unittime()
+                                   : (1.0f / 60.0f);
+        auto* actionObj = new cocostudio::ActionObject();
         actionObj->setName(pbAction.name().c_str());
         actionObj->setLoop(pbAction.loop());
         actionObj->setUnitTime(unitTime);
 
         for (int n = 0; n < pbAction.actionnodelist_size(); ++n) {
-            const CSActionNode& pbNode     = pbAction.actionnodelist(n);
-            auto*               actionNode = new cocos2d::extension::ActionNode();
+            const CSActionNode& pbNode = pbAction.actionnodelist(n);
+            auto* actionNode = new cocostudio::ActionNode();
             actionNode->setActionTag(pbNode.actiontag());
             actionNode->setUnitTime(unitTime);
 
-            cocos2d::ui::Widget* targetWidget =
-                SeekActionWidgetByActionTag(rootWidget, pbNode.actiontag());
+            ax::ui::Widget* targetWidget = SeekActionWidgetByActionTag(rootWidget, pbNode.actiontag());
             if (targetWidget) {
                 actionNode->setObject(targetWidget);
                 boundTargets.push_back(targetWidget);
             }
 
-            TrackedActionNodeEntry tracked;
-            tracked.actionObj    = actionObj;
-            tracked.actionNode   = actionNode;
-            tracked.targetWidget = targetWidget;
+            TrackedActionNodeEntry tracked{actionObj, actionNode, targetWidget};
             actionObj->retain();
             actionNode->retain();
             group->entries.push_back(tracked);
 
-            int moveSlot  = 0;
-            int scaleSlot = 0;
-            int rotSlot   = 0;
-            int fadeSlot  = 0;
-            int tintSlot  = 0;
-
+            int moveSlot = 0, scaleSlot = 0, rotSlot = 0, fadeSlot = 0, tintSlot = 0;
             for (int f = 0; f < pbNode.actionframelist_size(); ++f) {
                 const CSActionFrame& pbFrame = pbNode.actionframelist(f);
-                const int            frameId = pbFrame.frameid();
+                const int frameId = pbFrame.frameid();
 
                 if (pbFrame.has_positionx() || pbFrame.has_positiony()) {
-                    auto* moveFrame = new cocos2d::extension::ActionMoveFrame();
+                    auto* moveFrame = new cocostudio::ActionMoveFrame();
                     moveFrame->setFrameIndex(frameId);
-                    moveFrame->setPosition(cocos2d::CCPoint(
+                    moveFrame->setPosition(ax::Vec2(
                         pbFrame.has_positionx() ? pbFrame.positionx() : 0.0f,
                         pbFrame.has_positiony() ? pbFrame.positiony() : 0.0f));
                     actionNode->insertFrame(moveSlot++, moveFrame);
                     moveFrame->release();
                 }
-
                 if (pbFrame.has_scalex() || pbFrame.has_scaley()) {
-                    auto* scaleFrame = new cocos2d::extension::ActionScaleFrame();
+                    auto* scaleFrame = new cocostudio::ActionScaleFrame();
                     scaleFrame->setFrameIndex(frameId);
                     scaleFrame->setScaleX(pbFrame.has_scalex() ? pbFrame.scalex() : 1.0f);
                     scaleFrame->setScaleY(pbFrame.has_scaley() ? pbFrame.scaley() : 1.0f);
                     actionNode->insertFrame(scaleSlot++, scaleFrame);
                     scaleFrame->release();
                 }
-
                 if (pbFrame.has_rotation()) {
-                    auto* rotFrame = new cocos2d::extension::ActionRotationFrame();
+                    auto* rotFrame = new cocostudio::ActionRotationFrame();
                     rotFrame->setFrameIndex(frameId);
                     rotFrame->setRotation(pbFrame.rotation());
                     actionNode->insertFrame(rotSlot++, rotFrame);
                     rotFrame->release();
                 }
-
                 if (pbFrame.has_opacity()) {
-                    auto* fadeFrame = new cocos2d::extension::ActionFadeFrame();
+                    auto* fadeFrame = new cocostudio::ActionFadeFrame();
                     fadeFrame->setFrameIndex(frameId);
                     fadeFrame->setOpacity(pbFrame.opacity());
                     actionNode->insertFrame(fadeSlot++, fadeFrame);
                     fadeFrame->release();
                 }
-
                 if (pbFrame.has_colorr() || pbFrame.has_colorg() || pbFrame.has_colorb()) {
-                    auto* tintFrame = new cocos2d::extension::ActionTintFrame();
+                    auto* tintFrame = new cocostudio::ActionTintFrame();
                     tintFrame->setFrameIndex(frameId);
-                    tintFrame->setColor(cocos2d::ccc3(
-                        static_cast<GLubyte>(pbFrame.has_colorr() ? pbFrame.colorr() : 255),
-                        static_cast<GLubyte>(pbFrame.has_colorg() ? pbFrame.colorg() : 255),
-                        static_cast<GLubyte>(pbFrame.has_colorb() ? pbFrame.colorb() : 255)));
+                    tintFrame->setColor(ax::Color3B(
+                        static_cast<uint8_t>(pbFrame.has_colorr() ? pbFrame.colorr() : 255),
+                        static_cast<uint8_t>(pbFrame.has_colorg() ? pbFrame.colorg() : 255),
+                        static_cast<uint8_t>(pbFrame.has_colorb() ? pbFrame.colorb() : 255)));
                     actionNode->insertFrame(tintSlot++, tintFrame);
                     tintFrame->release();
                 }
@@ -1643,30 +1493,26 @@ void RegisterGuiAnimations(const CSAnimation& anim,
             actionNode->release();
         }
 
-        actionArray->addObject(actionObj);
+        actionVec.pushBack(actionObj);
         actionObj->release();
     }
 
     const std::vector<std::string> keys = BuildActionDictionaryKeys(sourceFileName);
-    group->registeredKeys               = keys;
+    group->registeredKeys = keys;
 
-    {
-        std::lock_guard<std::mutex> lock(g_actionGroupsMutex);
-        g_activeActionGroups[actionArray] = group;
-    }
-
-    AttachActionGuardToWidget(rootWidget, /*isRootGuard=*/true, group);
-    for (cocos2d::ui::Widget* targetWidget : boundTargets) {
-        AttachActionGuardToWidget(targetWidget, /*isRootGuard=*/false, group);
+    AttachActionGuardToWidget(rootWidget, true, group);
+    for (ax::ui::Widget* targetWidget : boundTargets) {
+        AttachActionGuardToWidget(targetWidget, false, group);
     }
 
     for (const std::string& key : keys) {
-        if (auto* prevArray = dynamic_cast<cocos2d::CCArray*>(actionDic->objectForKey(key))) {
-            if (prevArray != actionArray) {
-                DetachOverwrittenActionArray(prevArray);
+        auto it = actionMap->find(key);
+        if (it != actionMap->end()) {
+            for (auto* prevObj : it->second) {
+                if (prevObj && prevObj->isPlaying()) prevObj->stop();
             }
         }
-        actionDic->setObject(actionArray, key);
+        (*actionMap)[key] = actionVec;
     }
 }
 
@@ -1739,8 +1585,8 @@ void AttachSceneComponent(cocos2d::CCNode* node,
                 PbGuiLoader::LoadPlistSpriteFramesSafe(rawPlist, baseDir);
             }
             if (!resPath.empty()) {
-                auto* sfc = cocos2d::CCSpriteFrameCache::sharedSpriteFrameCache();
-                if (sfc && sfc->spriteFrameByName(resPath.c_str()) != nullptr) {
+                auto* sfc = ax::SpriteFrameCache::getInstance();
+                if (sfc && sfc->getSpriteFrameByName(resPath.c_str()) != nullptr) {
                     sprite = cocos2d::CCSprite::createWithSpriteFrameName(resPath.c_str());
                 }
             }
@@ -1793,7 +1639,7 @@ void AttachSceneComponent(cocos2d::CCNode* node,
                 (dotPos == std::string::npos || dotPos < start) ? std::string::npos : (dotPos - start);
             const std::string armName = resPath.substr(start, len);
 
-            auto* armMgr = cocos2d::extension::CCArmatureDataManager::sharedArmatureDataManager();
+            auto* armMgr = cocostudio::ArmatureDataManager::getInstance();
             if (armMgr && !armName.empty() &&
                 armMgr->getArmatureData(armName.c_str()) != nullptr) {
                 if (auto* arm = cocos2d::extension::CCArmature::create(armName.c_str())) {
@@ -1935,7 +1781,7 @@ bool PbGuiLoader::LoadPlistSpriteFramesSafe(const std::string& plistPath,
     // Pass 2: fallback to CCSpriteFrameCache::addSpriteFramesWithFile ONLY after
     // verifying the .plist exists on disk, is non-empty XML (NOT .plistb or 0xFEFEFEFE),
     // and probing its atlas texture across split Resources/ and assets/ roots.
-    auto* sfc = cocos2d::CCSpriteFrameCache::sharedSpriteFrameCache();
+    auto* sfc = ax::SpriteFrameCache::getInstance();
     if (!sfc) {
         return false;
     }
@@ -2200,7 +2046,7 @@ cocos2d::CCNode* PbGuiLoader::CreateSceneFromPbRoot(const CSSceneRoot& root,
     if (root.has_objecttag()) {
         node->setTag(root.objecttag());
     }
-    node->setZOrder(root.zorder());
+    node->setLocalZOrder(root.zorder());
     node->setScaleX(root.has_scalex() ? root.scalex() : 1.0f);
     node->setScaleY(root.has_scaley() ? root.scaley() : 1.0f);
     node->setRotation(static_cast<float>(root.rotation()));

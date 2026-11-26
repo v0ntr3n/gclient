@@ -18,7 +18,7 @@ constexpr int SOCKET_ERROR = -1;
 #endif
 
 #if defined(GCLIENT_USE_COCOS2DX)
-#include "cocos2d.h"
+#include "compat/Axmol226Compat.h"
 #endif
 
 #include <array>

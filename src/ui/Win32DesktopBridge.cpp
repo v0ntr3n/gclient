@@ -17,11 +17,6 @@ namespace gclient::ui {
 namespace {
 
 #ifdef _WIN32
-struct EglViewProtocolAccessor : public cocos2d::CCEGLView {
-    static ResolutionPolicy getPolicy(const cocos2d::CCEGLView* view) noexcept {
-        return view ? view->*(&EglViewProtocolAccessor::m_eResolutionPolicy) : kResolutionUnKnown;
-    }
-};
 
 bool queryTraceInputEnvDefault() {
     char buf[16] = {};
@@ -47,12 +42,12 @@ void syncViewportOnClientResize(cocos2d::CCEGLView* eglView, int clientW, int cl
 
     const cocos2d::CCSize prevFrame = eglView->getFrameSize();
     const cocos2d::CCSize prevDesign = eglView->getDesignResolutionSize();
-    const ResolutionPolicy prevPolicy = EglViewProtocolAccessor::getPolicy(eglView);
+    const ResolutionPolicy prevPolicy = eglView->getResolutionPolicy();
 
     // CCEGLViewProtocol::setFrameSize overwrites m_obDesignResolutionSize = m_obScreenSize,
     // so snapshot prevDesign & prevPolicy first and divide physical client pixels by zoom
     // so m_fFrameZoomFactor (125% / 150%) is never applied twice to mouse coordinates!
-    eglView->cocos2d::CCEGLViewProtocol::setFrameSize(unzoomedW, unzoomedH);
+    eglView->ax::RenderView::setFrameSize(unzoomedW, unzoomedH);
 
     const bool hasValidPrevDesign =
         std::isfinite(prevDesign.width) && std::isfinite(prevDesign.height) &&
@@ -80,7 +75,7 @@ void logMouseRoutingTrace(HWND hwnd, const char* eventName, WPARAM wParam, LPARA
     RECT rc{};
     ::GetClientRect(hwnd, &rc);
 
-    if (auto* eglView = cocos2d::CCEGLView::sharedOpenGLView()) {
+    if (auto* eglView = dynamic_cast<ax::RenderViewImpl*>(ax::Director::getInstance()->getRenderView())) {
         const float rawZoom = eglView->getFrameZoomFactor();
         const float zoom = (std::isfinite(rawZoom) && rawZoom > 0.0f) ? rawZoom : 1.0f;
         const cocos2d::CCSize frameSz = eglView->getFrameSize();
@@ -252,12 +247,12 @@ LRESULT CALLBACK Win32DesktopBridge::subclassProc(HWND hwnd, UINT msg, WPARAM wP
             if (readyForInput &&
                 (wParam == SIZE_RESTORED || wParam == SIZE_MAXIMIZED) &&
                 clientW > 0 && clientH > 0) {
-                if (auto* eglView = cocos2d::CCEGLView::sharedOpenGLView()) {
+                if (auto* eglView = dynamic_cast<ax::RenderViewImpl*>(ax::Director::getInstance()->getRenderView())) {
                     syncViewportOnClientResize(eglView, clientW, clientH);
                 }
                 if (wParam == SIZE_MAXIMIZED) {
                     if (gclient::AppDelegate::hasActiveInstance()) {
-                        if (auto* app = cocos2d::CCApplication::sharedApplication()) {
+                        if (auto* app = ax::Application::getInstance()) {
                             app->applicationWillEnterForeground();
                         }
                     }

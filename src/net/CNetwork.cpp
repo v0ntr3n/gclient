@@ -192,7 +192,7 @@ CConnection* CNetwork::newConnection() {
             if (c != nullptr &&
                 c->getState() == CConnection::State::Closed &&
                 liveSet_.find(c) == liveSet_.end() &&
-                c->retainCount() == 1u) {
+                c->getReferenceCount() == 1u) {
                 c->network_ = nullptr;
                 c->release();
                 it = ownedConnections_.erase(it);

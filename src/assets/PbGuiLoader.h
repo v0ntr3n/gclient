@@ -10,12 +10,18 @@ class CSOptions;
 class CSAnimation;
 class CSSceneRoot;
 
-namespace cocos2d {
-class CCNode;
+#if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
+#include "compat/Axmol226Compat.h"
+#else
+namespace ax {
+class Node;
+using CCNode = Node;
 namespace ui {
 class Widget;
 }
 }
+namespace cocos2d = ax;
+#endif
 
 namespace gclient {
 namespace assets {

@@ -62,10 +62,10 @@ inline void pushCCObject(lua_State* tolua_S, T* obj, const char* typeName) {
         return;
     }
     CCObject* baseObj = static_cast<CCObject*>(obj);
-    const int nID = static_cast<int>(baseObj->m_uID);
-    int* pLuaID = &baseObj->m_nLuaID;
-    toluafix_pushusertype_ccobject(
-        tolua_S, nID, pLuaID, static_cast<void*>(baseObj), typeName ? typeName : "CCObject");
+    const int nID = static_cast<int>(baseObj->_ID);
+    int* pLuaID = &baseObj->_luaID;
+    toluafix_pushusertype_object(
+        tolua_S, nID, pLuaID, static_cast<void*>(baseObj), typeName ? typeName : "ax.Object");
 }
 
 CCObject* extractToluaCCObject(lua_State* L, int idx, const char* expectedType) {
@@ -77,7 +77,7 @@ CCObject* extractToluaCCObject(lua_State* L, int idx, const char* expectedType) 
     const char* checkType = (expectedType && *expectedType) ? expectedType : "CCObject";
     if (lua_type(L, absIdx) == LUA_TUSERDATA) {
         if (tolua_isusertype(L, absIdx, checkType, 0, &err) ||
-            tolua_isusertype(L, absIdx, "CCObject", 0, &err)) {
+            (tolua_isusertype(L, absIdx, "ax.Object", 0, &err) || tolua_isusertype(L, absIdx, "CCObject", 0, &err))) {
             return static_cast<CCObject*>(tolua_tousertype(L, absIdx, nullptr));
         }
         return nullptr;
@@ -96,7 +96,7 @@ CCObject* extractToluaCCObject(lua_State* L, int idx, const char* expectedType) 
             if (lua_type(L, -1) == LUA_TUSERDATA) {
                 CCObject* obj = nullptr;
                 if (tolua_isusertype(L, -1, checkType, 0, &err) ||
-                    tolua_isusertype(L, -1, "CCObject", 0, &err)) {
+                    (tolua_isusertype(L, -1, "ax.Object", 0, &err) || tolua_isusertype(L, -1, "CCObject", 0, &err))) {
                     obj = static_cast<CCObject*>(tolua_tousertype(L, -1, nullptr));
                 }
                 lua_pop(L, 1);
@@ -849,7 +849,7 @@ int tolua_GameTemplate_SpriteBlur_draw00(lua_State* tolua_S) {
         return 0;
     }
     auto* self = getSafeToluaCCObject<SpriteBlur>(tolua_S, 1, "SpriteBlur");
-    if (self) self->draw();
+    if (self) // Axmol renders via draw(renderer, transform, flags)
     return 0;
 }
 
@@ -1073,7 +1073,7 @@ TOLUA_API int tolua_GameTemplate_open(lua_State* tolua_S) {
     tolua_beginmodule(tolua_S, nullptr);
 
     // CLuaFuncs
-    tolua_cclass(tolua_S, "CLuaFuncs", "CLuaFuncs", "CCObject", nullptr);
+    tolua_cclass(tolua_S, "CLuaFuncs", "CLuaFuncs", "ax.Object", nullptr);
     tolua_beginmodule(tolua_S, "CLuaFuncs");
     tolua_function(tolua_S, "sharedLuaFuncs", tolua_GameTemplate_CLuaFuncs_sharedLuaFuncs00);
     tolua_function(tolua_S, "addHandler", tolua_GameTemplate_CLuaFuncs_addHandler00);
@@ -1157,7 +1157,7 @@ TOLUA_API int tolua_GameTemplate_open(lua_State* tolua_S) {
     }
 
     // CTimer
-    tolua_cclass(tolua_S, "CTimer", "CTimer", "CCObject", nullptr);
+    tolua_cclass(tolua_S, "CTimer", "CTimer", "ax.Object", nullptr);
     tolua_beginmodule(tolua_S, "CTimer");
     tolua_function(tolua_S, "sharedTimer", tolua_GameTemplate_CTimer_sharedTimer00);
     tolua_function(tolua_S, "addEvent", tolua_GameTemplate_CTimer_addEvent00);
@@ -1191,7 +1191,7 @@ TOLUA_API int tolua_GameTemplate_open(lua_State* tolua_S) {
     tolua_endmodule(tolua_S);
 
     // CCStrokeLabel (3 methods)
-    tolua_cclass(tolua_S, "CCStrokeLabel", "CCStrokeLabel", "CCLabelTTF", nullptr);
+    tolua_cclass(tolua_S, "CCStrokeLabel", "CCStrokeLabel", "ax.Label", nullptr);
     tolua_beginmodule(tolua_S, "CCStrokeLabel");
     tolua_function(tolua_S, "create", tolua_GameTemplate_CCStrokeLabel_create00);
     tolua_function(tolua_S, "setStroke", tolua_GameTemplate_CCStrokeLabel_setStroke00);
@@ -1217,7 +1217,7 @@ TOLUA_API int tolua_GameTemplate_open(lua_State* tolua_S) {
     tolua_endmodule(tolua_S);
 
     // SpriteBlur (all 7 methods)
-    tolua_cclass(tolua_S, "SpriteBlur", "SpriteBlur", "CCSprite", nullptr);
+    tolua_cclass(tolua_S, "SpriteBlur", "SpriteBlur", "ax.Sprite", nullptr);
     tolua_beginmodule(tolua_S, "SpriteBlur");
     tolua_function(tolua_S, "draw", tolua_GameTemplate_SpriteBlur_draw00);
     tolua_function(tolua_S, "initProgram", tolua_GameTemplate_SpriteBlur_initProgram00);

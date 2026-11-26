@@ -4,9 +4,15 @@
 #include <cstdint>
 #include <string>
 
-namespace cocos2d {
-class CCFileUtils;
+#if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
+#include "compat/Axmol226Compat.h"
+#else
+namespace ax {
+class FileUtils;
+using CCFileUtils = FileUtils;
 }
+namespace cocos2d = ax;
+#endif
 
 namespace gclient {
 namespace assets {
