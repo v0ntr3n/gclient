@@ -473,6 +473,7 @@ if(GCLIENT_BUILD_TESTS)
             src/assets/BtDecryptHook.cpp
             src/assets/PlistbLoader.cpp
             src/assets/XmlbArmatureLoader.cpp
+            src/net/Amf3Module.cpp
             src/net/LCPacket.cpp
             src/net/CConnection.cpp
             src/net/CNetwork.cpp

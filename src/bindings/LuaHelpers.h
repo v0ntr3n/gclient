@@ -75,7 +75,10 @@ private:
 // Registers RichText, RichElement, RichElementText, RichElementImage, and RichElementCustomNode Lua bindings.
 void RegisterRichTextBindings(lua_State* L);
 
-// Wires PlistbLoader, PbGuiLoader, XmlbArmatureLoader, RichText, Spine, and CocoStudio UI hooks into Lua metatables.
+// Installs C++-injected Lua require/package.loaded resilience hooks for system.Network and core.BindableData.
+void InstallNetworkResilienceHook(lua_State* L);
+
+// Wires PlistbLoader, PbGuiLoader, XmlbArmatureLoader, RichText, Spine, CocoStudio UI, and Network resilience hooks.
 void RegisterAssetLoaderHooks(lua_State* L);
 
 // Unschedules all active Lua script timer entries registered via CCScheduler:scheduleScriptFunc

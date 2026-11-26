@@ -1,4 +1,5 @@
 #include "LuaHelpers.h"
+#include "NetworkResilienceHook.h"
 #include "../assets/PlistbLoader.h"
 #include "../assets/PbGuiLoader.h"
 #include "../assets/XmlbArmatureLoader.h"
@@ -5552,8 +5553,14 @@ void RegisterRichTextBindings(lua_State* L) {
     registerRichTextBindingsInternal(L);
 }
 
+void InstallNetworkResilienceHook(lua_State* L) {
+    gclient::bindings::InstallNetworkResilienceHookImpl(L);
+}
+
 void RegisterAssetLoaderHooks(lua_State* L) {
     if (!L) return;
+
+    InstallNetworkResilienceHook(L);
 
     wrapMetatableMethod(L, "CCFileUtils", "isFileExist", &hook_CCFileUtils_isFileExist);
     wrapMetatableMethod(L, "CCScheduler", "scheduleScriptFunc", &hook_CCScheduler_scheduleScriptFunc);

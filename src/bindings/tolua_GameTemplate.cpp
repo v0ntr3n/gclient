@@ -551,8 +551,9 @@ int tolua_GameTemplate_CConnection_send00(lua_State* tolua_S) {
     size_t len = 0;
     const char* ptr = lua_tolstring(tolua_S, 2, &len);
     const bool useLCPacket = tolua_toboolean(tolua_S, 3, 1) != 0;
-    if (self) self->send(std::string(ptr ? ptr : "", len), useLCPacket);
-    return 0;
+    const bool ok = self ? self->send(std::string(ptr ? ptr : "", len), useLCPacket) : false;
+    tolua_pushboolean(tolua_S, ok ? 1 : 0);
+    return 1;
 }
 
 int tolua_GameTemplate_CConnection_connect00(lua_State* tolua_S) {
