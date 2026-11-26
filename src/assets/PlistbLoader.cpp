@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 #if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
@@ -17,8 +18,9 @@ namespace assets {
 
 namespace {
 
-std::mutex                      g_loadedPlistbMutex;
-std::unordered_set<std::string> g_loadedPlistbFiles;
+std::mutex                                               g_loadedPlistbMutex;
+std::unordered_set<std::string>                          g_loadedPlistbFiles;
+std::unordered_map<std::string, std::vector<std::string>> g_plistFrameNamesMap;
 
 uint16_t ReadLE16U(const uint8_t* ptr) {
     return static_cast<uint16_t>(ptr[0]) |
@@ -620,6 +622,7 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
 #if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
     const std::string normBasePath = NormalizeAssetPath(plistPath);
     const std::string plistbPath   = BuildPlistbPath(normBasePath);
+    const std::string xmlPlistPath = BuildXmlPlistPath(normBasePath);
     if (plistbPath.empty()) {
         return false;
     }
@@ -702,17 +705,18 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
         return false;
     }
 
+    std::vector<std::string> registeredNames;
+    registeredNames.reserve(parsed.frames.size());
+
     for (const auto& rec : parsed.frames) {
         if (rec.frameName.empty()) {
             continue;
         }
 
-        if (targetCache->spriteFrameByName(rec.frameName.c_str()) != nullptr) {
-            cocos2d::CCLog("addSpriteFramesWithBinary : Duplicate frame skipped (%s)",
-                           rec.frameName.c_str());
-            continue;
-        }
-
+        // Match stock CCSpriteFrameCache::addSpriteFramesWithDictionary (setObject
+        // overwrites existing entries) so reloading an unloaded texture or loading
+        // sibling effect atlases with shared sub-texture names always binds the live
+        // targetTexture instead of keeping a stale/wrong-atlas CCSpriteFrame.
         const cocos2d::CCRect  rect(rec.rectX, rec.rectY, rec.rectWidth, rec.rectHeight);
         const cocos2d::CCPoint offset(rec.offsetX, rec.offsetY);
         const cocos2d::CCSize  originalSize(rec.originalWidth, rec.originalHeight);
@@ -721,17 +725,71 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
         frame->initWithTexture(targetTexture, rect, rec.rotated, offset, originalSize);
         targetCache->addSpriteFrame(frame, rec.frameName.c_str());
         frame->release();
+
+        registeredNames.push_back(rec.frameName);
     }
 
     {
         std::lock_guard<std::mutex> lock(g_loadedPlistbMutex);
         g_loadedPlistbFiles.insert(normBasePath);
         g_loadedPlistbFiles.insert(plistbPath);
+        if (!xmlPlistPath.empty()) {
+            g_loadedPlistbFiles.insert(xmlPlistPath);
+        }
+        g_plistFrameNamesMap[plistbPath] = std::move(registeredNames);
     }
     return true;
 #else
     (void)plistPath;
     (void)texture;
+    (void)cache;
+    return false;
+#endif
+}
+
+bool PlistbLoader::RemoveSpriteFramesWithBinary(const std::string& plistPath,
+                                                cocos2d::CCSpriteFrameCache* cache) {
+#if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
+    const std::string normBasePath = NormalizeAssetPath(plistPath);
+    const std::string plistbPath   = BuildPlistbPath(normBasePath);
+    const std::string xmlPlistPath = BuildXmlPlistPath(normBasePath);
+    if (plistbPath.empty()) {
+        return false;
+    }
+
+    std::vector<std::string> namesToRemove;
+    {
+        std::lock_guard<std::mutex> lock(g_loadedPlistbMutex);
+        auto it = g_plistFrameNamesMap.find(plistbPath);
+        if (it != g_plistFrameNamesMap.end()) {
+            namesToRemove = std::move(it->second);
+            g_plistFrameNamesMap.erase(it);
+        }
+        g_loadedPlistbFiles.erase(normBasePath);
+        g_loadedPlistbFiles.erase(plistbPath);
+        if (!xmlPlistPath.empty()) {
+            g_loadedPlistbFiles.erase(xmlPlistPath);
+        }
+    }
+
+    if (namesToRemove.empty()) {
+        return false;
+    }
+
+    cocos2d::CCSpriteFrameCache* targetCache =
+        cache ? cache : cocos2d::CCSpriteFrameCache::sharedSpriteFrameCache();
+    if (!targetCache) {
+        return false;
+    }
+
+    for (const std::string& frameName : namesToRemove) {
+        if (!frameName.empty()) {
+            targetCache->removeSpriteFrameByName(frameName.c_str());
+        }
+    }
+    return true;
+#else
+    (void)plistPath;
     (void)cache;
     return false;
 #endif
@@ -823,6 +881,7 @@ bool PlistbLoader::IsPlistbLoaded(const std::string& plistPath) {
 void PlistbLoader::ClearLoadedTracking() {
     std::lock_guard<std::mutex> lock(g_loadedPlistbMutex);
     g_loadedPlistbFiles.clear();
+    g_plistFrameNamesMap.clear();
 }
 
 } // namespace assets

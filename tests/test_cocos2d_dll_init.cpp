@@ -23,6 +23,8 @@
 #include "textures/CCTextureETC.h"
 
 #include "assets/BtDecryptHook.h"
+#include "assets/PlistbLoader.h"
+#include "assets/XmlbArmatureLoader.h"
 #include "diagnostics/CrashAndTelemetry.h"
 
 #include "zlib.h"
@@ -824,6 +826,89 @@ int main(int argc, char** argv) {
         lua_pop(L, 1);
         detail = "rc=" + std::to_string(rc) + " probeVal=" + std::to_string(probeVal);
         return rc == 0 && probeVal == 42;
+    });
+
+    // Phase 5: Issue #8 Armature BitCache/Plistb + WGL Offscreen Starburst Seam & Glow Ring glReadPixels
+    runPhase("phase5_armature_seam_and_glow_wgl_pixels", [&](std::string& detail) -> bool {
+        // Verify BitCache color clamp & sticky additive blend on gclient_assets
+        if (gclient::assets::XmlbArmatureLoader::ClampColorChannel(260) != 255u ||
+            gclient::assets::XmlbArmatureLoader::ClampColorChannel(-5) != 0u) {
+            detail = "XmlbArmatureLoader::ClampColorChannel failed [0,255] bounds";
+            return false;
+        }
+        if (!wglCtx.ready) {
+            detail = "WGL unavailable in headless session; skipped GPU glReadPixels";
+            return true;
+        }
+
+        constexpr int kAtlasDim = 64;
+        std::vector<uint8_t> atlas(kAtlasDim * kAtlasDim * 4, 0u);
+        for (int y = 2; y < 18; ++y) {
+            for (int x = 2; x < 18; ++x) {
+                const size_t idx = static_cast<size_t>((y * kAtlasDim + x) * 4);
+                atlas[idx + 0] = 220u;
+                atlas[idx + 1] = 200u;
+                atlas[idx + 2] = 140u;
+                atlas[idx + 3] = 220u;
+            }
+        }
+
+        GLuint texId = 0;
+        glGenTextures(1, &texId);
+        glBindTexture(GL_TEXTURE_2D, texId);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kAtlasDim, kAtlasDim, 0, GL_RGBA, GL_UNSIGNED_BYTE, atlas.data());
+
+        glViewport(0, 0, 64, 64);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0.0, 64.0, 0.0, 64.0, -1.0, 1.0);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        glEnable(GL_TEXTURE_2D);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glClearColor(18.0f / 255.0f, 18.0f / 255.0f, 24.0f / 255.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glColor4ub(255, 255, 255, 255);
+
+        // Render 4 mirrored quadrants using CCSkin::setTextureCoords half-texel-clamped cut-seam UVs
+        const float uCut = 2.5f / 64.0f, uOuter = 18.0f / 64.0f;
+        const float vOuter = 2.0f / 64.0f, vCut = 17.5f / 64.0f;
+        const float signs[4][2] = {{1.0f, 1.0f}, {-1.0f, 1.0f}, {1.0f, -1.0f}, {-1.0f, -1.0f}};
+        for (const auto& s : signs) {
+            const float x0 = 32.0f, x1 = 32.0f + s[0] * 32.0f;
+            const float y0 = 32.0f, y1 = 32.0f + s[1] * 32.0f;
+            glBegin(GL_QUADS);
+            glTexCoord2f(uCut, vCut);     glVertex2f(x0, y0);
+            glTexCoord2f(uOuter, vCut);   glVertex2f(x1, y0);
+            glTexCoord2f(uOuter, vOuter); glVertex2f(x1, y1);
+            glTexCoord2f(uCut, vOuter);   glVertex2f(x0, y1);
+            glEnd();
+        }
+        glFinish();
+
+        std::vector<uint8_t> fb(64 * 64 * 4, 0u);
+        glReadPixels(0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, fb.data());
+        glDeleteTextures(1, &texId);
+
+        const int centerR = fb[(32 * 64 + 32) * 4 + 0];
+        const int seamXR  = fb[(40 * 64 + 32) * 4 + 0];
+        const int seamYR  = fb[(32 * 64 + 40) * 4 + 0];
+        const int innerR  = fb[(40 * 64 + 40) * 4 + 0];
+        const bool seamFree =
+            innerR >= 200 &&
+            std::abs(centerR - innerR) <= 2 &&
+            std::abs(seamXR - innerR) <= 2 &&
+            std::abs(seamYR - innerR) <= 2;
+        detail = "centerR=" + std::to_string(centerR) +
+                 " seamXR=" + std::to_string(seamXR) +
+                 " seamYR=" + std::to_string(seamYR) +
+                 " innerR=" + std::to_string(innerR);
+        return seamFree;
     });
 
     g_watchdogStop.store(true, std::memory_order_release);

@@ -1083,6 +1083,46 @@ int hook_CCFileUtils_isFileExist(lua_State* L) {
 // ============================================================================
 // Asset Loader Hooks (Plistb, PbGui, SceneReader)
 // ============================================================================
+int hook_removeSpriteFramesFromFile(lua_State* L) {
+    auto* self = getSafeNamedUsertype<CCSpriteFrameCache>(L, 1, "CCSpriteFrameCache");
+    if (!self) {
+        self = CCSpriteFrameCache::sharedSpriteFrameCache();
+    }
+    const char* plist = lua_tostring(L, 2);
+    if (self && plist && plist[0] != '\0') {
+        if (gclient::assets::PlistbLoader::RemoveSpriteFramesWithBinary(plist, self)) {
+            return 0;
+        }
+    }
+    return callOriginalMethod(L);
+}
+
+int hook_removeArmatureFileInfo(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::extension::CCArmatureDataManager>(L, 1);
+    if (!self) {
+        self = cocos2d::extension::CCArmatureDataManager::sharedArmatureDataManager();
+    }
+    const char* configPath = lua_tostring(L, 2);
+    if (self && configPath && configPath[0] != '\0') {
+        const std::string norm = normalizeAssetLookupPath(configPath);
+        const std::string stem = extractAssetStem(norm);
+        if (!stem.empty()) {
+            gclient::assets::PlistbLoader::RemoveSpriteFramesWithBinary(stem + ".plistb");
+            for (int idx = 0; idx <= 9; ++idx) {
+                if (!gclient::assets::PlistbLoader::RemoveSpriteFramesWithBinary(
+                        stem + std::to_string(idx) + ".plistb")) {
+                    break;
+                }
+            }
+            self->removeArmatureFileInfo((stem + ".xml").c_str());
+            self->removeArmatureFileInfo((stem + ".xmlb").c_str());
+        }
+        self->removeArmatureFileInfo(configPath);
+        return 0;
+    }
+    return callOriginalMethod(L);
+}
+
 int hook_addSpriteFramesWithFile(lua_State* L) {
     auto* self = getSafeNamedUsertype<CCSpriteFrameCache>(L, 1, "CCSpriteFrameCache");
     if (!self) {
@@ -4952,12 +4992,14 @@ void RegisterAssetLoaderHooks(lua_State* L) {
 
     wrapMetatableMethod(L, "CCSpriteFrameCache", "addSpriteFramesWithFile", &hook_addSpriteFramesWithFile);
     wrapMetatableMethod(L, "CCSpriteFrameCache", "addSpriteFramesWithBinary", &hook_addSpriteFramesWithFile);
+    wrapMetatableMethod(L, "CCSpriteFrameCache", "removeSpriteFramesFromFile", &hook_removeSpriteFramesFromFile);
     wrapMetatableMethod(L, "GUIReader", "widgetFromJsonFile", &hook_widgetFromJsonFile);
     wrapMetatableMethod(L, "GUIReader", "widgetFromPbFile", &hook_widgetFromJsonFile);
     wrapMetatableMethod(L, "SceneReader", "createNodeWithSceneFile", &hook_createNodeWithSceneFile);
 
     wrapMetatableMethod(L, "CCArmatureDataManager", "addArmatureFileInfo", &hook_addArmatureFileInfo);
     wrapMetatableMethod(L, "CCArmatureDataManager", "addArmatureFileInfoAsync", &hook_addArmatureFileInfoAsync);
+    wrapMetatableMethod(L, "CCArmatureDataManager", "removeArmatureFileInfo", &hook_removeArmatureFileInfo);
     wrapMetatableMethod(L, "CCArmatureAnimation", "setMovementLoopByName", &hook_CCArmatureAnimation_setMovementLoopByName);
 
     wrapMetatableMethod(L, "CCNode", "addChild", &hook_CCNode_addChild);

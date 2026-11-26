@@ -667,6 +667,209 @@ class TestCocos2dxPatcher(unittest.TestCase):
             self.assertNotEqual(rc_drift, 0)
 
 
+    def test_patch_pvr_rgba8_premul_and_armature_seam_fixes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cocos_root = Path(tmp) / "cocos2d-x-2.2.6"
+            create_mock_cocos2dx_226_tree(cocos_root)
+
+            def w_extra(rel: str, content: str) -> None:
+                p = cocos_root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content, encoding="utf-8")
+
+            w_extra(
+                "cocos2dx/textures/CCTexture2D.cpp",
+                """#include "CCTexture2D.h"
+NS_CC_BEGIN
+static bool PVRHaveAlphaPremultiplied_ = false;
+bool CCTexture2D::initWithPVRFile(const char* file)
+{
+    CCTexturePVR *pvr = new CCTexturePVR;
+    bool bRet = pvr->initWithContentsOfFile(file);
+    if (bRet)
+    {
+        m_bHasPremultipliedAlpha = PVRHaveAlphaPremultiplied_;
+        pvr->release();
+    }
+    return bRet;
+}
+NS_CC_END
+""",
+            )
+            w_extra(
+                "cocos2dx/textures/CCTexturePVR.cpp",
+                """#include "CCTexturePVR.h"
+NS_CC_BEGIN
+#define kPVR3TexturePixelFormat_LA_88      0x000008080000616cULL
+struct _pixel_formathash v3_pixel_formathash[] = {
+\t{kPVR3TexturePixelFormat_LA_88,\t\t&PVRTableFormats[8] },
+};
+bool CCTexturePVR::unpackPVRv3Data(unsigned char* dataPointer, unsigned int dataLength)
+{
+    unsigned int pvr3TableElements = PVR3_MAX_TABLE_ELEMENTS;
+    if (! CCConfiguration::sharedConfiguration()->supportsPVRTC())
+    {
+        pvr3TableElements = 9;
+    }
+    for(unsigned int i = 0; i < pvr3TableElements; i++)
+    {
+\t\tif( v3_pixel_formathash[i].pixelFormat == pixelFormat )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+bool CCTexturePVR::createGLTexture()
+{
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_uWidth, m_uHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+    return true;
+}
+NS_CC_END
+""",
+            )
+            w_extra(
+                "extensions/CocoStudio/Armature/CCBone.cpp",
+                """#include "CCBone.h"
+NS_CC_EXT_BEGIN
+void CCBone::updateColor()
+{
+    CCNode *display = m_pDisplayManager->getDisplayRenderNode();
+    CCRGBAProtocol *protocol = dynamic_cast<CCRGBAProtocol *>(display);
+    if(protocol != NULL)
+    {
+        protocol->setColor(ccc3(_displayedColor.r * m_pTweenData->r / 255, _displayedColor.g * m_pTweenData->g / 255, _displayedColor.b * m_pTweenData->b / 255));
+        protocol->setOpacity(_displayedOpacity * m_pTweenData->a / 255);
+    }
+}
+NS_CC_EXT_END
+""",
+            )
+            w_extra(
+                "extensions/CocoStudio/Armature/display/CCSkin.h",
+                """#ifndef __CCSKIN_H__
+#define __CCSKIN_H__
+NS_CC_EXT_BEGIN
+class CC_EX_DLL CCSkin : public CCSprite
+{
+protected:
+    CCArmature *m_pArmature;
+};
+NS_CC_EXT_END
+#endif
+""",
+            )
+            w_extra(
+                "extensions/CocoStudio/Armature/display/CCSkin.cpp",
+                """#include "CCSkin.h"
+NS_CC_EXT_BEGIN
+void CCSkin::updateArmatureTransform()
+{
+    m_sTransform = CCAffineTransformConcat(m_tSkinTransform, m_pBone->nodeToArmatureTransform());
+}
+NS_CC_EXT_END
+""",
+            )
+            w_extra(
+                "extensions/CocoStudio/Armature/CCArmature.cpp",
+                """#include "CCArmature.h"
+NS_CC_EXT_BEGIN
+void CCArmature::draw()
+{
+    switch (bone->getDisplayRenderNodeType())
+    {
+    case CS_DISPLAY_SPRITE:
+    {
+                CCSkin *skin = (CCSkin *)node;
+
+                CCTextureAtlas *textureAtlas = skin->getTextureAtlas();
+
+                ccBlendFunc func = bone->getBlendFunc();
+                bool blendDirty = func.src != CC_BLEND_SRC || func.dst != CC_BLEND_DST;
+
+                if(m_pAtlas != textureAtlas || blendDirty)
+                {
+                    if (m_pAtlas)
+                    {
+                        m_pAtlas->drawQuads();
+                        m_pAtlas->removeAllQuads();
+                    }
+                }
+
+                m_pAtlas = textureAtlas;
+                if (m_pAtlas->getCapacity() == m_pAtlas->getTotalQuads() && !m_pAtlas->resizeCapacity(m_pAtlas->getCapacity() * 2))
+                    return;
+
+                skin->updateTransform();
+
+                if (blendDirty)
+                {
+                    ccGLBlendFunc(func.src, func.dst);
+
+                    m_pAtlas->drawQuads();
+                    m_pAtlas->removeAllQuads();
+
+                    ccGLBlendFunc(m_sBlendFunc.src, m_sBlendFunc.dst);
+                }
+    }
+    break;
+    case CS_DISPLAY_ARMATURE:
+    {
+                CCArmature *armature = (CCArmature *)(node);
+
+                CCTextureAtlas *textureAtlas = armature->getTextureAtlas();
+                if(m_pAtlas != textureAtlas)
+                {
+                    if (m_pAtlas)
+                    {
+                        m_pAtlas->drawQuads();
+                        m_pAtlas->removeAllQuads();
+                    }
+                }
+                armature->draw();
+
+                m_pAtlas = armature->getTextureAtlas();
+    }
+    break;
+    }
+}
+NS_CC_EXT_END
+""",
+            )
+
+            self.assertEqual(patch_cocos2dx.main([str(cocos_root)]), 0)
+
+            t2d = (cocos_root / "cocos2dx/textures/CCTexture2D.cpp").read_text(encoding="utf-8")
+            self.assertIn("static bool PVRHaveAlphaPremultiplied_ = true;", t2d)
+            self.assertIn("pvr->isForcePremultipliedAlpha()", t2d)
+
+            pvr = (cocos_root / "cocos2dx/textures/CCTexturePVR.cpp").read_text(encoding="utf-8")
+            self.assertIn("kPVR3TexturePixelFormat_R_8", pvr)
+            self.assertIn("kPVR3TexturePixelFormat_RG_88", pvr)
+            self.assertIn("GL_RGBA8", pvr)
+            self.assertIn("case kCCTexture2DPixelFormat_RGBA4444:", pvr)
+            self.assertIn("case kCCTexture2DPixelFormat_A8:", pvr)
+
+            bone = (cocos_root / "extensions/CocoStudio/Armature/CCBone.cpp").read_text(encoding="utf-8")
+            self.assertIn("if (r < 0) r = 0; else if (r > 255) r = 255;", bone)
+
+            skin_h = (cocos_root / "extensions/CocoStudio/Armature/display/CCSkin.h").read_text(encoding="utf-8")
+            skin_cpp = (cocos_root / "extensions/CocoStudio/Armature/display/CCSkin.cpp").read_text(encoding="utf-8")
+            self.assertIn("virtual void setTextureCoords(CCRect rect);", skin_h)
+            self.assertIn("void CCSkin::setTextureCoords(CCRect rect)", skin_cpp)
+            self.assertIn("trimLeftPx <= 0.5f", skin_cpp)
+
+            arm = (cocos_root / "extensions/CocoStudio/Armature/CCArmature.cpp").read_text(encoding="utf-8")
+            self.assertIn("skin->isOpacityModifyRGB() ? GL_ONE : GL_SRC_ALPHA", arm)
+            self.assertIn("childBlendDirty", arm)
+
+            # Verify 100% idempotency on second run
+            self.assertEqual(patch_cocos2dx.main([str(cocos_root)]), 0)
+            self.assertEqual(pvr, (cocos_root / "cocos2dx/textures/CCTexturePVR.cpp").read_text(encoding="utf-8"))
+            self.assertEqual(skin_cpp, (cocos_root / "extensions/CocoStudio/Armature/display/CCSkin.cpp").read_text(encoding="utf-8"))
+            self.assertEqual(arm, (cocos_root / "extensions/CocoStudio/Armature/CCArmature.cpp").read_text(encoding="utf-8"))
+
+
 class TestPeDependencyAuditor(unittest.TestCase):
     LUA_REQUIRED_EXPORTS = sorted(audit_pe.REQUIRED_LUA51_EXPORTS)
 
