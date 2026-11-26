@@ -1258,6 +1258,23 @@ bool hasPush(const std::vector<S2cDecodedMsg>& pushes, const std::string& cbName
     return false;
 }
 
+int64_t sumBagTemplateCount(const Amf3Value& bagRet, const std::string& subBagKey,
+                            int64_t targetTid) {
+    int64_t total = 0;
+    const auto* sub = bagRet.get(subBagKey);
+    if (!sub) {
+        return 0;
+    }
+    for (const auto& kv : sub->fields) {
+        const auto* tidVal = kv.second.get("item_template_id");
+        const auto* numVal = kv.second.get("item_num");
+        if (tidVal && numVal && tidVal->asInt() == targetTid) {
+            total += numVal->asInt();
+        }
+    }
+    return total;
+}
+
 // ============================================================================
 // 5. Offline Self-Tests (LCPacket + BtDecryptHook + Optional LuaJIT Amf3Module)
 // ============================================================================
@@ -1364,7 +1381,7 @@ int main(int argc, char** argv) {
     }
 
     if (verifyRestart) {
-        runCase("CrossRepo_14_VerifyColdRestart_WAL_State_Via_RealCConnection", [&]() {
+        runCase("CrossRepo_16_VerifyColdRestart_WAL_State_CopyProgress_And_ActStar", [&]() {
             const auto tk = strictGuestHandshake(httpHost, httpPort, "kestrel_cpp_alpha", true);
             REQUIRE_EQ(tk.tcpPort, tcpPort);
 
@@ -1403,6 +1420,9 @@ int main(int argc, char** argv) {
             auto u = client.callRpc("user.getUser", {});
             REQUIRE_EQ(u.ret.get("uname")->asString(), std::string("LongĐởmThần"));
             REQUIRE_EQ(u.ret.get("level")->asInt(), 35LL);
+            // Flow A stamina (`300 + 25 + 50 - 6 - 12 - 6 - 6 = 345`) & EXP (`3 * 2100 = 6300`) persisted!
+            REQUIRE_EQ(u.ret.get("execution")->asInt(), 345LL);
+            REQUIRE_EQ(u.ret.get("exp")->asInt(), 6300LL);
 
             // VIP 1 gift must still be marked bought after cold restart!
             auto vipDup = client.callRpc("user.buyVipGift", {Amf3Value::makeInt(1)});
@@ -1410,6 +1430,61 @@ int main(int argc, char** argv) {
 
             auto va = client.callRpc("user.getVaConfig", {});
             REQUIRE_EQ(va.ret.get("kestrel_key")->asString(), std::string("win32_ok"));
+
+            // Flow A cold-restart verification: copy stars, passed count, chapter 1002 unlock & prize mask!
+            auto cl = client.callRpc("copy.getList", {Amf3Value::makeInt(1)});
+            REQUIRE_EQ(cl.err, std::string("ok"));
+            const auto* cd = cl.ret.get("copyData");
+            REQUIRE_TRUE(cd != nullptr);
+            const auto* c1001 = cd->get("1001");
+            REQUIRE_TRUE(c1001 != nullptr);
+            REQUIRE_EQ(c1001->get("star")->asInt(), 9LL);
+            REQUIRE_EQ(c1001->get("pass_strongh")->asInt(), 3LL);
+            REQUIRE_EQ(c1001->get("prize")->asInt(), 1LL);
+            REQUIRE_TRUE(cd->get("1002") != nullptr);
+
+            auto cc = client.callRpc("copy.getCopy", {Amf3Value::makeInt(1001)});
+            REQUIRE_EQ(cc.err, std::string("ok"));
+            const auto* vaCopy = cc.ret.get("va_copy");
+            REQUIRE_TRUE(vaCopy != nullptr);
+            REQUIRE_TRUE(vaCopy->get("100102") != nullptr);
+            REQUIRE_EQ(vaCopy->get("100102")->get("normal_star")->asInt(), 3LL);
+            REQUIRE_EQ(vaCopy->get("100102")->get("pass")->asInt(), 1LL);
+            REQUIRE_TRUE(vaCopy->get("100105") != nullptr);
+            REQUIRE_EQ(vaCopy->get("100105")->get("normal_star")->asInt(), 3LL);
+            REQUIRE_EQ(vaCopy->get("100105")->get("pass")->asInt(), 1LL);
+            REQUIRE_EQ(
+                client.callRpc("copy.fetchPrize", {Amf3Value::makeInt(1001), Amf3Value::makeInt(0)})
+                    .err,
+                std::string("prize_already_claimed"));
+
+            // Flow B cold-restart verification: ActStar claimed gift IDs, duplicate/locked guards & bag rewards!
+            auto starInfo = client.callRpc("activityStarPlayOpen.getInfo", {});
+            REQUIRE_EQ(starInfo.err, std::string("ok"));
+            REQUIRE_TRUE(starInfo.ret.get("1") != nullptr);
+            REQUIRE_TRUE(starInfo.ret.get("1")->kind == Amf3Value::Kind::Bool &&
+                         starInfo.ret.get("1")->boolVal);
+            REQUIRE_TRUE(starInfo.ret.get("4") != nullptr);
+            REQUIRE_TRUE(starInfo.ret.get("4")->kind == Amf3Value::Kind::Bool &&
+                         starInfo.ret.get("4")->boolVal);
+            REQUIRE_TRUE(starInfo.ret.get("2") == nullptr);
+            REQUIRE_TRUE(starInfo.ret.get("5") == nullptr);
+
+            REQUIRE_EQ(
+                client.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(1)}).err,
+                std::string("already_claimed"));
+            REQUIRE_EQ(
+                client.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(5)}).err,
+                std::string("level_not_enough"));
+            REQUIRE_EQ(
+                client.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(99)}).err,
+                std::string("invalid_gift_id"));
+
+            auto bag = client.callRpc("bag.bagInfo", {}).ret;
+            REQUIRE_TRUE(sumBagTemplateCount(bag, "item", 17002) >= 5LL);
+            REQUIRE_EQ(sumBagTemplateCount(bag, "soul", 50406), 35LL);
+            REQUIRE_TRUE(sumBagTemplateCount(bag, "item", 10010) >= 20LL);
+            REQUIRE_TRUE(sumBagTemplateCount(bag, "item", 22202) >= 3LL);
 
             client.disconnect();
             return true;
@@ -1711,11 +1786,17 @@ int main(int argc, char** argv) {
         composedHid = ch.ret.get("hid")->asInt();
         REQUIRE_TRUE(composedHid > 10000001LL);
 
+        // Starter equipment fragment aligned in cobalt-relay 8ac9658 to vnsg2 `3113001` (x20)
         auto ca = clientA.callRpc("exchange.composeArm",
-                                  {Amf3Value::makeInt(3100101), Amf3Value::makeInt(1)});
+                                  {Amf3Value::makeInt(3113001), Amf3Value::makeInt(1)});
         REQUIRE_EQ(ca.err, std::string("ok"));
         craftedArmGid = ca.ret.get("gid")->asInt();
         REQUIRE_TRUE(craftedArmGid >= 20001LL);
+        REQUIRE_EQ(clientA
+                       .callRpc("exchange.composeArm",
+                                {Amf3Value::makeInt(3113001), Amf3Value::makeInt(1)})
+                       .err,
+                   std::string("insufficient_item_count"));
 
         auto pushes = clientA.drainPushes(60);
         REQUIRE_TRUE(hasPush(pushes, "bag.update"));
@@ -1849,14 +1930,14 @@ int main(int argc, char** argv) {
         int64_t trsGid = 0;
         if (const auto* armSub = bag.get("arm")) {
             for (const auto& kv : armSub->fields) {
-                if (kv.second.get("item_template_id")->asInt() == 101101) {
+                if (kv.second.get("item_template_id")->asInt() == 112001) {
                     wpnGid = std::stoll(kv.first);
                 }
             }
         }
         if (const auto* trsSub = bag.get("treasure")) {
             for (const auto& kv : trsSub->fields) {
-                if (kv.second.get("item_template_id")->asInt() == 180101) {
+                if (kv.second.get("item_template_id")->asInt() == 182001) {
                     trsGid = std::stoll(kv.first);
                 }
             }
@@ -2090,6 +2171,382 @@ int main(int argc, char** argv) {
                    std::string("ok"));
         REQUIRE_EQ(clientA.callRpc("online.fetch", {Amf3Value::makeInt(1)}).err,
                    std::string("ok"));
+        return true;
+    });
+
+    runCase("CrossRepo_14_FlowA_CopyBattle_SkillIds_Stamina_Rewards_And_ReconnectPersistence",
+            [&]() {
+                // 1. Negative: invalid / mismatched copy stage must be strictly rejected
+                REQUIRE_EQ(
+                    clientA.callRpc("copy.attack", {Amf3Value::makeInt(0), Amf3Value::makeInt(0)})
+                        .err,
+                    std::string("invalid_copy_stage"));
+                REQUIRE_EQ(
+                    clientA
+                        .callRpc("copy.attack",
+                                 {Amf3Value::makeInt(1001), Amf3Value::makeInt(200101)})
+                        .err,
+                    std::string("invalid_copy_stage"));
+
+                // 2. Snapshot pre-battle UserData, BagData, and CopyData
+                auto preUser = clientA.callRpc("user.getUser", {}).ret;
+                const int64_t preExec = preUser.get("execution")->asInt();
+                const int64_t preExp = preUser.get("exp")->asInt();
+                const int64_t preCopper = preUser.get("copper")->asInt();
+                const int64_t preSoul = preUser.get("hero_soul")->asInt();
+                const int64_t preGold = preUser.get("gold")->asInt();
+
+                auto preBag = clientA.callRpc("bag.bagInfo", {}).ret;
+                const int64_t pre17002 = sumBagTemplateCount(preBag, "item", 17002);
+                const int64_t pre16012 = sumBagTemplateCount(preBag, "item", 16012);
+
+                auto preList = clientA.callRpc("copy.getList", {Amf3Value::makeInt(1)});
+                REQUIRE_EQ(preList.err, std::string("ok"));
+                const auto* preChap = preList.ret.get("copyData")->get("1001");
+                REQUIRE_TRUE(preChap != nullptr);
+                REQUIRE_EQ(preChap->get("star")->asInt(), 3LL);
+                REQUIRE_EQ(preChap->get("pass_strongh")->asInt(), 1LL);
+
+                // 3. Execute copy.attack against Chapter 1001 Stronghold 100102 (`Vu Cát`)
+                auto atk = clientA.callRpc("copy.attack",
+                                           {Amf3Value::makeInt(1001), Amf3Value::makeInt(100102)});
+                REQUIRE_EQ(atk.err, std::string("ok"));
+                REQUIRE_EQ(atk.ret.get("ret")->asString(), std::string("ok"));
+                const int64_t brid = atk.ret.get("brid")->asInt();
+                REQUIRE_TRUE(brid > 0LL);
+                REQUIRE_EQ(atk.ret.get("appraisal")->asInt(), 50LL);
+
+                // Verify CopyProxy:groupDrops drop schema `{ copper, soul, item = { ["17002"] = 1 } }`
+                const auto* drop = atk.ret.get("drop");
+                REQUIRE_TRUE(drop != nullptr);
+                REQUIRE_EQ(drop->get("copper")->asInt(), 2000LL);
+                REQUIRE_EQ(drop->get("soul")->asInt(), 70LL);
+                REQUIRE_TRUE(drop->get("item") != nullptr);
+                REQUIRE_EQ(drop->get("item")->get("17002")->asInt(), 1LL);
+
+                // Verify hero battle units carry valid configured skill IDs (`1001` normal, `2001` rage)
+                const auto* bInfo = atk.ret.get("battleInfo");
+                REQUIRE_TRUE(bInfo != nullptr);
+                REQUIRE_EQ(bInfo->get("isPVP")->asInt(), 0LL);
+                const auto* team1 = bInfo->get("arrTeam1")->get("1")->get("arrHero");
+                const auto* team2 = bInfo->get("arrTeam2")->get("1")->get("arrHero");
+                REQUIRE_TRUE(team1 != nullptr && !team1->fields.empty());
+                REQUIRE_TRUE(team2 != nullptr && !team2->fields.empty());
+
+                for (const auto* teamHeroMap : {team1, team2}) {
+                    for (const auto& kv : teamHeroMap->fields) {
+                        const auto* skills = kv.second.get("arrSkill");
+                        REQUIRE_TRUE(skills != nullptr);
+                        REQUIRE_EQ(skills->dense.size(), static_cast<size_t>(2));
+                        REQUIRE_EQ(skills->dense[0].dense.size(), static_cast<size_t>(2));
+                        REQUIRE_EQ(skills->dense[1].dense.size(), static_cast<size_t>(2));
+                        const int64_t normalSkillId = skills->dense[0].dense[0].asInt();
+                        const int64_t rageSkillId = skills->dense[1].dense[0].asInt();
+                        REQUIRE_TRUE(normalSkillId > 0LL);
+                        REQUIRE_TRUE(rageSkillId > 0LL);
+                        const int64_t unitHtid = kv.second.get("htid") ? kv.second.get("htid")->asInt() : 0LL;
+                        if (teamHeroMap == team1) {
+                            // Verify authentic per-hero skill mapping (never broken 1201, and exact com_atk/angry_atk when A4 is active)
+                            REQUIRE_TRUE(normalSkillId != 1201LL);
+                            if (unitHtid == 1LL) {
+                                REQUIRE_TRUE((normalSkillId == 102LL && rageSkillId == 101LL) ||
+                                             (normalSkillId == 1001LL && rageSkillId == 2001LL));
+                            } else if (unitHtid == 101LL) {
+                                REQUIRE_TRUE((normalSkillId == 10102LL && rageSkillId == 10101LL) ||
+                                             (normalSkillId == 1001LL && rageSkillId == 2001LL));
+                            } else if (unitHtid == 401LL) {
+                                REQUIRE_TRUE((normalSkillId == 40102LL && rageSkillId == 40101LL) ||
+                                             (normalSkillId == 1001LL && rageSkillId == 2001LL));
+                            } else if (unitHtid == 406LL) {
+                                REQUIRE_TRUE((normalSkillId == 40602LL && rageSkillId == 40601LL) ||
+                                             (normalSkillId == 1001LL && rageSkillId == 2001LL));
+                            } else if (unitHtid == 426LL) {
+                                REQUIRE_TRUE((normalSkillId == 42602LL && rageSkillId == 42601LL) ||
+                                             (normalSkillId == 1001LL && rageSkillId == 2001LL));
+                            }
+                        } else {
+                            REQUIRE_EQ(normalSkillId, 1001LL);
+                            REQUIRE_EQ(rageSkillId, 2001LL);
+                        }
+                    }
+                }
+
+                // Verify userInfo 2-entry banner array (`FightProxy:parseBattleInfo`)
+                const auto* uInfo = atk.ret.get("userInfo");
+                REQUIRE_TRUE(uInfo != nullptr && uInfo->dense.size() == 2);
+                REQUIRE_EQ(uInfo->dense[0].get("uid")->asInt(), uidA);
+                REQUIRE_EQ(uInfo->dense[1].get("uname")->asString(),
+                           std::string("StageBoss_100102"));
+
+                // Verify Zlib-compressed `fightRet` inside `copy.attack` + `battle.getRecord` parity
+                const auto* fightRetBlob = atk.ret.get("fightRet");
+                REQUIRE_TRUE(fightRetBlob != nullptr && !fightRetBlob->strVal.empty());
+                std::string rawFightRet;
+                REQUIRE_TRUE(gclient::net::LCPacket::zlibDecompress(
+                    reinterpret_cast<const uint8_t*>(fightRetBlob->strVal.data()),
+                    fightRetBlob->strVal.size(), rawFightRet));
+                const Amf3Value fightReport = decodeAmf3(rawFightRet);
+                REQUIRE_EQ(fightReport.get("brid")->asInt(), brid);
+                REQUIRE_EQ(fightReport.get("appraisal")->asInt(), 50LL);
+                REQUIRE_TRUE(fightReport.get("round")->asInt() >= 1LL);
+                REQUIRE_TRUE(fightReport.get("heroResoultInfo") != nullptr);
+                REQUIRE_TRUE(fightReport.get("statisticalDataInfo") != nullptr);
+                if (const auto* rq = fightReport.get("rageQueue")) {
+                    for (const auto& step : rq->dense) {
+                        const int64_t rqSid = step.get("skillId")->asInt();
+                        REQUIRE_TRUE(rqSid > 0LL);
+                        REQUIRE_TRUE(rqSid != 1201LL);
+                    }
+                }
+
+                auto rec = clientA.callRpc("battle.getRecord", {Amf3Value::makeInt(brid)});
+                REQUIRE_EQ(rec.err, std::string("ok"));
+                std::string rawRec;
+                REQUIRE_TRUE(gclient::net::LCPacket::zlibDecompress(
+                    reinterpret_cast<const uint8_t*>(rec.ret.strVal.data()),
+                    rec.ret.strVal.size(), rawRec));
+                REQUIRE_EQ(decodeAmf3(rawRec).get("appraisal")->asInt(), 50LL);
+
+                // 4. Settle battle via `copy.pass` (`CopyProxy:fightEnd`) & verify pushes + state
+                (void)clientA.drainPushes(20);
+                auto pass = clientA.callRpc(
+                    "copy.pass",
+                    {Amf3Value::makeInt(1001), Amf3Value::makeInt(100102),
+                     Amf3Value::makeEmptyArray()});
+                REQUIRE_EQ(pass.err, std::string("ok"));
+                REQUIRE_EQ(pass.ret.get("ret")->asString(), std::string("ok"));
+                REQUIRE_EQ(pass.ret.get("battle_result")->asInt(), 1LL);
+                REQUIRE_EQ(pass.ret.get("brid")->asInt(), brid);
+                REQUIRE_EQ(pass.ret.get("star")->asInt(), 3LL);
+                REQUIRE_EQ(pass.ret.get("exp")->asInt(), 2100LL);
+                REQUIRE_EQ(pass.ret.get("drop")->get("copper")->asInt(), 2000LL);
+                REQUIRE_EQ(pass.ret.get("drop")->get("soul")->asInt(), 70LL);
+                REQUIRE_EQ(pass.ret.get("drop")->get("item")->get("17002")->asInt(), 1LL);
+
+                auto passPushes = clientA.drainPushes(60);
+                REQUIRE_TRUE(hasPush(passPushes, "user.updateUser"));
+                REQUIRE_TRUE(hasPush(passPushes, "bag.update"));
+
+                auto midUser = clientA.callRpc("user.getUser", {}).ret;
+                REQUIRE_EQ(midUser.get("execution")->asInt(), preExec - 6);
+                REQUIRE_EQ(midUser.get("exp")->asInt(), preExp + 2100);
+                REQUIRE_EQ(midUser.get("copper")->asInt(), preCopper + 2000);
+                REQUIRE_EQ(midUser.get("hero_soul")->asInt(), preSoul + 70);
+
+                auto midBag = clientA.callRpc("bag.bagInfo", {}).ret;
+                REQUIRE_EQ(sumBagTemplateCount(midBag, "item", 17002), pre17002 + 1);
+
+                // 5. Clear Chapter 1001 Boss Stronghold `100105` (`Bùi Nguyên Thiệu`) to unlock `1002`
+                auto atkBoss = clientA.callRpc(
+                    "copy.attack", {Amf3Value::makeInt(1001), Amf3Value::makeInt(100105)});
+                REQUIRE_EQ(atkBoss.err, std::string("ok"));
+                REQUIRE_EQ(atkBoss.ret.get("appraisal")->asInt(), 50LL);
+
+                auto passBoss = clientA.callRpc(
+                    "copy.pass",
+                    {Amf3Value::makeInt(1001), Amf3Value::makeInt(100105),
+                     Amf3Value::makeEmptyArray()});
+                REQUIRE_EQ(passBoss.err, std::string("ok"));
+                REQUIRE_EQ(passBoss.ret.get("star")->asInt(), 3LL);
+
+                // Claim 3-star chapter chest (`copy.fetchPrize`) and verify duplicate guard
+                auto prize = clientA.callRpc(
+                    "copy.fetchPrize", {Amf3Value::makeInt(1001), Amf3Value::makeInt(0)});
+                REQUIRE_EQ(prize.err, std::string("ok"));
+                REQUIRE_EQ(prize.ret.get("prize")->asInt(), 1LL);
+                REQUIRE_EQ(
+                    clientA
+                        .callRpc("copy.fetchPrize",
+                                 {Amf3Value::makeInt(1001), Amf3Value::makeInt(0)})
+                        .err,
+                    std::string("prize_already_claimed"));
+
+                // 6. Reconnect on a fresh TCP session and verify all Flow A mutations persisted!
+                const auto tkReconn =
+                    strictGuestHandshake(httpHost, httpPort, "kestrel_cpp_alpha", false);
+                RealKestrelWireClient reconnA;
+                REQUIRE_TRUE(reconnA.connectToRelay(tcpHost, tcpPort));
+                REQUIRE_EQ(
+                    reconnA
+                        .callRpc("user.login",
+                                 {Amf3Value::makeMap({
+                                     {"AMF", Amf3Value::makeInt(3)},
+                                     {"pid", Amf3Value::makeString(tkReconn.pid)},
+                                     {"qid", Amf3Value::makeString(tkReconn.pid)},
+                                     {"hash", Amf3Value::makeString(tkReconn.hash)},
+                                     {"serverID", Amf3Value::makeString("game2900161")},
+                                 })})
+                        .err,
+                    std::string("ok"));
+                REQUIRE_EQ(
+                    reconnA.callRpc("user.userLogin", {Amf3Value::makeInt(uidA)}).ret.asString(),
+                    std::string("ok"));
+
+                auto recUser = reconnA.callRpc("user.getUser", {}).ret;
+                REQUIRE_EQ(recUser.get("execution")->asInt(), preExec - 12);
+                REQUIRE_EQ(recUser.get("exp")->asInt(), preExp + 4200);
+                REQUIRE_EQ(recUser.get("copper")->asInt(), preCopper + 4750);
+                REQUIRE_EQ(recUser.get("hero_soul")->asInt(), preSoul + 170);
+                REQUIRE_EQ(recUser.get("gold")->asInt(), preGold + 100);
+
+                auto recBag = reconnA.callRpc("bag.bagInfo", {}).ret;
+                REQUIRE_EQ(sumBagTemplateCount(recBag, "item", 17002), pre17002 + 2);
+                REQUIRE_EQ(sumBagTemplateCount(recBag, "item", 16012), pre16012 + 1);
+
+                auto recList = reconnA.callRpc("copy.getList", {Amf3Value::makeInt(1)});
+                REQUIRE_EQ(recList.err, std::string("ok"));
+                const auto* recC1001 = recList.ret.get("copyData")->get("1001");
+                REQUIRE_TRUE(recC1001 != nullptr);
+                REQUIRE_EQ(recC1001->get("star")->asInt(), 9LL);
+                REQUIRE_EQ(recC1001->get("pass_strongh")->asInt(), 3LL);
+                REQUIRE_EQ(recC1001->get("prize")->asInt(), 1LL);
+                REQUIRE_TRUE(recList.ret.get("copyData")->get("1002") != nullptr);
+
+                auto recCopy = reconnA.callRpc("copy.getCopy", {Amf3Value::makeInt(1001)});
+                REQUIRE_EQ(recCopy.err, std::string("ok"));
+                REQUIRE_EQ(recCopy.ret.get("va_copy")->get("100102")->get("normal_star")->asInt(),
+                           3LL);
+                REQUIRE_EQ(recCopy.ret.get("va_copy")->get("100105")->get("normal_star")->asInt(),
+                           3LL);
+
+                reconnA.disconnect();
+                return true;
+            });
+
+    runCase("CrossRepo_15_FlowB_ActStar_ReceiveGift_Eligibility_Bag_Dup_And_Persistence", [&]() {
+        // 1. Initial `activityStarPlayOpen.getInfo` returns `{}` (`ActStarCodeData:parseData`)
+        auto initInfo = clientA.callRpc("activityStarPlayOpen.getInfo", {});
+        REQUIRE_EQ(initInfo.err, std::string("ok"));
+        REQUIRE_TRUE(initInfo.ret.dense.empty() && initInfo.ret.fields.empty());
+
+        // 2. (e) Reject non-existent gift IDs (`0`, `-1`, `99`) and level-locked gift tiers
+        REQUIRE_EQ(
+            clientA.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(0)}).err,
+            std::string("invalid_gift_id"));
+        REQUIRE_EQ(
+            clientA.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(-1)}).err,
+            std::string("invalid_gift_id"));
+        REQUIRE_EQ(
+            clientA.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(99)}).err,
+            std::string("invalid_gift_id"));
+
+        // Client B is Lv.10 -> Tier 3 (`req_level = 20`) must be rejected with `level_not_enough`
+        REQUIRE_EQ(
+            clientB.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(3)}).err,
+            std::string("level_not_enough"));
+
+        // Client A is Lv.35 -> Tier 5 (`req_level = 40`) & Tier 7 (`req_level = 60`) must fail
+        REQUIRE_EQ(
+            clientA.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(5)}).err,
+            std::string("level_not_enough"));
+        REQUIRE_EQ(
+            clientA.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(7)}).err,
+            std::string("level_not_enough"));
+
+        // 3. Snapshot Client A currencies & inventory before claiming `Quà Điêu Thuyền`
+        auto preUser = clientA.callRpc("user.getUser", {}).ret;
+        const int64_t preGold = preUser.get("gold")->asInt();
+        const int64_t preCopper = preUser.get("copper")->asInt();
+
+        auto preBag = clientA.callRpc("bag.bagInfo", {}).ret;
+        const int64_t pre10010 = sumBagTemplateCount(preBag, "item", 10010);
+        const int64_t pre22202 = sumBagTemplateCount(preBag, "item", 22202);
+        const int64_t pre50406 = sumBagTemplateCount(preBag, "soul", 50406);
+
+        // 4. (a)+(b) Claim Tier 1 (`req_level = 1`) & Tier 4 (`req_level = 30`) on Lv.35 Client A
+        (void)clientA.drainPushes(20);
+        auto claim1 =
+            clientA.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(1)});
+        REQUIRE_EQ(claim1.err, std::string("ok"));
+        REQUIRE_EQ(claim1.ret.get("ret")->asString(), std::string("ok"));
+        REQUIRE_EQ(claim1.ret.get("id")->asInt(), 1LL);
+
+        // Verify `GainItemListInfoPanel` / `RewardManager:addRewardsByFixTb` `[type, id, num]` schema!
+        const auto* rw1 = claim1.ret.get("reward");
+        REQUIRE_TRUE(rw1 != nullptr && rw1->dense.size() == 4);
+        REQUIRE_EQ(rw1->dense[0].dense[0].asInt(), 2LL);
+        REQUIRE_EQ(rw1->dense[0].dense[2].asInt(), 188LL);
+        REQUIRE_EQ(rw1->dense[1].dense[0].asInt(), 1LL);
+        REQUIRE_EQ(rw1->dense[1].dense[2].asInt(), 50000LL);
+        REQUIRE_EQ(rw1->dense[2].dense[0].asInt(), 4LL);
+        REQUIRE_EQ(rw1->dense[2].dense[1].asInt(), 10010LL);
+        REQUIRE_EQ(rw1->dense[2].dense[2].asInt(), 20LL);
+        REQUIRE_EQ(rw1->dense[3].dense[0].asInt(), 4LL);
+        REQUIRE_EQ(rw1->dense[3].dense[1].asInt(), 50406LL);
+        REQUIRE_EQ(rw1->dense[3].dense[2].asInt(), 10LL);
+
+        auto pushes1 = clientA.drainPushes(60);
+        REQUIRE_TRUE(hasPush(pushes1, "user.updateUser"));
+        REQUIRE_TRUE(hasPush(pushes1, "bag.update"));
+
+        auto claim4 =
+            clientA.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(4)});
+        REQUIRE_EQ(claim4.err, std::string("ok"));
+        REQUIRE_EQ(claim4.ret.get("id")->asInt(), 4LL);
+        const auto* rw4 = claim4.ret.get("reward");
+        REQUIRE_TRUE(rw4 != nullptr && rw4->dense.size() == 4);
+        REQUIRE_EQ(rw4->dense[2].dense[1].asInt(), 22202LL);
+        REQUIRE_EQ(rw4->dense[2].dense[2].asInt(), 3LL);
+        REQUIRE_EQ(rw4->dense[3].dense[1].asInt(), 50406LL);
+        REQUIRE_EQ(rw4->dense[3].dense[2].asInt(), 25LL);
+
+        auto postUser = clientA.callRpc("user.getUser", {}).ret;
+        REQUIRE_EQ(postUser.get("gold")->asInt(), preGold + 188 + 588);
+        REQUIRE_EQ(postUser.get("copper")->asInt(), preCopper + 50000 + 200000);
+
+        auto postBag = clientA.callRpc("bag.bagInfo", {}).ret;
+        REQUIRE_EQ(sumBagTemplateCount(postBag, "item", 10010), pre10010 + 20);
+        REQUIRE_EQ(sumBagTemplateCount(postBag, "item", 22202), pre22202 + 3);
+        REQUIRE_EQ(sumBagTemplateCount(postBag, "soul", 50406), pre50406 + 35);
+
+        // 5. (d) Reject duplicate claims of already-claimed gift IDs without double-granting!
+        REQUIRE_EQ(
+            clientA.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(1)}).err,
+            std::string("already_claimed"));
+        REQUIRE_EQ(
+            clientA.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(4)}).err,
+            std::string("already_claimed"));
+        REQUIRE_EQ(clientA.callRpc("user.getUser", {}).ret.get("gold")->asInt(),
+                   preGold + 188 + 588);
+
+        // 6. (c) Verify claimed gift IDs persist on `getInfo` and across a fresh TCP reconnect!
+        auto postInfo = clientA.callRpc("activityStarPlayOpen.getInfo", {});
+        REQUIRE_EQ(postInfo.err, std::string("ok"));
+        REQUIRE_TRUE(postInfo.ret.get("1") != nullptr && postInfo.ret.get("1")->boolVal);
+        REQUIRE_TRUE(postInfo.ret.get("4") != nullptr && postInfo.ret.get("4")->boolVal);
+        REQUIRE_TRUE(postInfo.ret.get("2") == nullptr);
+
+        const auto tkReconn =
+            strictGuestHandshake(httpHost, httpPort, "kestrel_cpp_alpha", false);
+        RealKestrelWireClient reconnStar;
+        REQUIRE_TRUE(reconnStar.connectToRelay(tcpHost, tcpPort));
+        REQUIRE_EQ(
+            reconnStar
+                .callRpc("user.login",
+                         {Amf3Value::makeMap({
+                             {"AMF", Amf3Value::makeInt(3)},
+                             {"pid", Amf3Value::makeString(tkReconn.pid)},
+                             {"qid", Amf3Value::makeString(tkReconn.pid)},
+                             {"hash", Amf3Value::makeString(tkReconn.hash)},
+                             {"serverID", Amf3Value::makeString("game2900161")},
+                         })})
+                .err,
+            std::string("ok"));
+        REQUIRE_EQ(
+            reconnStar.callRpc("user.userLogin", {Amf3Value::makeInt(uidA)}).ret.asString(),
+            std::string("ok"));
+
+        auto recInfo = reconnStar.callRpc("activityStarPlayOpen.getInfo", {});
+        REQUIRE_EQ(recInfo.err, std::string("ok"));
+        REQUIRE_TRUE(recInfo.ret.get("1") != nullptr && recInfo.ret.get("1")->boolVal);
+        REQUIRE_TRUE(recInfo.ret.get("4") != nullptr && recInfo.ret.get("4")->boolVal);
+        REQUIRE_EQ(
+            reconnStar.callRpc("activityStarPlayOpen.receiveGift", {Amf3Value::makeInt(1)}).err,
+            std::string("already_claimed"));
+        auto recBag = reconnStar.callRpc("bag.bagInfo", {}).ret;
+        REQUIRE_EQ(sumBagTemplateCount(recBag, "soul", 50406), pre50406 + 35);
+
+        reconnStar.disconnect();
         return true;
     });
 

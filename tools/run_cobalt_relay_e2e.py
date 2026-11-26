@@ -84,17 +84,30 @@ def resolve_cobalt_relay(
             "COBALT_RELAY_GIT_URL", "https://github.com/v0ntr3n/cobalt-relay.git"
         )
         clone_dir = temp_root / "cobalt-relay-ci"
-        print(f"[orchestrator] Attempting ephemeral clone of {clone_url} ...", flush=True)
+        preferred_ref = os.environ.get("COBALT_RELAY_GIT_REF", "test/issue-3-live-e2e")
+        print(f"[orchestrator] Attempting ephemeral clone of {clone_url} (ref={preferred_ref}) ...", flush=True)
         res = subprocess.run(
-            ["git", "clone", "--depth", "1", clone_url, str(clone_dir)],
+            ["git", "clone", "--depth", "1", "--branch", preferred_ref, clone_url, str(clone_dir)],
             capture_output=True,
             text=True,
         )
+        if res.returncode != 0:
+            shutil.rmtree(clone_dir, ignore_errors=True)
+            res = subprocess.run(
+                ["git", "clone", "--depth", "1", clone_url, str(clone_dir)],
+                capture_output=True,
+                text=True,
+            )
         if res.returncode == 0 and (clone_dir / "Cargo.toml").is_file():
             build = subprocess.run(
-                [cargo, "build", "--release", "-p", "gserver"],
+                [cargo, "build", "--release", "-p", "gserver", "--offline"],
                 cwd=str(clone_dir),
             )
+            if build.returncode != 0:
+                build = subprocess.run(
+                    [cargo, "build", "--release", "-p", "gserver"],
+                    cwd=str(clone_dir),
+                )
             b = clone_dir / "target" / "release" / exe_name
             if build.returncode == 0 and b.is_file():
                 return b, clone_dir

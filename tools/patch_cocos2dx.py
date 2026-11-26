@@ -592,12 +592,12 @@ def patch_cpp(path: str) -> None:
             "}\n"
             "}\n"
         )
-        txt = _insert_before_ns_cc_begin(txt, utf8_exist_helper)
         txt = re.sub(
-            r"\bGetFileAttributesA\s*\(",
+            r"(?<!::)\bGetFileAttributesA\s*\(",
             "gclientGetFileAttributesUtf8(",
             txt,
         )
+        txt = _insert_before_ns_cc_begin(txt, utf8_exist_helper)
 
     if txt == orig_txt:
         expected_markers = (
