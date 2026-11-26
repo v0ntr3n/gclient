@@ -446,10 +446,18 @@ public:
     virtual void update(float) { ++ticks; }
 };
 
+class ScopedDummyApplication final : public cocos2d::CCApplication {
+public:
+    bool applicationDidFinishLaunching() override { return true; }
+    void applicationDidEnterBackground() override {}
+    void applicationWillEnterForeground() override {}
+};
+
 struct ScopedDummyWglContext {
     HWND hwnd = nullptr;
     HDC hdc = nullptr;
     HGLRC hglrc = nullptr;
+    bool gl11Ready = false;
     bool ready = false;
     std::string glVersion;
 
@@ -476,14 +484,18 @@ struct ScopedDummyWglContext {
 
         hglrc = ::wglCreateContext(hdc);
         if (!hglrc || !::wglMakeCurrent(hdc, hglrc)) return;
+        gl11Ready = true;
 
         glewExperimental = GL_TRUE;
-        (void)::glewInit();
+        const GLenum glewRc = ::glewInit();
         const GLubyte* ver = ::glGetString(GL_VERSION);
         if (ver) {
             glVersion = reinterpret_cast<const char*>(ver);
         }
-        ready = true;
+        // Headless Windows Hyper-V GDI Generic only exposes OpenGL 1.1.0 (`glCreateProgram == nullptr`);
+        // Cocos2d-x 2.2.6 CCShaderCache / CCSprite / VBOs strictly require OpenGL 2.0 entry points.
+        ready = (glewRc == GLEW_OK) && GLEW_VERSION_2_0 &&
+                (glCreateProgram != nullptr) && (glGenBuffers != nullptr);
     }
 
     ~ScopedDummyWglContext() {
@@ -678,6 +690,7 @@ int main(int argc, char** argv) {
         luaOut << "return 1337\n";
     }
 
+    ScopedDummyApplication dummyApp;
     ScopedDummyWglContext wglCtx;
 
     // Phase 1: CCFileUtils + setSearchPaths + bt_decrypt + UTF-8 path resolution
@@ -755,7 +768,7 @@ int main(int argc, char** argv) {
         } else {
             img->release();
         }
-        detail = "PNG 256x32 decoded cleanly; WGL=" + (wglCtx.ready ? wglCtx.glVersion : std::string("unavailable"));
+        detail = "PNG 256x32 decoded cleanly; WGL20=" + (wglCtx.ready ? wglCtx.glVersion : ("unavailable(gl=" + wglCtx.glVersion + ")"));
         return true;
     });
 
