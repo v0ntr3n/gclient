@@ -191,18 +191,33 @@ cocos2d::CCSpriteFrame* findSpriteFrameWithFallback(const char* name) {
         if (auto* f = cache->spriteFrameByName(s.c_str())) return f;
     }
 
-    const std::string prefix = "res/jsonUI/";
-    if (s.rfind(prefix, 0) == 0) {
-        const std::string stripped = s.substr(prefix.size());
-        if (!stripped.empty()) {
-            if (auto* f = cache->spriteFrameByName(stripped.c_str())) return f;
+    auto tryWithPngSuffix = [&](const std::string& key) -> cocos2d::CCSpriteFrame* {
+        if (key.empty()) return nullptr;
+        if (auto* f = cache->spriteFrameByName(key.c_str())) return f;
+        const size_t slashPos = key.find_last_of('/');
+        const size_t dotPos = key.find_last_of('.');
+        if (dotPos == std::string::npos || (slashPos != std::string::npos && dotPos < slashPos)) {
+            const std::string withPng = key + ".png";
+            if (auto* f = cache->spriteFrameByName(withPng.c_str())) return f;
         }
+        return nullptr;
+    };
+
+    if (auto* f = tryWithPngSuffix(s)) return f;
+
+    if (s.compare(0, 11, "res/jsonUI/") == 0 && s.size() > 11) {
+        if (auto* f = tryWithPngSuffix(s.substr(11))) return f;
+    }
+    if (s.compare(0, 4, "res/") == 0 && s.size() > 4) {
+        if (auto* f = tryWithPngSuffix(s.substr(4))) return f;
+    }
+    if (s.compare(0, 10, "gameImage/") == 0 && s.size() > 10) {
+        if (auto* f = tryWithPngSuffix(std::string("images/") + s.substr(10))) return f;
     }
 
     const size_t lastSlash = s.find_last_of('/');
     if (lastSlash != std::string::npos && lastSlash + 1 < s.size()) {
-        const std::string basename = s.substr(lastSlash + 1);
-        if (auto* f = cache->spriteFrameByName(basename.c_str())) return f;
+        if (auto* f = tryWithPngSuffix(s.substr(lastSlash + 1))) return f;
     }
 
     return nullptr;
@@ -238,10 +253,13 @@ cocos2d::CCTexture2D* loadTextureWithExtensionFallback(const char* name) {
         }
     }
 
-    auto tryAltExtensions = [&](const std::string& candidate) -> cocos2d::CCTexture2D* {
+    auto tryCandidateWithExts = [&](const std::string& candidate) -> cocos2d::CCTexture2D* {
         if (candidate.empty()) return nullptr;
+        if (auto* tex = texCache->addImage(candidate.c_str())) {
+            return tex;
+        }
         const std::string stem = extractAssetStem(candidate);
-        static const char* const kAltExts[] = {".pvr.ccz", ".pkm", ".webp", ".png", ".jpg"};
+        static const char* const kAltExts[] = {".pvr.ccz", ".pkm", ".png", ".webp", ".jpg", ".jpeg"};
         for (const char* ext : kAltExts) {
             const std::string altPath = stem + ext;
             if (auto* tex = texCache->addImage(altPath.c_str())) {
@@ -251,19 +269,17 @@ cocos2d::CCTexture2D* loadTextureWithExtensionFallback(const char* name) {
         return nullptr;
     };
 
-    if (auto* tex = tryAltExtensions(s)) {
+    if (auto* tex = tryCandidateWithExts(s)) {
         return tex;
     }
-
-    const std::string prefix = "res/jsonUI/";
-    if (s.rfind(prefix, 0) == 0) {
-        const std::string stripped = s.substr(prefix.size());
-        if (auto* tex = texCache->addImage(stripped.c_str())) {
-            return tex;
-        }
-        if (auto* tex = tryAltExtensions(stripped)) {
-            return tex;
-        }
+    if (s.compare(0, 11, "res/jsonUI/") == 0 && s.size() > 11) {
+        if (auto* tex = tryCandidateWithExts(s.substr(11))) return tex;
+    }
+    if (s.compare(0, 4, "res/") == 0 && s.size() > 4) {
+        if (auto* tex = tryCandidateWithExts(s.substr(4))) return tex;
+    }
+    if (s.compare(0, 10, "gameImage/") == 0 && s.size() > 10) {
+        if (auto* tex = tryCandidateWithExts(std::string("images/") + s.substr(10))) return tex;
     }
 
     return nullptr;
@@ -275,19 +291,33 @@ std::string resolveImagePathWithExtensionFallback(const char* filePath) {
     auto* fu = cocos2d::CCFileUtils::sharedFileUtils();
     if (!fu) return norm;
 
-    const std::string exactFull = fu->fullPathForFilename(norm.c_str());
-    if (!exactFull.empty() && fu->isFileExist(exactFull)) {
-        return norm;
-    }
-
-    const std::string stem = extractAssetStem(norm);
-    static const char* const kAltExts[] = {".pvr.ccz", ".pkm", ".webp", ".png"};
-    for (const char* ext : kAltExts) {
-        const std::string cand = stem + ext;
-        const std::string full = fu->fullPathForFilename(cand.c_str());
-        if (!full.empty() && fu->isFileExist(full)) {
-            return cand;
+    auto tryResolve = [&](const std::string& base) -> std::string {
+        if (base.empty()) return {};
+        const std::string exactFull = fu->fullPathForFilename(base.c_str());
+        if (!exactFull.empty() && fu->isFileExist(exactFull)) {
+            return base;
         }
+        const std::string stem = extractAssetStem(base);
+        static const char* const kAltExts[] = {".pvr.ccz", ".pkm", ".png", ".webp", ".jpg", ".jpeg"};
+        for (const char* ext : kAltExts) {
+            const std::string cand = stem + ext;
+            const std::string full = fu->fullPathForFilename(cand.c_str());
+            if (!full.empty() && fu->isFileExist(full)) {
+                return cand;
+            }
+        }
+        return {};
+    };
+
+    if (std::string r = tryResolve(norm); !r.empty()) return r;
+    if (norm.compare(0, 11, "res/jsonUI/") == 0 && norm.size() > 11) {
+        if (std::string r = tryResolve(norm.substr(11)); !r.empty()) return r;
+    }
+    if (norm.compare(0, 4, "res/") == 0 && norm.size() > 4) {
+        if (std::string r = tryResolve(norm.substr(4)); !r.empty()) return r;
+    }
+    if (norm.compare(0, 10, "gameImage/") == 0 && norm.size() > 10) {
+        if (std::string r = tryResolve(std::string("images/") + norm.substr(10)); !r.empty()) return r;
     }
     return norm;
 }
@@ -1047,7 +1077,10 @@ int hook_CCFileUtils_isFileExist(lua_State* L) {
     static const char* const kBinaryAltExts[] = {
         ".pkm",
         ".pvr.ccz",
+        ".png",
         ".webp",
+        ".jpg",
+        ".jpeg",
         ".plistb",
         ".xmlb",
         ".pb",
@@ -1060,9 +1093,13 @@ int hook_CCFileUtils_isFileExist(lua_State* L) {
         }
     }
 
-    const std::string jsonUiPrefix = "res/jsonUI/";
-    if (norm.rfind(jsonUiPrefix, 0) == 0) {
-        const std::string stripped = norm.substr(jsonUiPrefix.size());
+    const std::string altBases[] = {
+        (norm.compare(0, 11, "res/jsonUI/") == 0 && norm.size() > 11) ? norm.substr(11) : std::string(),
+        (norm.compare(0, 4, "res/") == 0 && norm.size() > 4) ? norm.substr(4) : std::string(),
+        (norm.compare(0, 10, "gameImage/") == 0 && norm.size() > 10) ? (std::string("images/") + norm.substr(10)) : std::string(),
+    };
+    for (const std::string& stripped : altBases) {
+        if (stripped.empty()) continue;
         if (existsViaFileUtils(stripped)) {
             lua_pushboolean(L, 1);
             return 1;
@@ -1789,6 +1826,260 @@ int hook_Widget_addNode(lua_State* L) {
     return 0;
 }
 
+struct WidgetHierarchyAccessor : public cocos2d::ui::Widget {
+    static cocos2d::CCArray* rawWidgetChildren(cocos2d::ui::Widget* obj) {
+        return obj ? obj->*(&WidgetHierarchyAccessor::_widgetChildren) : nullptr;
+    }
+    static cocos2d::CCArray* rawNodes(cocos2d::ui::Widget* obj) {
+        return obj ? obj->*(&WidgetHierarchyAccessor::_nodes) : nullptr;
+    }
+    static void purgeDetachedChild(cocos2d::ui::Widget* owner, cocos2d::CCNode* child) {
+        if (!owner || !child) return;
+        if (cocos2d::CCArray* wc = rawWidgetChildren(owner)) {
+            if (wc->containsObject(child)) {
+                wc->removeObject(child);
+            }
+        }
+        if (cocos2d::CCArray* nd = rawNodes(owner)) {
+            if (nd->containsObject(child)) {
+                nd->removeObject(child);
+            }
+        }
+    }
+    static void pruneDetachedNodes(cocos2d::ui::Widget* owner) {
+        if (!owner) return;
+        cocos2d::CCArray* nd = rawNodes(owner);
+        if (!nd || !nd->data) return;
+        for (int i = static_cast<int>(nd->data->num) - 1; i >= 0; --i) {
+            auto* pNode = static_cast<cocos2d::CCNode*>(nd->data->arr[i]);
+            if (!pNode || pNode->getParent() != owner) {
+                nd->removeObjectAtIndex(static_cast<unsigned int>(i));
+            }
+        }
+    }
+    static void drainAllWidgetAndNodeChildren(cocos2d::ui::Widget* owner, bool cleanup) {
+        if (!owner) return;
+        CCObjectRetainGuard ownerGuard(owner);
+        std::vector<cocos2d::CCNode*> snapshot;
+        cocos2d::CCArray* wc = rawWidgetChildren(owner);
+        cocos2d::CCArray* nd = rawNodes(owner);
+        size_t cap = 0;
+        if (wc && wc->data && wc->data->num > 0) cap += static_cast<size_t>(wc->data->num);
+        if (nd && nd->data && nd->data->num > 0) cap += static_cast<size_t>(nd->data->num);
+        if (cap > 0) snapshot.reserve(cap);
+        if (wc && wc->data && wc->data->num > 0) {
+            for (unsigned int i = 0; i < wc->data->num; ++i) {
+                if (auto* c = static_cast<cocos2d::CCNode*>(wc->data->arr[i])) {
+                    c->retain();
+                    snapshot.push_back(c);
+                }
+            }
+            wc->removeAllObjects();
+        }
+        if (nd && nd->data && nd->data->num > 0) {
+            for (unsigned int i = 0; i < nd->data->num; ++i) {
+                if (auto* n = static_cast<cocos2d::CCNode*>(nd->data->arr[i])) {
+                    n->retain();
+                    snapshot.push_back(n);
+                }
+            }
+            nd->removeAllObjects();
+        }
+        for (cocos2d::CCNode* item : snapshot) {
+            owner->cocos2d::CCNode::removeChild(item, cleanup);
+            item->release();
+        }
+    }
+};
+
+struct ListViewItemsAccessor : public cocos2d::ui::ListView {
+    static cocos2d::CCArray* rawItems(cocos2d::ui::ListView* lv) {
+        return lv ? lv->*(&ListViewItemsAccessor::_items) : nullptr;
+    }
+};
+
+cocos2d::ui::Widget* resolveEffectiveContainerWidget(cocos2d::ui::Widget* w) {
+    if (!w) return nullptr;
+    if (auto* sv = dynamic_cast<cocos2d::ui::ScrollView*>(w)) {
+        if (cocos2d::ui::Layout* inner = sv->getInnerContainer()) {
+            return inner;
+        }
+    }
+    return w;
+}
+
+int hook_CCNode_removeFromParentAndCleanup(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::CCNode>(L, 1);
+    if (!self) {
+        return 0;
+    }
+    const bool cleanup = (lua_gettop(L) >= 2 && lua_isboolean(L, 2))
+        ? (lua_toboolean(L, 2) != 0)
+        : true;
+    CCObjectRetainGuard selfGuard(self);
+    cocos2d::CCNode* parentNode = self->getParent();
+    auto* parentWidget = dynamic_cast<cocos2d::ui::Widget*>(parentNode);
+    CCObjectRetainGuard parentGuard(parentWidget);
+
+    self->removeFromParentAndCleanup(cleanup);
+    if (parentWidget) {
+        WidgetHierarchyAccessor::purgeDetachedChild(parentWidget, self);
+    }
+    return 0;
+}
+
+int hook_CCNode_removeFromParent(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::CCNode>(L, 1);
+    if (!self) {
+        return 0;
+    }
+    CCObjectRetainGuard selfGuard(self);
+    cocos2d::CCNode* parentNode = self->getParent();
+    auto* parentWidget = dynamic_cast<cocos2d::ui::Widget*>(parentNode);
+    CCObjectRetainGuard parentGuard(parentWidget);
+
+    self->removeFromParentAndCleanup(true);
+    if (parentWidget) {
+        WidgetHierarchyAccessor::purgeDetachedChild(parentWidget, self);
+    }
+    return 0;
+}
+
+int hook_CCNode_removeChild(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::CCNode>(L, 1);
+    auto* child = getSafeCCObject<cocos2d::CCNode>(L, 2);
+    if (!self || !child) {
+        return 0;
+    }
+    const bool cleanup = (lua_gettop(L) >= 3 && lua_isboolean(L, 3))
+        ? (lua_toboolean(L, 3) != 0)
+        : true;
+    CCObjectRetainGuard selfGuard(self);
+    CCObjectRetainGuard childGuard(child);
+
+    if (auto* lv = dynamic_cast<cocos2d::ui::ListView*>(self)) {
+        if (cocos2d::CCArray* items = ListViewItemsAccessor::rawItems(lv)) {
+            if (items->containsObject(child)) {
+                items->removeObject(child);
+                lv->requestRefreshView();
+            }
+        }
+    }
+    self->removeChild(child, cleanup);
+    if (auto* selfWidget = dynamic_cast<cocos2d::ui::Widget*>(self)) {
+        WidgetHierarchyAccessor::purgeDetachedChild(selfWidget, child);
+        if (cocos2d::ui::Widget* eff = resolveEffectiveContainerWidget(selfWidget); eff && eff != selfWidget) {
+            WidgetHierarchyAccessor::purgeDetachedChild(eff, child);
+        }
+    }
+    return 0;
+}
+
+int hook_CCNode_removeAllChildrenWithCleanup(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::CCNode>(L, 1);
+    if (!self) {
+        return 0;
+    }
+    const bool cleanup = (lua_gettop(L) >= 2 && lua_isboolean(L, 2))
+        ? (lua_toboolean(L, 2) != 0)
+        : true;
+    CCObjectRetainGuard selfGuard(self);
+    if (auto* selfWidget = dynamic_cast<cocos2d::ui::Widget*>(self)) {
+        if (auto* lv = dynamic_cast<cocos2d::ui::ListView*>(selfWidget)) {
+            if (cocos2d::CCArray* items = ListViewItemsAccessor::rawItems(lv)) {
+                items->removeAllObjects();
+            }
+            lv->requestRefreshView();
+        }
+        cocos2d::ui::Widget* target = resolveEffectiveContainerWidget(selfWidget);
+        WidgetHierarchyAccessor::drainAllWidgetAndNodeChildren(target, cleanup);
+        selfWidget->removeAllChildrenWithCleanup(cleanup);
+        return 0;
+    }
+    self->removeAllChildrenWithCleanup(cleanup);
+    return 0;
+}
+
+int hook_Widget_removeAllChildren(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::ui::Widget>(L, 1);
+    if (!self) {
+        return 0;
+    }
+    CCObjectRetainGuard selfGuard(self);
+    if (auto* lv = dynamic_cast<cocos2d::ui::ListView*>(self)) {
+        if (cocos2d::CCArray* items = ListViewItemsAccessor::rawItems(lv)) {
+            items->removeAllObjects();
+        }
+        lv->requestRefreshView();
+    }
+    cocos2d::ui::Widget* target = resolveEffectiveContainerWidget(self);
+    WidgetHierarchyAccessor::drainAllWidgetAndNodeChildren(target, true);
+    self->removeAllChildrenWithCleanup(true);
+    return 0;
+}
+
+int hook_Widget_removeNode(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::ui::Widget>(L, 1);
+    auto* node = getSafeCCObject<cocos2d::CCNode>(L, 2);
+    if (!self || !node) {
+        return 0;
+    }
+    CCObjectRetainGuard selfGuard(self);
+    CCObjectRetainGuard nodeGuard(node);
+    self->removeNode(node);
+    WidgetHierarchyAccessor::purgeDetachedChild(self, node);
+    if (cocos2d::ui::Widget* eff = resolveEffectiveContainerWidget(self); eff && eff != self) {
+        WidgetHierarchyAccessor::purgeDetachedChild(eff, node);
+    }
+    return 0;
+}
+
+int hook_Widget_removeNodeByTag(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::ui::Widget>(L, 1);
+    if (!self || !lua_isnumber(L, 2)) {
+        return 0;
+    }
+    const int tag = static_cast<int>(lua_tointeger(L, 2));
+    if (tag == cocos2d::kCCNodeTagInvalid) {
+        return 0;
+    }
+    CCObjectRetainGuard selfGuard(self);
+    cocos2d::ui::Widget* eff = resolveEffectiveContainerWidget(self);
+    WidgetHierarchyAccessor::pruneDetachedNodes(eff);
+    if (cocos2d::CCNode* node = self->getNodeByTag(tag)) {
+        CCObjectRetainGuard nodeGuard(node);
+        self->removeNode(node);
+        WidgetHierarchyAccessor::purgeDetachedChild(eff, node);
+    }
+    return 0;
+}
+
+int hook_Widget_removeAllNodes(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::ui::Widget>(L, 1);
+    if (!self) {
+        return 0;
+    }
+    CCObjectRetainGuard selfGuard(self);
+    cocos2d::ui::Widget* eff = resolveEffectiveContainerWidget(self);
+    WidgetHierarchyAccessor::pruneDetachedNodes(eff);
+    self->removeAllNodes();
+    WidgetHierarchyAccessor::pruneDetachedNodes(eff);
+    return 0;
+}
+
+int hook_Widget_getNodes(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::ui::Widget>(L, 1);
+    if (!self) {
+        lua_pushnil(L);
+        return 1;
+    }
+    cocos2d::ui::Widget* eff = resolveEffectiveContainerWidget(self);
+    WidgetHierarchyAccessor::pruneDetachedNodes(eff);
+    cocos2d::CCArray* nodes = self->getNodes();
+    pushCCObject(L, nodes, "CCArray");
+    return 1;
+}
+
 int hook_CCNode_runAction(lua_State* L) {
     auto* self = getSafeCCObject<cocos2d::CCNode>(L, 1);
     auto* action = getSafeCCObject<cocos2d::CCAction>(L, 2);
@@ -1840,9 +2131,94 @@ int hook_Layout_isBackGroundImageScale9Enabled(lua_State* L) {
     return 1;
 }
 
+bool applyWidgetRendererTextureWithFallback(
+    cocos2d::CCNode* renderer,
+    bool scale9Enabled,
+    const char* fileName,
+    cocos2d::ui::TextureResType texType,
+    const cocos2d::CCRect& capInsets,
+    bool hasCapInsets)
+{
+    if (!renderer || !fileName || fileName[0] == '\0') {
+        return false;
+    }
+    cocos2d::CCSpriteFrame* frame = nullptr;
+    cocos2d::CCTexture2D* tex = nullptr;
+    if (texType == cocos2d::ui::UI_TEX_TYPE_PLIST) {
+        frame = findSpriteFrameWithFallback(fileName);
+        if (!frame) {
+            tex = loadTextureWithExtensionFallback(fileName);
+        }
+    } else {
+        tex = loadTextureWithExtensionFallback(fileName);
+        if (!tex) {
+            frame = findSpriteFrameWithFallback(fileName);
+        }
+    }
+    if (!frame && tex) {
+        cocos2d::CCRect texRect = cocos2d::CCRectZero;
+        texRect.size = tex->getContentSize();
+        frame = cocos2d::CCSpriteFrame::createWithTexture(tex, texRect);
+    }
+    if (!frame) {
+        return false;
+    }
+    if (scale9Enabled) {
+        auto* s9 = static_cast<cocos2d::extension::CCScale9Sprite*>(renderer);
+        const bool ok = s9->initWithSpriteFrame(frame);
+        if (ok && hasCapInsets) {
+            s9->setCapInsets(capInsets);
+        }
+        return ok;
+    }
+    auto* sp = static_cast<cocos2d::CCSprite*>(renderer);
+    return sp->initWithSpriteFrame(frame);
+}
+
+cocos2d::ui::TextureResType readLuaTexResType(lua_State* L, int idx) {
+    if (lua_gettop(L) >= idx && lua_isnumber(L, idx)) {
+        const int raw = static_cast<int>(lua_tointeger(L, idx));
+        if (raw == static_cast<int>(cocos2d::ui::UI_TEX_TYPE_PLIST)) {
+            return cocos2d::ui::UI_TEX_TYPE_PLIST;
+        }
+    }
+    return cocos2d::ui::UI_TEX_TYPE_LOCAL;
+}
+
 struct LayoutAccessor : public cocos2d::ui::Layout {
     static cocos2d::CCNode* bgImg(const cocos2d::ui::Layout* obj) {
         return obj ? obj->*(&LayoutAccessor::_backGroundImage) : nullptr;
+    }
+    static void setBackGroundImageWithFallback(
+        cocos2d::ui::Layout* obj,
+        const char* fileName,
+        cocos2d::ui::TextureResType texType)
+    {
+        if (!obj || !fileName || fileName[0] == '\0') return;
+        auto* acc = static_cast<LayoutAccessor*>(obj);
+        if (acc->_backGroundImage == nullptr) {
+            acc->addBackGroundImage();
+        }
+        acc->_backGroundImageFileName = fileName;
+        acc->_bgImageTexType = texType;
+        if (applyWidgetRendererTextureWithFallback(
+                acc->_backGroundImage,
+                acc->_backGroundScale9Enabled,
+                fileName,
+                texType,
+                acc->_backGroundImageCapInsets,
+                acc->_backGroundScale9Enabled)) {
+            if (acc->_backGroundScale9Enabled && acc->_backGroundImage) {
+                static_cast<cocos2d::extension::CCScale9Sprite*>(acc->_backGroundImage)->setPreferredSize(acc->_size);
+            }
+            acc->_backGroundImageTextureSize = acc->_backGroundImage
+                ? acc->_backGroundImage->getContentSize()
+                : cocos2d::CCSizeZero;
+            if (acc->_backGroundImage) {
+                acc->_backGroundImage->setPosition(cocos2d::CCPoint(acc->_size.width * 0.5f, acc->_size.height * 0.5f));
+            }
+            acc->updateBackGroundImageRGBA();
+        }
     }
 };
 
@@ -1853,6 +2229,17 @@ int hook_Layout_getBackGroundImage(lua_State* L) {
     return 1;
 }
 
+int hook_Layout_setBackGroundImage(lua_State* L) {
+    auto* layout = getSafeCCObject<cocos2d::ui::Layout>(L, 1);
+    const char* fileName = (lua_gettop(L) >= 2 && lua_type(L, 2) == LUA_TSTRING)
+        ? lua_tostring(L, 2)
+        : nullptr;
+    if (layout && fileName && fileName[0] != '\0') {
+        LayoutAccessor::setBackGroundImageWithFallback(layout, fileName, readLuaTexResType(L, 3));
+    }
+    return 0;
+}
+
 struct ImageViewAccessor : public cocos2d::ui::ImageView {
     static cocos2d::CCNode* imgRenderer(const cocos2d::ui::ImageView* obj) {
         return obj ? obj->*(&ImageViewAccessor::_imageRenderer) : nullptr;
@@ -1861,7 +2248,44 @@ struct ImageViewAccessor : public cocos2d::ui::ImageView {
         static const std::string kEmpty;
         return obj ? obj->*(&ImageViewAccessor::_textureFile) : kEmpty;
     }
+    static bool loadTextureWithFallback(
+        cocos2d::ui::ImageView* obj,
+        const char* fileName,
+        cocos2d::ui::TextureResType texType)
+    {
+        if (!obj || !fileName || fileName[0] == '\0') return false;
+        auto* acc = static_cast<ImageViewAccessor*>(obj);
+        acc->_textureFile = fileName;
+        acc->_imageTexType = texType;
+        if (!applyWidgetRendererTextureWithFallback(
+                acc->_imageRenderer,
+                acc->_scale9Enabled,
+                fileName,
+                texType,
+                acc->_capInsets,
+                true)) {
+            return false;
+        }
+        acc->_imageTextureSize = acc->_imageRenderer->getContentSize();
+        acc->imageTextureScaleChangedWithSize();
+        acc->updateAnchorPoint();
+        acc->updateFlippedX();
+        acc->updateFlippedY();
+        acc->updateRGBAToRenderer(acc->_imageRenderer);
+        return true;
+    }
 };
+
+int hook_ImageView_loadTexture(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::ui::ImageView>(L, 1);
+    const char* fileName = (lua_gettop(L) >= 2 && lua_type(L, 2) == LUA_TSTRING)
+        ? lua_tostring(L, 2)
+        : nullptr;
+    if (self && fileName && fileName[0] != '\0') {
+        ImageViewAccessor::loadTextureWithFallback(self, fileName, readLuaTexResType(L, 3));
+    }
+    return 0;
+}
 
 int hook_ImageView_getScale9Image(lua_State* L) {
     auto* self = getSafeCCObject<cocos2d::ui::ImageView>(L, 1);
@@ -1901,7 +2325,98 @@ struct ButtonAccessor : public cocos2d::ui::Button {
     static cocos2d::CCLabelTTF* titleRenderer(const cocos2d::ui::Button* obj) {
         return obj ? obj->*(&ButtonAccessor::_titleRenderer) : nullptr;
     }
+    static void loadNormal(cocos2d::ui::Button* obj, const char* path, cocos2d::ui::TextureResType rt) {
+        if (!obj || !path || path[0] == '\0') return;
+        auto* acc = static_cast<ButtonAccessor*>(obj);
+        acc->_normalFileName = path;
+        acc->_normalTexType = rt;
+        if (!applyWidgetRendererTextureWithFallback(
+                acc->_buttonNormalRenderer, acc->_scale9Enabled, path, rt, acc->_capInsetsNormal, true)) {
+            return;
+        }
+        acc->_normalTextureSize = acc->_buttonNormalRenderer->getContentSize();
+        acc->updateAnchorPoint();
+        acc->updateFlippedX();
+        acc->updateFlippedY();
+        acc->updateRGBAToRenderer(acc->_buttonNormalRenderer);
+        acc->normalTextureScaleChangedWithSize();
+        acc->_normalTextureLoaded = true;
+    }
+    static void loadPressed(cocos2d::ui::Button* obj, const char* path, cocos2d::ui::TextureResType rt) {
+        if (!obj || !path || path[0] == '\0') return;
+        auto* acc = static_cast<ButtonAccessor*>(obj);
+        acc->_clickedFileName = path;
+        acc->_pressedTexType = rt;
+        if (!applyWidgetRendererTextureWithFallback(
+                acc->_buttonClickedRenderer, acc->_scale9Enabled, path, rt, acc->_capInsetsPressed, true)) {
+            return;
+        }
+        acc->_pressedTextureSize = acc->_buttonClickedRenderer->getContentSize();
+        acc->updateAnchorPoint();
+        acc->updateFlippedX();
+        acc->updateFlippedY();
+        acc->updateRGBAToRenderer(acc->_buttonClickedRenderer);
+        acc->pressedTextureScaleChangedWithSize();
+        acc->_pressedTextureLoaded = true;
+    }
+    static void loadDisabled(cocos2d::ui::Button* obj, const char* path, cocos2d::ui::TextureResType rt) {
+        if (!obj || !path || path[0] == '\0') return;
+        auto* acc = static_cast<ButtonAccessor*>(obj);
+        acc->_disabledFileName = path;
+        acc->_disabledTexType = rt;
+        if (!applyWidgetRendererTextureWithFallback(
+                acc->_buttonDisableRenderer, acc->_scale9Enabled, path, rt, acc->_capInsetsDisabled, true)) {
+            return;
+        }
+        acc->_disabledTextureSize = acc->_buttonDisableRenderer->getContentSize();
+        acc->updateAnchorPoint();
+        acc->updateFlippedX();
+        acc->updateFlippedY();
+        acc->updateRGBAToRenderer(acc->_buttonDisableRenderer);
+        acc->disabledTextureScaleChangedWithSize();
+        acc->_disabledTextureLoaded = true;
+    }
 };
+
+int hook_Button_loadTextureNormal(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::ui::Button>(L, 1);
+    const char* p = (lua_gettop(L) >= 2 && lua_type(L, 2) == LUA_TSTRING) ? lua_tostring(L, 2) : nullptr;
+    if (self && p && p[0] != '\0') {
+        ButtonAccessor::loadNormal(self, p, readLuaTexResType(L, 3));
+    }
+    return 0;
+}
+
+int hook_Button_loadTexturePressed(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::ui::Button>(L, 1);
+    const char* p = (lua_gettop(L) >= 2 && lua_type(L, 2) == LUA_TSTRING) ? lua_tostring(L, 2) : nullptr;
+    if (self && p && p[0] != '\0') {
+        ButtonAccessor::loadPressed(self, p, readLuaTexResType(L, 3));
+    }
+    return 0;
+}
+
+int hook_Button_loadTextureDisabled(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::ui::Button>(L, 1);
+    const char* p = (lua_gettop(L) >= 2 && lua_type(L, 2) == LUA_TSTRING) ? lua_tostring(L, 2) : nullptr;
+    if (self && p && p[0] != '\0') {
+        ButtonAccessor::loadDisabled(self, p, readLuaTexResType(L, 3));
+    }
+    return 0;
+}
+
+int hook_Button_loadTextures(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::ui::Button>(L, 1);
+    if (!self) return 0;
+    const cocos2d::ui::TextureResType rt = readLuaTexResType(L, 5);
+    const char* normal = (lua_gettop(L) >= 2 && lua_type(L, 2) == LUA_TSTRING) ? lua_tostring(L, 2) : nullptr;
+    const char* selected = (lua_gettop(L) >= 3 && lua_type(L, 3) == LUA_TSTRING) ? lua_tostring(L, 3) : nullptr;
+    const char* disabled = (lua_gettop(L) >= 4 && lua_type(L, 4) == LUA_TSTRING) ? lua_tostring(L, 4) : nullptr;
+    if (normal && normal[0] != '\0') ButtonAccessor::loadNormal(self, normal, rt);
+    if (selected && selected[0] != '\0') ButtonAccessor::loadPressed(self, selected, rt);
+    if (disabled && disabled[0] != '\0') ButtonAccessor::loadDisabled(self, disabled, rt);
+    return 0;
+}
 
 cocos2d::CCSize effectiveButtonSize(cocos2d::ui::Button* btn) {
     if (!btn) return cocos2d::CCSizeZero;
@@ -2375,7 +2890,47 @@ struct LoadingBarAccessor : public cocos2d::ui::LoadingBar {
         static const std::string kEmpty;
         return obj ? obj->*(&LoadingBarAccessor::_textureFile) : kEmpty;
     }
+    static void loadTextureWithFallback(
+        cocos2d::ui::LoadingBar* obj,
+        const char* fileName,
+        cocos2d::ui::TextureResType texType)
+    {
+        if (!obj || !fileName || fileName[0] == '\0') return;
+        auto* acc = static_cast<LoadingBarAccessor*>(obj);
+        acc->_renderBarTexType = texType;
+        acc->_textureFile = fileName;
+        if (!applyWidgetRendererTextureWithFallback(
+                acc->_barRenderer, acc->_scale9Enabled, fileName, texType, acc->_capInsets, true)) {
+            return;
+        }
+        acc->updateRGBAToRenderer(acc->_barRenderer);
+        acc->_barRendererTextureSize = acc->_barRenderer->getContentSize();
+        switch (acc->_barType) {
+        case cocos2d::ui::LoadingBarTypeLeft:
+            acc->_barRenderer->setAnchorPoint(cocos2d::CCPoint(0.0f, 0.5f));
+            if (!acc->_scale9Enabled) {
+                static_cast<cocos2d::CCSprite*>(acc->_barRenderer)->setFlipX(false);
+            }
+            break;
+        case cocos2d::ui::LoadingBarTypeRight:
+            acc->_barRenderer->setAnchorPoint(cocos2d::CCPoint(1.0f, 0.5f));
+            if (!acc->_scale9Enabled) {
+                static_cast<cocos2d::CCSprite*>(acc->_barRenderer)->setFlipX(true);
+            }
+            break;
+        }
+        acc->barRendererScaleChangedWithSize();
+    }
 };
+
+int hook_LoadingBar_loadTexture(lua_State* L) {
+    auto* self = getSafeCCObject<cocos2d::ui::LoadingBar>(L, 1);
+    const char* p = (lua_gettop(L) >= 2 && lua_type(L, 2) == LUA_TSTRING) ? lua_tostring(L, 2) : nullptr;
+    if (self && p && p[0] != '\0') {
+        LoadingBarAccessor::loadTextureWithFallback(self, p, readLuaTexResType(L, 3));
+    }
+    return 0;
+}
 
 int hook_LoadingBar_getScale9Image(lua_State* L) {
     auto* self = getSafeCCObject<cocos2d::ui::LoadingBar>(L, 1);
@@ -4893,9 +5448,23 @@ void wrapMetatableMethod(lua_State* L, const char* typeName, const char* methodN
     lua_pop(L, 1);
 }
 
-void wrapScrollContainerHooks(lua_State* L, const char* typeName) {
+void wrapWidgetLifecycleHooks(lua_State* L, const char* typeName) {
     wrapMetatableMethod(L, typeName, "addChild", &hook_Widget_addChild);
     wrapMetatableMethod(L, typeName, "addNode", &hook_Widget_addNode);
+    wrapMetatableMethod(L, typeName, "removeFromParent", &hook_CCNode_removeFromParent);
+    wrapMetatableMethod(L, typeName, "removeFromParentAndCleanup", &hook_CCNode_removeFromParentAndCleanup);
+    wrapMetatableMethod(L, typeName, "removeChild", &hook_CCNode_removeChild);
+    wrapMetatableMethod(L, typeName, "removeAllChildren", &hook_Widget_removeAllChildren);
+    wrapMetatableMethod(L, typeName, "removeAllChildrenWithCleanup", &hook_CCNode_removeAllChildrenWithCleanup);
+    wrapMetatableMethod(L, typeName, "removeNode", &hook_Widget_removeNode);
+    wrapMetatableMethod(L, typeName, "removeNodeByTag", &hook_Widget_removeNodeByTag);
+    wrapMetatableMethod(L, typeName, "removeAllNodes", &hook_Widget_removeAllNodes);
+    wrapMetatableMethod(L, typeName, "getNodes", &hook_Widget_getNodes);
+}
+
+void wrapScrollContainerHooks(lua_State* L, const char* typeName) {
+    wrapWidgetLifecycleHooks(L, typeName);
+    wrapMetatableMethod(L, typeName, "setBackGroundImage", &hook_Layout_setBackGroundImage);
     wrapMetatableMethod(L, typeName, "getBackGroundImage", &hook_Layout_getBackGroundImage);
     wrapMetatableMethod(L, typeName, "isBackGroundImageScale9Enabled", &hook_Layout_isBackGroundImageScale9Enabled);
     wrapMetatableMethod(L, typeName, "setTouchMovedEnabled", &hook_ScrollView_setTouchMovedEnabled);
@@ -4961,19 +5530,27 @@ void RegisterAssetLoaderHooks(lua_State* L) {
     wrapMetatableMethod(L, "CCArmatureAnimation", "setMovementLoopByName", &hook_CCArmatureAnimation_setMovementLoopByName);
 
     wrapMetatableMethod(L, "CCNode", "addChild", &hook_CCNode_addChild);
+    wrapMetatableMethod(L, "CCNode", "removeFromParent", &hook_CCNode_removeFromParent);
+    wrapMetatableMethod(L, "CCNode", "removeFromParentAndCleanup", &hook_CCNode_removeFromParentAndCleanup);
+    wrapMetatableMethod(L, "CCNode", "removeChild", &hook_CCNode_removeChild);
+    wrapMetatableMethod(L, "CCNode", "removeAllChildrenWithCleanup", &hook_CCNode_removeAllChildrenWithCleanup);
     wrapMetatableMethod(L, "CCNode", "runAction", &hook_CCNode_runAction);
     wrapMetatableMethod(L, "CCNode", "setShaderWithVertexShaderByteArray", &hook_setShaderWithVertexShaderByteArray);
     wrapMetatableMethod(L, "CCDirector", "getCurrentTime", &hook_CCDirector_getCurrentTime);
 
-    wrapMetatableMethod(L, "Widget", "addChild", &hook_Widget_addChild);
-    wrapMetatableMethod(L, "Widget", "addNode", &hook_Widget_addNode);
+    wrapWidgetLifecycleHooks(L, "Widget");
     wrapMetatableMethod(L, "Widget", "clippingParentAreaContainPoint", &hook_Widget_clippingParentAreaContainPoint);
 
+    wrapMetatableMethod(L, "ImageView", "loadTexture", &hook_ImageView_loadTexture);
     wrapMetatableMethod(L, "ImageView", "isScale9Enabled", &hook_ImageView_isScale9Enabled);
     wrapMetatableMethod(L, "ImageView", "getScale9Image", &hook_ImageView_getScale9Image);
     wrapMetatableMethod(L, "ImageView", "getTexture", &hook_ImageView_getTexture);
     wrapMetatableMethod(L, "ImageView", "getCapInsets", &hook_ImageView_getCapInsets);
 
+    wrapMetatableMethod(L, "Button", "loadTextures", &hook_Button_loadTextures);
+    wrapMetatableMethod(L, "Button", "loadTextureNormal", &hook_Button_loadTextureNormal);
+    wrapMetatableMethod(L, "Button", "loadTexturePressed", &hook_Button_loadTexturePressed);
+    wrapMetatableMethod(L, "Button", "loadTextureDisabled", &hook_Button_loadTextureDisabled);
     wrapMetatableMethod(L, "Button", "isScale9Enabled", &hook_Button_isScale9Enabled);
     wrapMetatableMethod(L, "Button", "getScale9Image", &hook_Button_getScale9Image);
     wrapMetatableMethod(L, "Button", "enableTitleStroke", &hook_Button_enableTitleStroke);
@@ -4998,6 +5575,7 @@ void RegisterAssetLoaderHooks(lua_State* L) {
     wrapMetatableMethod(L, "CCLabelTTF", "enableShadow", &hook_CCLabelTTF_enableShadow);
     wrapMetatableMethod(L, "CCLabelTTF", "getTextHeight", &hook_Label_getTextHeight);
 
+    wrapMetatableMethod(L, "LoadingBar", "loadTexture", &hook_LoadingBar_loadTexture);
     wrapMetatableMethod(L, "LoadingBar", "isScale9Enabled", &hook_LoadingBar_isScale9Enabled);
     wrapMetatableMethod(L, "LoadingBar", "getScale9Image", &hook_LoadingBar_getScale9Image);
     wrapMetatableMethod(L, "LoadingBar", "getTexture", &hook_LoadingBar_getTexture);
@@ -5012,8 +5590,8 @@ void RegisterAssetLoaderHooks(lua_State* L) {
     wrapMetatableMethod(L, "CCSprite", "createWithSpriteFrameName", &hook_CCSprite_createWithSpriteFrameName);
     wrapMetatableMethod(L, "CCSprite", "createWithSpriteFrame", &hook_CCSprite_createWithSpriteFrame);
 
-    wrapMetatableMethod(L, "Layout", "addChild", &hook_Widget_addChild);
-    wrapMetatableMethod(L, "Layout", "addNode", &hook_Widget_addNode);
+    wrapWidgetLifecycleHooks(L, "Layout");
+    wrapMetatableMethod(L, "Layout", "setBackGroundImage", &hook_Layout_setBackGroundImage);
     wrapMetatableMethod(L, "Layout", "getBackGroundImage", &hook_Layout_getBackGroundImage);
     wrapMetatableMethod(L, "Layout", "isBackGroundImageScale9Enabled", &hook_Layout_isBackGroundImageScale9Enabled);
     wrapScrollContainerHooks(L, "ScrollView");
