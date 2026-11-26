@@ -952,10 +952,6 @@ int main(int argc, char** argv) {
 
     // Phase 3: CCConfiguration + gatherGPUInfo + dumpInfo + CCDirector + CCScheduler + SimpleAudioEngine
     runPhase("phase3_configuration_director_scheduler", [&](std::string& detail) -> bool {
-        auto makeTouchBtn = [&]() -> cocos2d::ui::Widget* {
-            if (wglCtx.ready) return cocos2d::ui::Button::create();
-            return cocos2d::ui::Layout::create();
-        };
         cocos2d::CCDirector* dir = cocos2d::CCDirector::sharedDirector();
         if (!dir) {
             detail = "CCDirector::sharedDirector() returned null";
@@ -1024,6 +1020,10 @@ int main(int argc, char** argv) {
 
     // Phase 5: Real Win32 HWND + CCEGLView + TouchGroup + FuncMenu (Tửu Quán) Mouse Routing (>= 24 cycles)
     runPhase("phase5_win32_funcmenu_mouse_routing", [&](std::string& detail) -> bool {
+        auto makeTouchBtn = [&]() -> cocos2d::ui::Widget* {
+            if (wglCtx.ready) return cocos2d::ui::Button::create();
+            return cocos2d::ui::Layout::create();
+        };
         using cocos2d::ui::SEL_TouchEvent;
         cocos2d::CCDirector* dir = cocos2d::CCDirector::sharedDirector();
         if (!dir || !dir->getTouchDispatcher()) { detail = "CCDirector/CCTouchDispatcher null"; return false; }
