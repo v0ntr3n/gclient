@@ -1022,7 +1022,9 @@ int main(int argc, char** argv) {
     runPhase("phase5_win32_funcmenu_mouse_routing", [&](std::string& detail) -> bool {
         auto makeTouchBtn = [&]() -> cocos2d::ui::Widget* {
             if (wglCtx.ready) return cocos2d::ui::Button::create();
-            return cocos2d::ui::Layout::create();
+            auto* l = cocos2d::ui::Layout::create();
+            l->setAnchorPoint(cocos2d::CCPointMake(0.5f, 0.5f));
+            return l;
         };
         using cocos2d::ui::SEL_TouchEvent;
         cocos2d::CCDirector* dir = cocos2d::CCDirector::sharedDirector();
