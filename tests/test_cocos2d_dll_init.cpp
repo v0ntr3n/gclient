@@ -447,10 +447,18 @@ public:
     virtual void update(float) { ++ticks; }
 };
 
+class ScopedDummyApplication final : public cocos2d::CCApplication {
+public:
+    bool applicationDidFinishLaunching() override { return true; }
+    void applicationDidEnterBackground() override {}
+    void applicationWillEnterForeground() override {}
+};
+
 struct ScopedDummyWglContext {
     HWND hwnd = nullptr;
     HDC hdc = nullptr;
     HGLRC hglrc = nullptr;
+    bool gl11Ready = false;
     bool ready = false;
     std::string glVersion;
 
@@ -477,14 +485,18 @@ struct ScopedDummyWglContext {
 
         hglrc = ::wglCreateContext(hdc);
         if (!hglrc || !::wglMakeCurrent(hdc, hglrc)) return;
+        gl11Ready = true;
 
         glewExperimental = GL_TRUE;
-        (void)::glewInit();
+        const GLenum glewRc = ::glewInit();
         const GLubyte* ver = ::glGetString(GL_VERSION);
         if (ver) {
             glVersion = reinterpret_cast<const char*>(ver);
         }
-        ready = true;
+        // Headless Windows Hyper-V GDI Generic only exposes OpenGL 1.1.0 (`glCreateProgram == nullptr`);
+        // Cocos2d-x 2.2.6 CCShaderCache / CCSprite / VBOs strictly require OpenGL 2.0 entry points.
+        ready = (glewRc == GLEW_OK) && GLEW_VERSION_2_0 &&
+                (glCreateProgram != nullptr) && (glGenBuffers != nullptr);
     }
 
     ~ScopedDummyWglContext() {
@@ -679,6 +691,7 @@ int main(int argc, char** argv) {
         luaOut << "return 1337\n";
     }
 
+    ScopedDummyApplication dummyApp;
     ScopedDummyWglContext wglCtx;
 
     // Phase 1: CCFileUtils + setSearchPaths + bt_decrypt + UTF-8 path resolution
@@ -756,7 +769,7 @@ int main(int argc, char** argv) {
         } else {
             img->release();
         }
-        detail = "PNG 256x32 decoded cleanly; WGL=" + (wglCtx.ready ? wglCtx.glVersion : std::string("unavailable"));
+        detail = "PNG 256x32 decoded cleanly; WGL20=" + (wglCtx.ready ? wglCtx.glVersion : ("unavailable(gl=" + wglCtx.glVersion + ")"));
         return true;
     });
 
@@ -832,36 +845,34 @@ int main(int argc, char** argv) {
     // removeAllChildrenWithCleanup(true) internal renderer preservation, and ImageView
     // ignoreContentAdaptWithSize(false) -> loadTexture (plist frame & local) -> setSize(100,100)/(98,98) + CCFadeIn
     runPhase("phase5_issue8_widget_lifecycle_and_imageview_icons", [&](std::string& detail) -> bool {
-        if (!wglCtx.ready) {
-            detail = "skipped GL texture phase (headless environment without WGL)";
-            return true;
-        }
-        fs::create_directories(tempFixture / L"gameImage" / L"item");
-        const std::vector<uint8_t> iconPng = buildValidRgbaPng(98, 98);
-        {
-            std::ofstream iconOut(tempFixture / L"gameImage" / L"item" / L"jinjiedan.png", std::ios::binary);
-            iconOut.write(reinterpret_cast<const char*>(iconPng.data()), static_cast<std::streamsize>(iconPng.size()));
-        }
-        const std::vector<uint8_t> framePng = buildValidRgbaPng(100, 100);
-        auto* frameImg = new cocos2d::CCImage();
-        if (!frameImg->initWithImageData(
-                const_cast<uint8_t*>(framePng.data()),
-                static_cast<int>(framePng.size()),
-                cocos2d::CCImage::kFmtPng)) {
+        cocos2d::CCSpriteFrame* frame5 = nullptr;
+        if (wglCtx.ready) {
+            fs::create_directories(tempFixture / L"gameImage" / L"item");
+            const std::vector<uint8_t> iconPng = buildValidRgbaPng(98, 98);
+            {
+                std::ofstream iconOut(tempFixture / L"gameImage" / L"item" / L"jinjiedan.png", std::ios::binary);
+                iconOut.write(reinterpret_cast<const char*>(iconPng.data()), static_cast<std::streamsize>(iconPng.size()));
+            }
+            const std::vector<uint8_t> framePng = buildValidRgbaPng(100, 100);
+            auto* frameImg = new cocos2d::CCImage();
+            if (!frameImg->initWithImageData(
+                    const_cast<uint8_t*>(framePng.data()),
+                    static_cast<int>(framePng.size()),
+                    cocos2d::CCImage::kFmtPng)) {
+                frameImg->release();
+                detail = "Failed to decode 100x100 frame PNG";
+                return false;
+            }
+            cocos2d::CCTexture2D* frameTex =
+                cocos2d::CCTextureCache::sharedTextureCache()->addUIImage(frameImg, "issue8_frame_5_atlas");
             frameImg->release();
-            detail = "Failed to decode 100x100 frame PNG";
-            return false;
+            if (!frameTex) {
+                detail = "addUIImage failed for issue8_frame_5_atlas";
+                return false;
+            }
+            frame5 = cocos2d::CCSpriteFrame::createWithTexture(frameTex, cocos2d::CCRect(0.0f, 0.0f, 100.0f, 100.0f));
+            cocos2d::CCSpriteFrameCache::sharedSpriteFrameCache()->addSpriteFrame(frame5, "frame_5.png");
         }
-        cocos2d::CCTexture2D* frameTex =
-            cocos2d::CCTextureCache::sharedTextureCache()->addUIImage(frameImg, "issue8_frame_5_atlas");
-        frameImg->release();
-        if (!frameTex) {
-            detail = "addUIImage failed for issue8_frame_5_atlas";
-            return false;
-        }
-        cocos2d::CCSpriteFrame* frame5 =
-            cocos2d::CCSpriteFrame::createWithTexture(frameTex, cocos2d::CCRect(0.0f, 0.0f, 100.0f, 100.0f));
-        cocos2d::CCSpriteFrameCache::sharedSpriteFrameCache()->addSpriteFrame(frame5, "frame_5.png");
 
         constexpr int kLoops = 60;
         for (int iter = 0; iter < kLoops; ++iter) {
@@ -873,7 +884,9 @@ int main(int argc, char** argv) {
                 itemContainer->addChild(cell);
 
                 // GainItemCell.lua:61: glow node at z = -1
-                auto* glow = cocos2d::CCSprite::createWithSpriteFrame(frame5);
+                cocos2d::CCNode* glow = frame5
+                    ? static_cast<cocos2d::CCNode*>(cocos2d::CCSprite::createWithSpriteFrame(frame5))
+                    : cocos2d::CCNode::create();
                 glow->setPosition(cocos2d::CCPoint(87.0f, 69.0f));
                 glow->setScale(1.2f);
                 cell->addNode(glow, -1, 101);
@@ -883,30 +896,31 @@ int main(int argc, char** argv) {
                 iconItem->setPosition(cocos2d::CCPoint(40.0f, 0.0f));
                 cell->addChild(iconItem);
 
-                auto* iconQuality = cocos2d::ui::ImageView::create();
-                iconQuality->ignoreContentAdaptWithSize(false);
-                iconItem->addChild(iconQuality);
-                // 1-arg UI_TEX_TYPE_LOCAL resolving "gameImage/frame/frame_5.png" from CCSpriteFrameCache!
-                iconQuality->loadTexture("gameImage/frame/frame_5.png", cocos2d::ui::UI_TEX_TYPE_LOCAL);
-                iconQuality->setSize(cocos2d::CCSize(100.0f, 100.0f));
+                if (wglCtx.ready) {
+                    auto* iconQuality = cocos2d::ui::ImageView::create();
+                    iconQuality->ignoreContentAdaptWithSize(false);
+                    iconItem->addChild(iconQuality);
+                    iconQuality->loadTexture("gameImage/frame/frame_5.png", cocos2d::ui::UI_TEX_TYPE_LOCAL);
+                    iconQuality->setSize(cocos2d::CCSize(100.0f, 100.0f));
 
-                auto* icon = cocos2d::ui::ImageView::create();
-                icon->ignoreContentAdaptWithSize(false);
-                iconItem->addChild(icon);
-                icon->loadTexture("gameImage/item/jinjiedan.png", cocos2d::ui::UI_TEX_TYPE_LOCAL);
-                icon->setSize(cocos2d::CCSize(98.0f, 98.0f));
+                    auto* icon = cocos2d::ui::ImageView::create();
+                    icon->ignoreContentAdaptWithSize(false);
+                    iconItem->addChild(icon);
+                    icon->loadTexture("gameImage/item/jinjiedan.png", cocos2d::ui::UI_TEX_TYPE_LOCAL);
+                    icon->setSize(cocos2d::CCSize(98.0f, 98.0f));
 
-                auto* lbName = cocos2d::ui::Label::create();
-                lbName->setText("Tiến Cấp Đơn");
-                iconItem->addChild(lbName);
+                    auto* lbName = cocos2d::ui::Label::create();
+                    lbName->setText("Tiến Cấp Đơn");
+                    iconItem->addChild(lbName);
 
-                auto* qVr = dynamic_cast<cocos2d::CCSprite*>(iconQuality->getVirtualRenderer());
-                auto* iVr = dynamic_cast<cocos2d::CCSprite*>(icon->getVirtualRenderer());
-                if (!qVr || !qVr->getTexture() || qVr->getContentSize().width <= 0.0f || qVr->getScaleX() <= 0.0f ||
-                    !iVr || !iVr->getTexture() || iVr->getContentSize().width <= 0.0f || iVr->getScaleX() <= 0.0f) {
-                    itemContainer->release();
-                    detail = "ImageView virtualRenderer missing texture or zero scale on iter=" + std::to_string(iter);
-                    return false;
+                    auto* qVr = dynamic_cast<cocos2d::CCSprite*>(iconQuality->getVirtualRenderer());
+                    auto* iVr = dynamic_cast<cocos2d::CCSprite*>(icon->getVirtualRenderer());
+                    if (!qVr || !qVr->getTexture() || qVr->getContentSize().width <= 0.0f || qVr->getScaleX() <= 0.0f ||
+                        !iVr || !iVr->getTexture() || iVr->getContentSize().width <= 0.0f || iVr->getScaleX() <= 0.0f) {
+                        itemContainer->release();
+                        detail = "ImageView virtualRenderer missing texture or zero scale on iter=" + std::to_string(iter);
+                        return false;
+                    }
                 }
 
                 // CCFadeIn opacity step verification on UIWidget
@@ -921,7 +935,9 @@ int main(int argc, char** argv) {
                 }
 
                 // playArmatureOnce equivalent: addNode(fx) then fx->removeFromParentAndCleanup(true)
-                auto* fxNode = cocos2d::CCSprite::createWithSpriteFrame(frame5);
+                cocos2d::CCNode* fxNode = frame5
+                    ? static_cast<cocos2d::CCNode*>(cocos2d::CCSprite::createWithSpriteFrame(frame5))
+                    : cocos2d::CCNode::create();
                 const unsigned int baseRef = fxNode->retainCount();
                 cell->addNode(fxNode, 0, 202);
                 if (!cell->getNodes() || cell->getNodes()->count() != 2u) {
