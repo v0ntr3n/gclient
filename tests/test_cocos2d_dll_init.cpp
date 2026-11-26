@@ -448,10 +448,18 @@ public:
     virtual void update(float) { ++ticks; }
 };
 
+class ScopedDummyApplication final : public cocos2d::CCApplication {
+public:
+    bool applicationDidFinishLaunching() override { return true; }
+    void applicationDidEnterBackground() override {}
+    void applicationWillEnterForeground() override {}
+};
+
 struct ScopedDummyWglContext {
     HWND hwnd = nullptr;
     HDC hdc = nullptr;
     HGLRC hglrc = nullptr;
+    bool gl11Ready = false;
     bool ready = false;
     std::string glVersion;
 
@@ -478,14 +486,18 @@ struct ScopedDummyWglContext {
 
         hglrc = ::wglCreateContext(hdc);
         if (!hglrc || !::wglMakeCurrent(hdc, hglrc)) return;
+        gl11Ready = true;
 
         glewExperimental = GL_TRUE;
-        (void)::glewInit();
+        const GLenum glewRc = ::glewInit();
         const GLubyte* ver = ::glGetString(GL_VERSION);
         if (ver) {
             glVersion = reinterpret_cast<const char*>(ver);
         }
-        ready = true;
+        // Headless Windows Hyper-V GDI Generic only exposes OpenGL 1.1.0 (`glCreateProgram == nullptr`);
+        // Cocos2d-x 2.2.6 CCShaderCache / CCSprite / VBOs strictly require OpenGL 2.0 entry points.
+        ready = (glewRc == GLEW_OK) && GLEW_VERSION_2_0 &&
+                (glCreateProgram != nullptr) && (glGenBuffers != nullptr);
     }
 
     ~ScopedDummyWglContext() {
@@ -851,6 +863,7 @@ int main(int argc, char** argv) {
         luaOut << "return 1337\n";
     }
 
+    ScopedDummyApplication dummyApp;
     ScopedDummyWglContext wglCtx;
 
     // Phase 1: CCFileUtils + setSearchPaths + bt_decrypt + UTF-8 path resolution
@@ -933,12 +946,16 @@ int main(int argc, char** argv) {
         } else {
             img->release();
         }
-        detail = "PNG 256x32 decoded cleanly; WGL=" + (wglCtx.ready ? wglCtx.glVersion : std::string("unavailable"));
+        detail = "PNG 256x32 decoded cleanly; WGL20=" + (wglCtx.ready ? wglCtx.glVersion : ("unavailable(gl=" + wglCtx.glVersion + ")"));
         return true;
     });
 
     // Phase 3: CCConfiguration + gatherGPUInfo + dumpInfo + CCDirector + CCScheduler + SimpleAudioEngine
     runPhase("phase3_configuration_director_scheduler", [&](std::string& detail) -> bool {
+        auto makeTouchBtn = [&]() -> cocos2d::ui::Widget* {
+            if (wglCtx.ready) return cocos2d::ui::Button::create();
+            return cocos2d::ui::Layout::create();
+        };
         cocos2d::CCDirector* dir = cocos2d::CCDirector::sharedDirector();
         if (!dir) {
             detail = "CCDirector::sharedDirector() returned null";
@@ -1090,7 +1107,7 @@ int main(int argc, char** argv) {
             choukaWrap->setPosition(cocos2d::CCPointMake(50.0f, 400.0f));
             funcMenu->addChild(choukaWrap);
 
-            auto* choukaBtn = cocos2d::ui::Button::create();
+            auto* choukaBtn = makeTouchBtn();
             choukaBtn->ignoreContentAdaptWithSize(false);
             choukaBtn->setSize(cocos2d::CCSizeMake(119.0f, 112.0f));
             choukaBtn->setScale(0.8f);
@@ -1110,7 +1127,7 @@ int main(int argc, char** argv) {
             bool raffleOpen = false, secondaryOpen = false;
             cocos2d::ui::TouchGroup* activeRaffle = nullptr;
             cocos2d::ui::Layout* secMask = nullptr;
-            cocos2d::ui::ImageView* secBg = nullptr;
+            cocos2d::ui::Widget* secBg = nullptr;
 
             auto* choukaCb = new WidgetCallbackTarget();
             auto* closeCb = new WidgetCallbackTarget();
@@ -1129,7 +1146,7 @@ int main(int argc, char** argv) {
                 activeRaffle->addWidget(modalBg);
                 modalBg->setZOrder(-2);
 
-                auto* closeBtn = cocos2d::ui::Button::create();
+                auto* closeBtn = makeTouchBtn();
                 closeBtn->ignoreContentAdaptWithSize(false);
                 closeBtn->setSize(cocos2d::CCSizeMake(80.0f, 80.0f));
                 closeBtn->setPosition(cocos2d::CCPointMake(1060.0f, 580.0f + yShift));
@@ -1174,7 +1191,7 @@ int main(int argc, char** argv) {
                     secMask->addTouchEventListener(maskCb, toucheventselector(WidgetCallbackTarget::handleTouch));
                     funcMenu->addChild(secMask);
 
-                    secBg = cocos2d::ui::ImageView::create();
+                    secBg = wglCtx.ready ? static_cast<cocos2d::ui::Widget*>(cocos2d::ui::ImageView::create()) : static_cast<cocos2d::ui::Widget*>(cocos2d::ui::Layout::create());
                     secBg->ignoreContentAdaptWithSize(false);
                     secBg->setAnchorPoint(cocos2d::CCPointMake(0.0f, 0.0f));
                     secBg->setPosition(cocos2d::CCPointMake(100.0f, 370.0f));
@@ -1184,7 +1201,7 @@ int main(int argc, char** argv) {
                     auto* jgWrap = cocos2d::ui::Layout::create();
                     jgWrap->setPosition(cocos2d::CCPointMake(68.0f, 10.0f));
                     secBg->addChild(jgWrap);
-                    auto* jgBtn = cocos2d::ui::Button::create();
+                    auto* jgBtn = makeTouchBtn();
                     jgBtn->ignoreContentAdaptWithSize(false);
                     jgBtn->setSize(cocos2d::CCSizeMake(119.0f, 112.0f));
                     jgBtn->setScale(0.8f);
@@ -1273,7 +1290,7 @@ int main(int argc, char** argv) {
                 testView->setDesignResolutionSize(1136.0f, 640.0f, kResolutionFixedWidth);
                 auto* siScene = cocos2d::CCScene::create(); siScene->retain();
                 auto* siGroup = cocos2d::ui::TouchGroup::create(); siGroup->setTouchPriority(-2);
-                auto* siBtn = cocos2d::ui::Button::create();
+                auto* siBtn = makeTouchBtn();
                 siBtn->ignoreContentAdaptWithSize(false);
                 siBtn->setSize(cocos2d::CCSizeMake(119.0f, 112.0f));
                 siBtn->setScale(0.8f);
