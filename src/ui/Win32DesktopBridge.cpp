@@ -52,20 +52,20 @@ void syncViewportOnClientResize(cocos2d::CCEGLView* eglView, int clientW, int cl
     const bool hasValidPrevDesign =
         std::isfinite(prevDesign.width) && std::isfinite(prevDesign.height) &&
         prevDesign.width >= 1.0f && prevDesign.height >= 1.0f &&
-        prevPolicy != kResolutionUnKnown;
+        prevPolicy != ResolutionPolicy::UNKNOWN;
 
     if (hasValidPrevDesign) {
         const bool sameAspect =
             (prevFrame.width > 0.0f && prevFrame.height > 0.0f) &&
             (std::fabs((unzoomedW / unzoomedH) - (prevFrame.width / prevFrame.height)) < 1e-3f);
         // Preserve exact policy on same-aspect restores/zooms (e.g. 960x640 -> 1136x758,
-        // 1024x768 -> 1136x768 ShowAll, 16:9 -> 1136x639); letterbox via kResolutionShowAll
+        // 1024x768 -> 1136x768 ShowAll, 16:9 -> 1136x639); letterbox via ResolutionPolicy::SHOW_ALL
         // when aspect changes post-boot (e.g. F11 fullscreen) so Lua's baked g.config.designSize
         // and LayerManager stage_layer offsets stay 100% aligned with hitTest!
-        const ResolutionPolicy targetPolicy = sameAspect ? prevPolicy : kResolutionShowAll;
+        const ResolutionPolicy targetPolicy = sameAspect ? prevPolicy : ResolutionPolicy::SHOW_ALL;
         eglView->setDesignResolutionSize(prevDesign.width, prevDesign.height, targetPolicy);
     } else {
-        eglView->setDesignResolutionSize(1136.0f, 640.0f, kResolutionFixedWidth);
+        eglView->setDesignResolutionSize(1136.0f, 640.0f, ResolutionPolicy::FIXED_WIDTH);
     }
 }
 

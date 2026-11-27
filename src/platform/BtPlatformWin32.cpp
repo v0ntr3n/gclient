@@ -35,6 +35,10 @@
 #include <shellapi.h>
 #endif
 
+#ifdef poll
+#undef poll
+#endif
+
 namespace bt {
 
 namespace {

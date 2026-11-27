@@ -1663,7 +1663,7 @@ bool XmlbArmatureLoader::AddDataFromBitCache(const uint8_t* bitCacheData,
         texData->release();
     }
 
-    (void)ReadLE32S; (void)MapBitCacheBlendType;
+    (void)&ReadLE32S; (void)&MapBitCacheBlendType;
     return true;
 #else
     (void)bitCacheData;

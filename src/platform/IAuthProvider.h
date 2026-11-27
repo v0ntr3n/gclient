@@ -22,6 +22,10 @@
 #include <string>
 #include <utility>
 
+#ifdef poll
+#undef poll
+#endif
+
 namespace bt {
 
 /**

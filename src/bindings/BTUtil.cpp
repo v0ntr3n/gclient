@@ -293,7 +293,7 @@ void BTUtil::exitNow() {
     }
 #ifdef _WIN32
     if (auto* director = ax::Director::getInstance()) {
-        if (auto* rv = director->getRenderView()) {
+        if (auto* rv = dynamic_cast<ax::RenderViewImpl*>(director->getRenderView())) {
             if (HWND hwnd = rv->getWin32Window(); hwnd != nullptr && ::IsWindow(hwnd)) {
                 ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
             }
