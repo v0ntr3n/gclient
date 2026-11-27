@@ -413,7 +413,7 @@ target_include_directories(${APP_NAME} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compat/include"
 )
 
-target_link_libraries(${APP_NAME} PRIVATE
+target_link_libraries(${APP_NAME}
     gclient_build_options
     gclient_bindings
     gclient_assets
