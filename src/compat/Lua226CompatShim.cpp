@@ -6,11 +6,15 @@ extern "C" {
 #include "lauxlib.h"
 }
 
+#include <string>
+
 namespace gclient::compat {
 
 namespace {
 
-constexpr const char* kLua226CompatSource = R"LUA(
+// Split into <4 KB string literal chunks to stay strictly below MSVC C2026 (16,380-byte literal cap).
+static const char* const kLua226CompatChunks[] = {
+    R"LUA(
 do
   ax   = ax or cc or {}
   cc   = ax
@@ -72,7 +76,8 @@ do
   _H.EVENT_TOUCH_ENDED               = _H.EVENT_TOUCH_ENDED or 42
   _H.EVENT_TOUCH_CANCELLED           = _H.EVENT_TOUCH_CANCELLED or 43
   _H.EVENT_TOUCHES_BEGAN             = _H.EVENT_TOUCHES_BEGAN or 44
-  _H.EVENT_TOUCHES_MOVED             = _H.EVENT_TOUCHES_MOVED or 45
+)LUA",
+    R"LUA(  _H.EVENT_TOUCHES_MOVED             = _H.EVENT_TOUCHES_MOVED or 45
   _H.EVENT_TOUCHES_ENDED             = _H.EVENT_TOUCHES_ENDED or 46
   _H.EVENT_TOUCHES_CANCELLED         = _H.EVENT_TOUCHES_CANCELLED or 47
   _H.EVENT_MOUSE_DOWN                = _H.EVENT_MOUSE_DOWN or 48
@@ -153,7 +158,8 @@ do
   function ccpMidpoint(v1, v2) return { x = (v1.x + v2.x) * 0.5, y = (v1.y + v2.y) * 0.5 } end
   function ccpDot(v1, v2) return v1.x * v2.x + v1.y * v2.y end
   function ccpLengthSQ(v) return v.x * v.x + v.y * v.y end
-  function ccpLength(v)   return math.sqrt(v.x * v.x + v.y * v.y) end
+)LUA",
+    R"LUA(  function ccpLength(v)   return math.sqrt(v.x * v.x + v.y * v.y) end
   function ccpDistanceSQ(v1, v2)
     local dx, dy = v1.x - v2.x, v1.y - v2.y
     return dx * dx + dy * dy
@@ -268,7 +274,8 @@ do
 
   -- 3. tolua.cast / tolua.isnull / tolua.type Compatibility Map
   tolua = tolua or {}
-  local _orig_tolua_cast   = tolua.cast
+)LUA",
+    R"LUA(  local _orig_tolua_cast   = tolua.cast
   local _orig_tolua_isnull = tolua.isnull
 
   local _toluaTypeMap = {
@@ -353,7 +360,8 @@ do
   }
 
   tolua.cast = function(obj, typeName)
-    if obj == nil then return nil end
+)LUA",
+    R"LUA(    if obj == nil then return nil end
     local mapped = _toluaTypeMap[typeName] or typeName
     if _orig_tolua_cast and type(obj) == "userdata" then
       local casted = _orig_tolua_cast(obj, mapped)
@@ -453,7 +461,8 @@ do
   CheckBox             = axui.CheckBox
   UICheckBox           = axui.CheckBox
   ImageView            = axui.ImageView
-  UIImageView          = axui.ImageView
+)LUA",
+    R"LUA(  UIImageView          = axui.ImageView
   Label                = axui.Text
   UILabel              = axui.Text
   LabelAtlas           = axui.TextAtlas
@@ -538,7 +547,8 @@ do
   CCEaseBounceIn           = ax.EaseBounceIn
   CCEaseBounceOut          = ax.EaseBounceOut
   CCEaseBounceInOut        = ax.EaseBounceInOut
-  CCEaseElasticIn          = ax.EaseElasticIn
+)LUA",
+    R"LUA(  CCEaseElasticIn          = ax.EaseElasticIn
   CCEaseElasticOut         = ax.EaseElasticOut
   CCEaseElasticInOut       = ax.EaseElasticInOut
   CCEaseExponentialIn      = ax.EaseExponentialIn
@@ -635,7 +645,8 @@ do
   end
 
   if ax.UserDefault then
-    ax.UserDefault.sharedUserDefault = ax.UserDefault.sharedUserDefault or function(cls)
+)LUA",
+    R"LUA(    ax.UserDefault.sharedUserDefault = ax.UserDefault.sharedUserDefault or function(cls)
       return ax.UserDefault:getInstance()
     end
   end
@@ -720,7 +731,8 @@ do
   -- 8. Metatable Method Bridges (Node, Layer, ScrollView, Label, UI Widgets)
   if ax.Node then
     ax.Node.setZOrder            = ax.Node.setZOrder or ax.Node.setLocalZOrder
-    ax.Node.getZOrder            = ax.Node.getZOrder or ax.Node.getLocalZOrder
+)LUA",
+    R"LUA(    ax.Node.getZOrder            = ax.Node.getZOrder or ax.Node.getLocalZOrder
     ax.Node.setVertexZ           = ax.Node.setVertexZ or ax.Node.setPositionZ
     ax.Node.getVertexZ           = ax.Node.getVertexZ or ax.Node.getPositionZ
     ax.Node.boundingBox          = ax.Node.boundingBox or ax.Node.getBoundingBox
@@ -789,7 +801,8 @@ do
           local loc = touch:getLocation()
           st.handler("ended", loc.x, loc.y)
         end, ax.Handler.EVENT_TOUCH_ENDED)
-        l:registerScriptHandler(function(touch, event)
+)LUA",
+    R"LUA(        l:registerScriptHandler(function(touch, event)
           local loc = touch:getLocation()
           st.handler("cancelled", loc.x, loc.y)
         end, ax.Handler.EVENT_TOUCH_CANCELLED)
@@ -866,7 +879,8 @@ do
       axui.Widget.addTouchEventListener = function(self, arg1, arg2)
         if type(arg1) == "function" and arg2 == nil then
           return _origAddTouchEventListener(self, arg1)
-        elseif type(arg2) == "function" then
+)LUA",
+    R"LUA(        elseif type(arg2) == "function" then
           local target = arg1
           return _origAddTouchEventListener(self, function(sender, eventType)
             arg2(target, sender, eventType)
@@ -907,15 +921,19 @@ do
     end
   end
 end
-)LUA";
+)LUA",
+};
 
 } // namespace
 
 bool InstallLua226CompatShim(lua_State* L) {
     if (!L) return false;
-    if (luaL_loadbuffer(L, kLua226CompatSource,
-                        std::char_traits<char>::length(kLua226CompatSource),
-                        "@Lua226CompatShim.lua") != 0 ||
+    std::string fullSource;
+    fullSource.reserve(40960);
+    for (const char* chunk : kLua226CompatChunks) {
+        if (chunk) fullSource.append(chunk);
+    }
+    if (luaL_loadbuffer(L, fullSource.data(), fullSource.size(), "@Lua226CompatShim.lua") != 0 ||
         lua_pcall(L, 0, 0, 0) != 0) {
         const char* err = lua_tostring(L, -1);
         gclient::diagnostics::CrashAndTelemetry::log(

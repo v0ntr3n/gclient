@@ -226,7 +226,7 @@ public:
     unsigned int count() const noexcept { return static_cast<unsigned int>(m_data.size()); }
 
     ax::Object* objectAtIndex(size_t index) const noexcept {
-        return (index < m_data.size()) ? m_data.at(index) : nullptr;
+        return (index < static_cast<size_t>(m_data.size())) ? m_data.at(static_cast<ssize_t>(index)) : nullptr;
     }
 
     ax::Object* lastObject() const noexcept {
@@ -234,7 +234,7 @@ public:
     }
 
     ax::Object* randomObject() const noexcept {
-        return m_data.empty() ? nullptr : m_data.at(static_cast<size_t>(std::rand()) % m_data.size());
+        return m_data.empty() ? nullptr : m_data.at(static_cast<ssize_t>(static_cast<size_t>(std::rand()) % static_cast<size_t>(m_data.size())));
     }
 
     bool containsObject(ax::Object* obj) const noexcept {
