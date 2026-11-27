@@ -47,7 +47,7 @@ vcpkg install protobuf:x64-windows sqlite3:x64-windows
 # 2. Clone Axmol v2.11.5 LTS & provision the axslcc shader compiler
 git clone --branch v2.11.5 --depth 1 https://github.com/axmolengine/axmol.git external/axmol
 $env:AX_ROOT = (Resolve-Path external/axmol).Path
-pwsh -NoProfile -ExecutionPolicy Bypass -File "$env:AX_ROOT/1k/1kiss.ps1" -setupOnly -prefix "$env:AX_ROOT/tools/external"
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "& { $Global:is_axmol_engine = $true; Set-Location $env:AX_ROOT; . ./1k/1kiss.ps1 -setupOnly -prefix ./tools/external }"
 
 # 3. Configure & build GCLIENT.exe (Release x64)
 cmake -B build -G "Visual Studio 17 2022" -A x64 `

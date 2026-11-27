@@ -101,7 +101,7 @@ jobs:
           }
           $env:AX_ROOT = $axRoot
           New-Item -ItemType Directory -Force -Path "$axRoot/tools/external" | Out-Null
-          pwsh -NoProfile -ExecutionPolicy Bypass -File "$axRoot/1k/1kiss.ps1" -setupOnly -prefix "$axRoot/tools/external"
+          pwsh -NoProfile -ExecutionPolicy Bypass -Command "& { `$Global:is_axmol_engine = `$true; Set-Location '$axRoot'; . '$axRoot/1k/1kiss.ps1' -setupOnly -prefix '$axRoot/tools/external' }"
           if (-not (Test-Path -LiteralPath "$axRoot/tools/external/axslcc/axslcc.exe")) {
             throw "axslcc.exe was not provisioned under $axRoot/tools/external/axslcc"
           }
