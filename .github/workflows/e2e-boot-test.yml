@@ -1,0 +1,227 @@
+name: E2E Axmol Boot Test
+
+on:
+  push:
+    branches: [feat/axmol-port]
+    paths:
+      - ".github/workflows/e2e-boot-test.yml"
+  workflow_run:
+    workflows: ["Build & Verify Kestrel Canvas Axmol Win64 (VS2022 x64 + Axmol v2.11.5)"]
+    types: [completed]
+    branches: [feat/axmol-port]
+  workflow_dispatch:
+    inputs:
+      kestrel_run_id:
+        description: "Optional kestrel-canvas workflow run ID (defaults to latest passing feat/axmol-port run)"
+        required: false
+        default: ""
+      cobalt_run_id:
+        description: "Optional cobalt-relay workflow run ID (defaults to latest passing main run)"
+        required: false
+        default: ""
+      boot_seconds:
+        description: "Seconds to let GCLIENT.exe run before collecting logs"
+        required: false
+        default: "10"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  e2e-boot-win64:
+    name: Win64 E2E Boot (kestrel-canvas + cobalt-relay + lua_scripts)
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout private v0ntr3n/lua_scripts into Resources/scripts
+        uses: actions/checkout@v4
+        with:
+          repository: v0ntr3n/lua_scripts
+          ref: main
+          token: ${{ secrets.LUA_SCRIPTS_TOKEN }}
+          path: work/Resources/scripts
+
+      - name: Cache CI Boot Pack (ci-boot-pack-v1)
+        id: bootpack-cache
+        uses: actions/cache@v4
+        with:
+          path: work/ci-boot-pack.zip
+          key: ci-boot-pack-v1
+
+      - name: Download CI Boot Pack from private v0ntr3n/lua_scripts release
+        if: steps.bootpack-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.LUA_SCRIPTS_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force work | Out-Null
+          gh release download ci-boot-pack-v1 -R v0ntr3n/lua_scripts -p "ci-boot-pack.zip" -D work
+
+      - name: Extract CI Boot Pack into Resources
+        shell: pwsh
+        run: |
+          python -c "
+          import zipfile
+          with zipfile.ZipFile('work/ci-boot-pack.zip', 'r') as zf:
+              zf.extractall('work/Resources')
+          print('Extracted boot pack into work/Resources')
+          "
+
+      - name: Download latest passing GCLIENT.exe and gserver.exe artifacts
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KESTREL_RUN_INPUT: ${{ inputs.kestrel_run_id }}
+          COBALT_RUN_INPUT: ${{ inputs.cobalt_run_id }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $kRun = $env:KESTREL_RUN_INPUT
+          if ([string]::IsNullOrWhiteSpace($kRun) -and -not [string]::IsNullOrWhiteSpace($env:WORKFLOW_RUN_ID)) {
+              $kRun = $env:WORKFLOW_RUN_ID
+          }
+          if ([string]::IsNullOrWhiteSpace($kRun)) {
+              $kRun = gh run list -R v0ntr3n/kestrel-canvas --branch feat/axmol-port --status success --workflow "build-axmol-win64.yml" --limit 1 --json databaseId --jq '.[0].databaseId'
+          }
+          $cRun = $env:COBALT_RUN_INPUT
+          if ([string]::IsNullOrWhiteSpace($cRun)) {
+              $cRun = gh run list -R v0ntr3n/cobalt-relay --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId'
+          }
+
+          Write-Host "Using kestrel-canvas run=$kRun, cobalt-relay run=$cRun"
+          if ([string]::IsNullOrWhiteSpace($kRun) -or [string]::IsNullOrWhiteSpace($cRun)) {
+              throw "Failed to resolve latest passing CI runs (kestrel=$kRun, cobalt=$cRun)"
+          }
+
+          gh run download $kRun -R v0ntr3n/kestrel-canvas -n gclient-axmol-win64-release -D work/gclient
+          gh run download $cRun -R v0ntr3n/cobalt-relay -n gserver-windows-x64 -D work/gserver
+
+          Get-Item work/gclient/GCLIENT.exe, work/gserver/target/release/gserver.exe | Select-Object FullName, Length
+
+      - name: Configure local server.toml (12412) and platform_override
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tomlPath = "work/gserver/server.toml"
+          $toml = Get-Content $tomlPath -Raw
+          $toml = $toml -replace 'http_bind\s*=\s*"[^"]+"', 'http_bind = "127.0.0.1:12412"'
+          Set-Content -Path $tomlPath -Value $toml -NoNewline
+
+          New-Item -ItemType Directory -Force "work/platform_override/platform", "work/profile" | Out-Null
+
+          @'
+          {
+            "host": "http://127.0.0.1:12412",
+            "host_debug": "http://127.0.0.1:12412",
+            "log_host": "http://127.0.0.1:12412",
+            "log_host_debug": "http://127.0.0.1:12412",
+            "pushurl": "http://127.0.0.1:12412/push",
+            "gn": "vnsg2",
+            "language": "vi_VN"
+          }
+          '@ | Set-Content -Path "work/platform_override/platform/game_config.json" -Encoding UTF8
+
+          @'
+          {
+            "pl": "android",
+            "os": "android",
+            "gn": "vnsg2",
+            "key": "2A0ce68806G8aJ58Mo6_vnsg2@OmZHv",
+            "userCenterName": "Win32Local",
+            "debug": "0",
+            "isAd": "0",
+            "isStandAlone": "0",
+            "isSimulation": "0",
+            "simulateHashHost": "http://127.0.0.1:12412"
+          }
+          '@ | Set-Content -Path "work/platform_override/platform/config.json" -Encoding UTF8
+
+      - name: Run headless --validate-assets check
+        shell: pwsh
+        run: |
+          $root = (Resolve-Path "work").Path
+          $p = Start-Process -FilePath "$root\gclient\GCLIENT.exe" `
+            -ArgumentList '--resources-dir', "$root\Resources", '--base-assets-dir', "$root\platform_override", '--profile-dir', "$root\profile", '--validate-assets' `
+            -WorkingDirectory "$root\gclient" -PassThru -Wait
+          Write-Host "VALIDATE_ASSETS_EXIT=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+
+      - name: Run E2E boot test (gserver + GCLIENT)
+        id: e2e
+        shell: pwsh
+        env:
+          BOOT_SECONDS: ${{ inputs.boot_seconds || '10' }}
+        run: |
+          $root = (Resolve-Path "work").Path
+          $srv = Start-Process -FilePath "$root\gserver\target\release\gserver.exe" `
+            -ArgumentList '--config', 'server.toml' `
+            -WorkingDirectory "$root\gserver" `
+            -RedirectStandardOutput "$root\profile\gserver.log" `
+            -RedirectStandardError "$root\profile\gserver_err.log" `
+            -PassThru
+          Start-Sleep -Seconds 2
+
+          $env:GCLIENT_AUTH_URL = "http://127.0.0.1:12412"
+          $env:GCLIENT_SUPPRESS_MESSAGEBOX = "1"
+          $env:GCLIENT_SCREENSHOT_NAME = "ci_boot.png"
+
+          $cli = Start-Process -FilePath "$root\gclient\GCLIENT.exe" `
+            -ArgumentList '--resources-dir', "$root\Resources", '--base-assets-dir', "$root\platform_override", '--profile-dir', "$root\profile" `
+            -WorkingDirectory "$root\gclient" -PassThru
+
+          $waitSec = [int]$env:BOOT_SECONDS
+          Start-Sleep -Seconds $waitSec
+
+          $srvAlive = $null -ne (Get-Process -Id $srv.Id -ErrorAction SilentlyContinue)
+          $cliAlive = $null -ne (Get-Process -Id $cli.Id -ErrorAction SilentlyContinue)
+          Write-Host "SRV_ALIVE=$srvAlive CLI_ALIVE=$cliAlive"
+
+          Stop-Process -Id $cli.Id, $srv.Id -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Milliseconds 500
+
+          $logFile = "$root\profile\logs\gclient-axmol_pid$($cli.Id).log"
+          $logText = if (Test-Path $logFile) { Get-Content $logFile -Raw } else { "" }
+
+          Write-Host "=== GCLIENT LOG ==="
+          Write-Host $logText
+          Write-Host "=== GSERVER LOG ==="
+          if (Test-Path "$root\profile\gserver.log") { Get-Content "$root\profile\gserver.log" }
+
+          $failures = @()
+          if (-not $srvAlive) { $failures += "gserver.exe exited prematurely" }
+          if (-not $cliAlive) { $failures += "GCLIENT.exe crashed or exited before ${waitSec}s" }
+          if ($logText -match '\[FATAL\]') { $failures += "FATAL crash logged in GCLIENT" }
+          if ((Get-ChildItem "$root\profile\dumps\*.dmp" -ErrorAction SilentlyContinue).Count -gt 0) {
+              $failures += "Crash minidump generated"
+          }
+          if ($logText -match '\[ERROR\].*\[CCMessageBox\]') {
+              $failures += "Lua startup error reported via CCMessageBox"
+          }
+          if ($logText -match '\[ERROR\].*\[tolua_Platform\] Lua callback error') {
+              $failures += "Lua callback error in tolua_Platform (initSDK / login flow)"
+          }
+          if ($logText -match 'runningScene=0000000000000000') {
+              $failures += "Black screen detected (runningScene=NULL at Frame 60)"
+          }
+
+          if ($failures.Count -gt 0) {
+              Write-Host "::error::E2E Boot Test FAILED:`n - $($failures -join "`n - ")"
+              exit 1
+          }
+          Write-Host "E2E Boot Test PASSED!"
+
+      - name: Upload E2E logs, screenshot, and dumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-boot-diagnostics
+          path: |
+            work/profile/logs/*.log
+            work/profile/gserver*.log
+            work/profile/writable/ci_boot.png
+            work/profile/dumps/*.dmp
+          if-no-files-found: ignore
