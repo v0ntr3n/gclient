@@ -2,11 +2,16 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <string>
+#include <vector>
 
 #include "compat/Axmol226Compat.h"
 
 struct lua_State;
+namespace ax {
+class LuaEngine;
+}
 
 namespace gclient {
 
@@ -19,11 +24,22 @@ struct AppConfig {
     std::string logsDir;
     std::string dumpsDir;
 
+    std::string mapiUrl;
+    std::string gameHost;
+    int         gamePort = 0;
+    std::string pid;
+    std::string sessionToken;
+    std::string entryScript;
+
     int windowWidth  = 1136;
     int windowHeight = 640;
 
     bool muteAudio          = false;
     bool validateAssetsOnly = false;
+    bool skipHotupdate      = false;
+    bool headlessServer     = false;
+
+    std::map<std::string, std::string> bootstrapEnv;
 };
 
 class AppDelegate final : public ax::Application {
@@ -53,6 +69,12 @@ public:
     // Headless CLI --validate-assets entrypoint (runs without requiring an OpenGL context)
     bool executeHeadlessAssetValidation();
 
+    // Headless server mode entrypoint
+    bool executeHeadlessServer();
+
+    // Schedule a Lua soft restart on the next frame tick
+    void restartGame();
+
     // Explicit ordered teardown (safe & idempotent; called prior to telemetry shutdown)
     void shutdown();
 
@@ -72,6 +94,7 @@ public:
         return m_pendingBackground.load(std::memory_order_acquire);
     }
 
+    static AppDelegate* activeInstance() noexcept;
     static bool hasActiveInstance() noexcept;
     static bool isLifecycleReady() noexcept;
 
@@ -81,8 +104,13 @@ public:
 private:
     class FrameTicker;
 
+    void resolveBootstrapEnvironment();
+    std::string resolveEntryScriptRelativePath() const;
     void configureFileUtils();
+    void installKestrelBootstrapTable(lua_State* L);
     void registerLuaBindings(lua_State* L);
+    int executeBootstrapScript(ax::LuaEngine* engine, const std::string& scriptPath);
+    void performSoftRestart();
     void scheduleNativeLoops();
     void unscheduleNativeLoops();
     bool runAssetValidation();
@@ -90,14 +118,17 @@ private:
                                               ax::RenderViewImpl* renderView);
     void teardownSubsystems(LifecycleState terminalState);
 
-    AppConfig    m_config;
-    FrameTicker* m_ticker            = nullptr;
-    bool         m_assetValidationOk = false;
+    AppConfig                m_config;
+    FrameTicker*             m_ticker            = nullptr;
+    bool                     m_assetValidationOk = false;
+    std::vector<std::string> m_initialSearchPaths;
 
     std::atomic<LifecycleState> m_lifecycleState{LifecycleState::Uninitialized};
     std::atomic<bool>           m_isInBackground{false};
     std::atomic<bool>           m_pendingForeground{false};
     std::atomic<bool>           m_pendingBackground{false};
+    std::atomic<bool>           m_pendingSoftRestart{false};
+    std::atomic<uint32_t>       m_restartCount{0};
 };
 
 } // namespace gclient
