@@ -3,6 +3,7 @@
 #include "CConnection.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -22,6 +23,7 @@ class CNetwork
 {
 public:
     static CNetwork* sharedNetwork();
+    static CNetwork* peekSharedNetwork() noexcept;
     static void destroySharedNetwork();
 
 #if defined(GCLIENT_USE_COCOS2DX)
@@ -35,6 +37,8 @@ public:
     void removeConnection(CConnection* conn);
     void update(float dt);
     void shutdown();
+    void resetForRestart(bool notifyLuaClose = false);
+    void wakePollThread() noexcept;
     size_t activeConnectionCount() const;
 
     friend class CConnection;
@@ -90,6 +94,10 @@ private:
     std::mutex eventMutex_;
     std::deque<PendingEvent> eventQueue_;
     size_t queuedEventBytes_ = 0;
+
+    std::atomic<uint64_t> dispatchGeneration_{0};
+    std::mutex pollWakeMutex_;
+    std::condition_variable pollWakeCv_;
 
     static std::mutex s_instanceMutex;
     static CNetwork* s_instance;

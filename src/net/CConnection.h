@@ -9,7 +9,9 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
+#endif
 #else
 #include <sys/socket.h>
 using SOCKET = int;
@@ -148,7 +150,7 @@ public:
     void registerCloseFunc(int luaHandler);
 
     // Optional standalone Lua VM binding for headless/Linux regression testing without CCLuaEngine.
-    void setStandaloneLuaState(lua_State* L) noexcept { standaloneLuaState_ = L; }
+    void setStandaloneLuaState(lua_State* L) noexcept;
 
     void setHeadCallback(HeadCallback cb);
     void setBodyCallback(BodyCallback cb);
@@ -183,6 +185,9 @@ private:
     static int getLastSocketError() noexcept;
     static bool isWouldBlockError(int err) noexcept;
 
+    void bindOwnerLuaStateOnRegister();
+    void removeLuaScriptHandlerOwned(int& handlerSlot, bool removeFromLiveEngine);
+    void detachScriptHandlers(bool removeFromLiveEngine);
     void releaseAllScriptHandlers();
     static void removeLuaScriptHandler(int& handlerSlot);
     void invokeProtectedLuaHandler(int luaHandler,
@@ -194,7 +199,7 @@ private:
                                    size_t headerLength,
                                    bool pushPacketArgs);
 
-    bool tryStartNextEndpointLocked(int& outLastErr, bool& outConnectedImmediately);
+    bool tryStartNextEndpointLocked(SOCKET& outSock, int& outLastErr, bool& outConnectedImmediately);
     uint32_t getBodyLength(const char* headerPtr, bool& outZeroBodyOk);
     void closeSocketHandle();
 
@@ -234,6 +239,7 @@ private:
     int bodyLuaHandler_ = 0;
     int closeLuaHandler_ = 0;
     lua_State* standaloneLuaState_ = nullptr;
+    lua_State* ownerLuaState_ = nullptr;
     bool closeNotified_ = false;
 
     HeadCallback headCallback_;

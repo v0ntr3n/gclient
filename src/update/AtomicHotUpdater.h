@@ -174,6 +174,8 @@ struct HotUpdaterConfig {
     uint32_t lockProbeMaxRetries = 12;
     /// Base backoff in milliseconds between NTFS lock probes.
     uint32_t lockProbeBackoffMs = 50;
+    /// Enforce Axmol-converted texture and GC64 LuaJIT compatibility on staged payloads.
+    bool enforceAxmolConvertedAssetCompat = true;
 };
 
 /// Windows-safe atomic hot-update pipeline for the Game Client Win32 C++ client.
@@ -263,6 +265,9 @@ public:
     /// Validates that a relative path from a manifest cannot escape staging/.
     static bool isSafeRelativePath(const std::string& relativePath);
 
+    /// Validates that a relative asset path uses Axmol-compatible formats.
+    static bool isAxmolCompatibleRelativeAssetPath(const std::string& relativePath);
+
     /// Compares dotted semantic versions ("major.minor.patch").
     /// Returns <0 if lhs < rhs, 0 if equal, >0 if lhs > rhs.
     static int compareSemver(const std::string& lhs, const std::string& rhs);
@@ -275,6 +280,13 @@ private:
     std::filesystem::path releaseDirForVersion(const std::string& version) const;
 
     bool ensureDirectoryLayout(std::string& errorOut) const;
+    bool validatePatchRootIsolation(std::string& errorOut) const;
+    bool isOverlayDirContainedInReleases(const std::filesystem::path& candidateDir) const;
+    bool isDirectoryTreeUnlocked(const std::filesystem::path& dirPath) const;
+    bool validateDownloadedPayloadCompatibility(
+        const std::string& relativePath,
+        const std::filesystem::path& stagedFile,
+        std::string& errorOut) const;
     bool loadActiveStateLocked(ActiveOverlayState& outState) const;
     bool writeFileAtomically(
         const std::filesystem::path& targetPath,

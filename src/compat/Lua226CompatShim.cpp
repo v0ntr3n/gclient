@@ -499,6 +499,7 @@ do
     ax.Node.removeAllChildrenWithCleanup = ax.Node.removeAllChildrenWithCleanup or function(self) return self:removeAllChildren() end
     ax.Node.pauseSchedulerAndActions     = ax.Node.pauseSchedulerAndActions or ax.Node.pause
     ax.Node.resumeSchedulerAndActions    = ax.Node.resumeSchedulerAndActions or ax.Node.resume
+    ax.Node.setShaderWithVertexShaderByteArray = ax.Node.setShaderWithVertexShaderByteArray or function(self) return self end
   end
 
   if ax.Layer then

@@ -6,6 +6,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -54,6 +55,7 @@ public:
                                 std::string& outError);
 
     static bool isOfflineStubToken(const std::string& tok);
+    static bool isLegacyDeadAuthUrl(std::string_view url) noexcept;
     static bool isEphemeralPidInstancePath(const std::string& path);
     static std::string defaultSessionFile();
     static std::string resolvePersistentDeviceId(const std::string& sessionFileHint = "");
@@ -67,6 +69,7 @@ public:
 
 private:
     void cancelPendingLogin();
+    void completeInFlightLogin(AuthCallback primaryCb, const AuthResult& res);
     void enqueueResult(AuthCallback cb, AuthResult res);
 
     mutable std::mutex mutex_;
@@ -79,6 +82,7 @@ private:
     std::thread workerThread_;
 
     std::mutex callbackMutex_;
+    std::vector<AuthCallback> coalescedLoginCallbacks_;
     std::deque<std::pair<AuthCallback, AuthResult>> pendingCallbacks_;
 };
 
