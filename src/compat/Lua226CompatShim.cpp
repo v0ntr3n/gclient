@@ -142,7 +142,7 @@ do
     CCNodeRGBA = "ax.Node", CCLayerRGBA = "ax.Layer", CCTMXTiledMap = "ax.TMXTiledMap",
     CCLabelTTF = "ax.Label", CCLabelBMFont = "ax.Label",
     CCScale9Sprite = "axui.Scale9Sprite", CCEditBox = "axui.EditBox",
-    TouchGroup = "TouchGroup", UILayer = "TouchGroup", RichText = "RichText",
+    TouchGroup = "TouchGroup", UILayer = "TouchGroup", RichText = "axui.RichText",
     Panel = "axui.Layout", TextButton = "axui.Button", DragPanel = "axui.ScrollView",
     Label = "axui.Text", UILabel = "axui.Text", Text = "axui.Text", TextArea = "axui.Text",
     LabelAtlas = "axui.TextAtlas", UILabelAtlas = "axui.TextAtlas", TextAtlas = "axui.TextAtlas",
@@ -183,6 +183,10 @@ do
     local t = "axui." .. n
     _toluaTypeMap[n], _toluaTypeMap["UI" .. n] = t, t
     _G[n], _G["UI" .. n] = axui[n], axui[n]
+  end
+  for n in ("RichText RichElement RichElementText RichElementImage RichElementCustomNode RichElementNewLine"):gmatch("%S+") do
+    _toluaTypeMap[n] = "axui." .. n
+    if axui[n] and _G[n] == nil then _G[n] = axui[n] end
   end
   Panel, TextButton, UIHelper = axui.Layout, axui.Button, axui.Helper
   Label, UILabel = axui.Text, axui.Text
@@ -597,6 +601,47 @@ do
     ax.ScrollView.setTouchPriority = ax.ScrollView.setTouchPriority or function() end
   end
 
+  do
+    local function _enableStroke(self, c3, size)
+      if self and self.enableOutline then
+        local c = type(c3) == "table" and ccc4(c3.r or 0, c3.g or 0, c3.b or 0, c3.a or 255) or ccc4(0, 0, 0, 255)
+        return self:enableOutline(c, tonumber(size) or 1)
+      end
+    end
+    local function _disableStroke(self)
+      if self and self.disableEffect then return self:disableEffect() end
+    end
+    for _, _lbl in ipairs({ ax.Label, axui.Text, axui.TextBMFont }) do
+      if _lbl then
+        _lbl.enableStroke  = _lbl.enableStroke  or _enableStroke
+        _lbl.disableStroke = _lbl.disableStroke or _disableStroke
+        if _lbl.enableShadow then
+          local _origSh = _lbl.enableShadow
+          _lbl.enableShadow = function(self, a1, a2, a3)
+            if type(a1) == "table" and a1.r == nil and (a1.width ~= nil or a1.x ~= nil) then
+              local op = tonumber(a2) or 255
+              if op > 0 and op <= 1 then op = math.floor(op * 255 + 0.5) end
+              local off = { x = tonumber(a1.width or a1.x) or 2, y = tonumber(a1.height or a1.y) or -2 }
+              return _origSh(self, ccc4(0, 0, 0, op), off, math.floor(tonumber(a3) or 0))
+            end
+            return _origSh(self, a1, a2, a3)
+          end
+        end
+      end
+    end
+    if axui.Button then
+      axui.Button.enableTitleStroke = axui.Button.enableTitleStroke or function(self, c3, size)
+        local r = self.getTitleRenderer and self:getTitleRenderer()
+        if r then return _enableStroke(r, c3, size) end
+      end
+      axui.Button.disableTitleStroke = axui.Button.disableTitleStroke or function(self)
+        local r = self.getTitleRenderer and self:getTitleRenderer()
+        if r then return _disableStroke(r) end
+      end
+    end
+  end
+)LUA",
+    R"LUA(
   if ax.Label then
     local _origCreate = ax.Label.create
     ax.Label.create = function(cls, text, fontName, fontSize, dims, hAlign, vAlign)

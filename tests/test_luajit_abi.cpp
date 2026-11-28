@@ -273,6 +273,58 @@ bool testLua226CompatShimRuntimeBridges() {
     return vm.evalExpectString(verifyShimScript, "shim_verified", "Shim Lua Error");
 }
 
+bool testLua226CompatShimStrokeAndRichText() {
+    ScopedLuaVm vm;
+    CHECK_ABI(vm.L != nullptr);
+
+    const char* setupMocks = R"LUA(
+        local lastOutline, lastShadow = nil, nil
+        local titleRenderer = {
+            enableOutline = function(_, col, sz) lastOutline = { col = col, sz = sz } end,
+            disableEffect = function() lastOutline = "disabled" end,
+        }
+        ax = {
+            Label = {
+                create = function() return {} end,
+                enableOutline = function(_, col, sz) lastOutline = { col = col, sz = sz } end,
+                disableEffect = function() lastOutline = "disabled" end,
+                enableShadow = function(_, col, off, blur) lastShadow = { col = col, off = off, blur = blur } end,
+            },
+        }
+        axui = {
+            Text = { enableOutline = ax.Label.enableOutline, disableEffect = ax.Label.disableEffect, enableShadow = ax.Label.enableShadow },
+            Button = { getTitleRenderer = function() return titleRenderer end },
+            RichText = { create = function() return { kind = "RichText" } end },
+            RichElementText = { create = function() return { kind = "RichElementText" } end },
+            RichElementCustomNode = { create = function() return { kind = "RichElementCustomNode" } end },
+        }
+        _G.__getLastOutline = function() return lastOutline end
+        _G.__getLastShadow  = function() return lastShadow end
+    )LUA";
+    CHECK_ABI(luaL_dostring(vm.L, setupMocks) == 0);
+    CHECK_ABI(gclient::compat::InstallLua226CompatShim(vm.L));
+
+    const char* verifyScript = R"LUA(
+        assert(RichText == axui.RichText, "RichText global alias missing")
+        assert(RichElementText == axui.RichElementText, "RichElementText global alias missing")
+        assert(RichElementCustomNode == axui.RichElementCustomNode, "RichElementCustomNode global alias missing")
+
+        ax.Label:enableStroke(ccc3(0x82, 0x24, 0x0f), 2, true)
+        local o1 = __getLastOutline()
+        assert(o1 and o1.col.r == 0x82 and o1.col.g == 0x24 and o1.col.b == 0x0f and o1.col.a == 255 and o1.sz == 2)
+
+        axui.Button:enableTitleStroke(ccc3(0x5c, 0x33, 0x20), 1, true)
+        local o2 = __getLastOutline()
+        assert(o2 and o2.col.r == 0x5c and o2.col.g == 0x33 and o2.col.b == 0x20 and o2.sz == 1)
+
+        ax.Label:enableShadow(CCSize(2, -2), 0.5, 3, true)
+        local sh = __getLastShadow()
+        assert(sh and sh.col.a == 128 and sh.off.x == 2 and sh.off.y == -2 and sh.blur == 3)
+        return "stroke_and_richtext_verified"
+    )LUA";
+    return vm.evalExpectString(verifyScript, "stroke_and_richtext_verified", "Stroke/RichText Shim Lua Error");
+}
+
 bool testWin32InProcessCrtHygiene() {
 #ifdef _WIN32
     HMODULE hLua = ::GetModuleHandleW(L"lua51.dll");
@@ -307,6 +359,7 @@ int main() {
     suite.run("02_LuaJIT_ErrorUnwindAcrossCBoundary_And_BytecodeRoundTrip", testLuaJitErrorUnwindAndBytecodeRoundTrip);
     suite.run("03_Amf3NativeModule_SparseFloatKeys_And_MalformedOomGuard", testAmf3NativeModuleRoundTripAndFuzzGuards);
     suite.run("04_Lua226CompatShim_Geometry_Handler_BMFont_And_WidgetCallbacks", testLua226CompatShimRuntimeBridges);
+    suite.run("04b_Lua226CompatShim_Stroke_TitleStroke_Shadow_And_RichTextAliases", testLua226CompatShimStrokeAndRichText);
     suite.run("05_Win32InProcess_Lua51Exports_And_ZeroLegacyCrtHygiene", testWin32InProcessCrtHygiene);
     return suite.finishWithBanner();
 }
