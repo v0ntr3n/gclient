@@ -87,3 +87,6 @@ void UnscheduleAllLuaScriptEntries();
 
 // Ensures any pending DeferredArmatureAsyncCallback tasks remain scheduled on CCScheduler.
 void RescheduleLuaHelpersCallbacks();
+
+// Resets Lua helper timers, async callbacks, and optionally Spine cache during soft restart/shutdown.
+void ResetLuaHelpersForSoftRestart(bool clearSpineCache = false);
