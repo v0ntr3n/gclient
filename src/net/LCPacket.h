@@ -46,8 +46,18 @@ public:
     static bool zlibDecompress(const uint8_t* input, size_t inputSize, std::string& output,
                                size_t maxOutputSize = kDefaultMaxDecompressedBytes);
 
-    static uint32_t readBigEndianU32(const uint8_t* data);
-    static void writeBigEndianU32(uint8_t* out, uint32_t value);
+    static inline uint32_t readBigEndianU32(const uint8_t* data) noexcept {
+        return (static_cast<uint32_t>(data[0]) << 24) |
+               (static_cast<uint32_t>(data[1]) << 16) |
+               (static_cast<uint32_t>(data[2]) << 8) |
+               static_cast<uint32_t>(data[3]);
+    }
+    static inline void writeBigEndianU32(uint8_t* out, uint32_t value) noexcept {
+        out[0] = static_cast<uint8_t>((value >> 24) & 0xFFu);
+        out[1] = static_cast<uint8_t>((value >> 16) & 0xFFu);
+        out[2] = static_cast<uint8_t>((value >> 8) & 0xFFu);
+        out[3] = static_cast<uint8_t>(value & 0xFFu);
+    }
 };
 
 } // namespace gclient::net

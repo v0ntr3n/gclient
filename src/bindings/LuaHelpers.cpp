@@ -755,15 +755,34 @@ int hook_Widget_removeAllNodes(lua_State* L) {
     return 0;
 }
 
-template <typename WidgetT, auto LoadFn>
-int hookWidgetLoadTex(lua_State* L) {
+template <typename WidgetT, typename CallFn>
+int hookWidgetLoadTexImpl(lua_State* L, CallFn&& call) {
     auto* self = lb::getAxObject<WidgetT>(L, 1);
     const char* raw = lua_tostring(L, 2);
     if (!self || !raw || !*raw) return 0;
     std::string path;
     const auto rt = resolveWidgetTexArg(raw, static_cast<int>(lua_tointeger(L, 3)), lua_isnumber(L, 3) != 0, path);
-    if (!path.empty()) (self->*LoadFn)(path, rt);
+    if (!path.empty()) call(self, path, rt);
     return 0;
+}
+
+int hook_ImageView_loadTexture(lua_State* L) {
+    return hookWidgetLoadTexImpl<ax::ui::ImageView>(L, [](auto* s, const std::string& p, auto rt) { s->loadTexture(p, rt); });
+}
+int hook_LoadingBar_loadTexture(lua_State* L) {
+    return hookWidgetLoadTexImpl<ax::ui::LoadingBar>(L, [](auto* s, const std::string& p, auto rt) { s->loadTexture(p, rt); });
+}
+int hook_Layout_setBackGroundImage(lua_State* L) {
+    return hookWidgetLoadTexImpl<ax::ui::Layout>(L, [](auto* s, const std::string& p, auto rt) { s->setBackGroundImage(p, rt); });
+}
+int hook_Button_loadTextureNormal(lua_State* L) {
+    return hookWidgetLoadTexImpl<ax::ui::Button>(L, [](auto* s, const std::string& p, auto rt) { s->loadTextureNormal(p, rt); });
+}
+int hook_Button_loadTexturePressed(lua_State* L) {
+    return hookWidgetLoadTexImpl<ax::ui::Button>(L, [](auto* s, const std::string& p, auto rt) { s->loadTexturePressed(p, rt); });
+}
+int hook_Button_loadTextureDisabled(lua_State* L) {
+    return hookWidgetLoadTexImpl<ax::ui::Button>(L, [](auto* s, const std::string& p, auto rt) { s->loadTextureDisabled(p, rt); });
 }
 
 int hook_Button_loadTextures(lua_State* L) {
@@ -771,16 +790,16 @@ int hook_Button_loadTextures(lua_State* L) {
     if (!self) return 0;
     const bool hasType = lua_isnumber(L, 5) != 0;
     const int expType = static_cast<int>(lua_tointeger(L, 5));
-    auto applySlot = [&](int argIdx, auto fn) {
+    auto applySlot = [&](int argIdx, auto&& call) {
         if (const char* raw = lua_tostring(L, argIdx); raw && *raw) {
             std::string path;
             const auto rt = resolveWidgetTexArg(raw, expType, hasType, path);
-            if (!path.empty()) (self->*fn)(path, rt);
+            if (!path.empty()) call(path, rt);
         }
     };
-    applySlot(2, &ax::ui::Button::loadTextureNormal);
-    applySlot(3, &ax::ui::Button::loadTexturePressed);
-    applySlot(4, &ax::ui::Button::loadTextureDisabled);
+    applySlot(2, [&](const std::string& p, auto rt) { self->loadTextureNormal(p, rt); });
+    applySlot(3, [&](const std::string& p, auto rt) { self->loadTexturePressed(p, rt); });
+    applySlot(4, [&](const std::string& p, auto rt) { self->loadTextureDisabled(p, rt); });
     return 0;
 }
 
@@ -1555,14 +1574,14 @@ void RegisterAssetLoaderHooks(lua_State* L) {
         wrapMetatableMethods(L, t, kWidgetCommonHooks);
     }
 
-    static constexpr luaL_Reg kImageViewHooks[]  = {{"loadTexture", hookWidgetLoadTex<ax::ui::ImageView, &ax::ui::ImageView::loadTexture>}};
-    static constexpr luaL_Reg kLoadingBarHooks[] = {{"loadTexture", hookWidgetLoadTex<ax::ui::LoadingBar, &ax::ui::LoadingBar::loadTexture>}};
-    static constexpr luaL_Reg kLayoutBgHooks[]   = {{"setBackGroundImage", hookWidgetLoadTex<ax::ui::Layout, &ax::ui::Layout::setBackGroundImage>}};
+    static constexpr luaL_Reg kImageViewHooks[]  = {{"loadTexture", hook_ImageView_loadTexture}};
+    static constexpr luaL_Reg kLoadingBarHooks[] = {{"loadTexture", hook_LoadingBar_loadTexture}};
+    static constexpr luaL_Reg kLayoutBgHooks[]   = {{"setBackGroundImage", hook_Layout_setBackGroundImage}};
     static constexpr luaL_Reg kButtonHooks[]     = {
         {"loadTextures", hook_Button_loadTextures},
-        {"loadTextureNormal", hookWidgetLoadTex<ax::ui::Button, &ax::ui::Button::loadTextureNormal>},
-        {"loadTexturePressed", hookWidgetLoadTex<ax::ui::Button, &ax::ui::Button::loadTexturePressed>},
-        {"loadTextureDisabled", hookWidgetLoadTex<ax::ui::Button, &ax::ui::Button::loadTextureDisabled>},
+        {"loadTextureNormal", hook_Button_loadTextureNormal},
+        {"loadTexturePressed", hook_Button_loadTexturePressed},
+        {"loadTextureDisabled", hook_Button_loadTextureDisabled},
         {"enableTitleStroke", hook_Button_enableTitleStroke},
         {"disableTitleStroke", hook_Button_disableTitleStroke},
     };
