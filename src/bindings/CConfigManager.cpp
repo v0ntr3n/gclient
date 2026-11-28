@@ -1,8 +1,11 @@
 #include "CConfigManager.h"
+#include "common/KestrelBinaryReader.h"
+#include "common/KestrelCrypto.h"
+#include "common/KestrelUtf8.h"
 #include "../diagnostics/CrashAndTelemetry.h"
 #include "../assets/BtDecryptHook.h"
 
-#include <cctype>
+#include <algorithm>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
@@ -10,17 +13,8 @@
 #include <filesystem>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <vector>
-
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <Windows.h>
-#endif
 
 USING_NS_CC;
 namespace fs = std::filesystem;
@@ -34,9 +28,7 @@ struct StmtFinalizeGuard {
     sqlite3_stmt* stmt = nullptr;
     explicit StmtFinalizeGuard(sqlite3_stmt* s) : stmt(s) {}
     ~StmtFinalizeGuard() {
-        if (stmt) {
-            sqlite3_finalize(stmt);
-        }
+        if (stmt) sqlite3_finalize(stmt);
     }
     StmtFinalizeGuard(const StmtFinalizeGuard&) = delete;
     StmtFinalizeGuard& operator=(const StmtFinalizeGuard&) = delete;
@@ -49,7 +41,6 @@ struct StmtExecutionScope {
     StmtExecutionScope(sqlite3* db, sqlite3_stmt* cachedStmt, const std::string& fallbackSql) {
         if (cachedStmt && g_busyStatements.find(cachedStmt) == g_busyStatements.end()) {
             stmt = cachedStmt;
-            ownsTempStmt = false;
             g_busyStatements.insert(stmt);
             sqlite3_reset(stmt);
             sqlite3_clear_bindings(stmt);
@@ -88,60 +79,11 @@ void logConfigSqliteError(const char* fmt, ...) {
 
     CCLog("%s", buf);
     gclient::diagnostics::CrashAndTelemetry::log(
-        gclient::diagnostics::LogLevel::Error,
-        "CConfigManager",
-        "%s",
-        buf);
-}
-
-bool isHexChar(char c) {
-    return (c >= '0' && c <= '9') ||
-           (c >= 'A' && c <= 'F') ||
-           (c >= 'a' && c <= 'f');
-}
-
-unsigned char hexNibble(char c) {
-    if (c >= '0' && c <= '9') return static_cast<unsigned char>(c - '0');
-    if (c >= 'A' && c <= 'F') return static_cast<unsigned char>(c - 'A' + 10);
-    if (c >= 'a' && c <= 'f') return static_cast<unsigned char>(c - 'a' + 10);
-    return 0;
-}
-
-bool isEvenHexRange(const char* src, size_t len) {
-    if (!src || len < 2 || (len % 2) != 0) {
-        return false;
-    }
-    for (size_t i = 0; i < len; ++i) {
-        if (!isHexChar(src[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-std::vector<unsigned char> hexDecode(const char* src, size_t len) {
-    if (!src || len <= 1) return {};
-    const size_t outLen = len / 2;
-    std::vector<unsigned char> out(outLen);
-    for (size_t i = 0; i < outLen; ++i) {
-        out[i] = static_cast<unsigned char>((hexNibble(src[2 * i]) << 4) | hexNibble(src[2 * i + 1]));
-    }
-    return out;
-}
-
-bool hasNonWhitespaceCondition(const std::string& s) {
-    for (char c : s) {
-        if (!std::isspace(static_cast<unsigned char>(c))) {
-            return true;
-        }
-    }
-    return false;
+        gclient::diagnostics::LogLevel::Error, "CConfigManager", "%s", buf);
 }
 
 std::string normalizeDbPath(const std::string& rawPath) {
-    if (rawPath.empty()) {
-        return {};
-    }
+    if (rawPath.empty()) return {};
     std::string out;
     out.reserve(rawPath.size());
 
@@ -155,7 +97,7 @@ std::string normalizeDbPath(const std::string& rawPath) {
 
     bool prevSlash = !out.empty();
     for (size_t i = startIdx; i < rawPath.size(); ++i) {
-        char c = (rawPath[i] == '\\') ? '/' : rawPath[i];
+        const char c = (rawPath[i] == '\\') ? '/' : rawPath[i];
         if (c == '/') {
             if (!prevSlash) {
                 out.push_back('/');
@@ -178,44 +120,33 @@ std::string quoteSqlIdentifier(const std::string& ident) {
     out.reserve(ident.size() + 2);
     out.push_back('"');
     for (char c : ident) {
-        if (c == '"') {
-            out += "\"\"";
-        } else {
-            out.push_back(c);
-        }
+        if (c == '"') out += "\"\"";
+        else out.push_back(c);
     }
     out.push_back('"');
     return out;
 }
 
 bool parseCanonicalInt64(const std::string& s, sqlite3_int64& outVal) {
-    if (s.empty()) {
-        return false;
-    }
+    if (s.empty()) return false;
     if (s == "0") {
         outVal = 0;
         return true;
     }
     size_t idx = 0;
     if (s[0] == '-') {
-        if (s.size() < 2 || s[1] < '1' || s[1] > '9') {
-            return false;
-        }
+        if (s.size() < 2 || s[1] < '1' || s[1] > '9') return false;
         idx = 1;
     } else if (s[0] < '1' || s[0] > '9') {
         return false;
     }
     for (size_t i = idx; i < s.size(); ++i) {
-        if (s[i] < '0' || s[i] > '9') {
-            return false;
-        }
+        if (s[i] < '0' || s[i] > '9') return false;
     }
     errno = 0;
     char* endPtr = nullptr;
     const long long parsed = std::strtoll(s.c_str(), &endPtr, 10);
-    if (errno != 0 || endPtr != s.c_str() + s.size()) {
-        return false;
-    }
+    if (errno != 0 || endPtr != s.c_str() + s.size()) return false;
     outVal = static_cast<sqlite3_int64>(parsed);
     return true;
 }
@@ -225,45 +156,36 @@ bool execPragma(sqlite3* db, const std::string& sql) {
     char* err = nullptr;
     const int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err);
     if (rc != SQLITE_OK) {
-        logConfigSqliteError("CConfigManager PRAGMA failed (%s): %s",
-                             sql.c_str(), err ? err : "");
+        logConfigSqliteError("CConfigManager PRAGMA failed (%s): %s", sql.c_str(), err ? err : "");
         if (err) sqlite3_free(err);
         return false;
     }
     return true;
 }
 
-bool isRegularFileUtf8(const std::string& utf8Path) {
+bool isRegularFileUtf8(std::string_view utf8Path) {
     if (utf8Path.empty()) return false;
     std::error_code ec;
-#ifdef _WIN32
-    const int req = ::MultiByteToWideChar(CP_UTF8, 0, utf8Path.c_str(), -1, nullptr, 0);
-    if (req <= 0) return false;
-    std::wstring wide(static_cast<size_t>(req), L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, utf8Path.c_str(), -1, wide.data(), req);
-    if (!wide.empty() && wide.back() == L'\0') {
-        wide.pop_back();
-    }
-    return fs::is_regular_file(fs::path(wide), ec);
-#else
-    return fs::is_regular_file(fs::path(utf8Path), ec);
-#endif
+    return fs::is_regular_file(gclient::utf8::utf8ToFsPath(utf8Path), ec);
 }
 
 std::string copySqliteColumnBytes(sqlite3_stmt* stmt, int col) {
     if (!stmt) return {};
     const void* rawPtr = sqlite3_column_blob(stmt, col);
     const int byteCount = sqlite3_column_bytes(stmt, col);
-    if (!rawPtr || byteCount <= 0) {
-        return {};
-    }
-    // Re-fetch pointer after sqlite3_column_bytes per SQLite conversion rules,
-    // and copy immediately into an owned local buffer before calling any external hooks.
+    if (!rawPtr || byteCount <= 0) return {};
+    // Re-fetch pointer after sqlite3_column_bytes per SQLite conversion rules.
     const char* safePtr = static_cast<const char*>(sqlite3_column_blob(stmt, col));
-    if (!safePtr) {
-        return {};
-    }
-    return std::string(safePtr, static_cast<size_t>(byteCount));
+    return safePtr ? std::string(safePtr, static_cast<size_t>(byteCount)) : std::string{};
+}
+
+bool tryDecryptCell(std::vector<uint8_t>& buf, std::string& outPlain) {
+    if (buf.empty()) return false;
+    auto decSize = static_cast<unsigned long>(buf.size());
+    if (!bt_decrypt(buf.data(), &decSize)) return false;
+    const size_t safeLen = std::min<size_t>(static_cast<size_t>(decSize), buf.size());
+    outPlain.assign(reinterpret_cast<const char*>(buf.data()), safeLen);
+    return true;
 }
 
 } // namespace
@@ -298,10 +220,7 @@ bool CTable::rebind(sqlite3* db, const std::string& dbPath) {
     finalizeStatements();
     m_db = db;
     m_dbPath = dbPath;
-    if (!m_db) {
-        return false;
-    }
-    return init();
+    return m_db ? init() : false;
 }
 
 std::string CTable::buildReadOnlyUri(const std::string& path) {
@@ -310,7 +229,6 @@ std::string CTable::buildReadOnlyUri(const std::string& path) {
     size_t startIdx = 0;
     if (path.size() >= 2 &&
         ((path[0] == '\\' && path[1] == '\\') || (path[0] == '/' && path[1] == '/'))) {
-        // Windows UNC path \\server\share\... -> file://server/share/...
         uri += "//";
         startIdx = 2;
     } else if (path.size() >= 2 && path[1] == ':') {
@@ -318,21 +236,13 @@ std::string CTable::buildReadOnlyUri(const std::string& path) {
     }
     for (size_t i = startIdx; i < path.size(); ++i) {
         const char c = path[i];
-        if (c == '\\') {
-            uri.push_back('/');
-        } else if (c == '%') {
-            uri += "%25";
-        } else if (c == ' ') {
-            uri += "%20";
-        } else if (c == '?') {
-            uri += "%3F";
-        } else if (c == '#') {
-            uri += "%23";
-        } else if (c == '\'') {
-            uri += "%27";
-        } else {
-            uri.push_back(c);
-        }
+        if (c == '\\')      uri.push_back('/');
+        else if (c == '%')  uri += "%25";
+        else if (c == ' ')  uri += "%20";
+        else if (c == '?')  uri += "%3F";
+        else if (c == '#')  uri += "%23";
+        else if (c == '\'') uri += "%27";
+        else                uri.push_back(c);
     }
     uri += "?mode=ro";
     return uri;
@@ -341,12 +251,9 @@ std::string CTable::buildReadOnlyUri(const std::string& path) {
 bool CTable::init() {
     std::lock_guard<std::recursive_mutex> lock(g_configSqliteMutex);
     finalizeStatements();
-    if (!m_db || m_tableName.empty()) {
-        return false;
-    }
+    if (!m_db || m_tableName.empty()) return false;
 
-    const std::string quotedTable = quoteSqlIdentifier(m_tableName);
-    const std::string sql = "SELECT * FROM main." + quotedTable + " WHERE id = ?1";
+    const std::string sql = "SELECT * FROM main." + quoteSqlIdentifier(m_tableName) + " WHERE id = ?1";
     if (sqlite3_prepare_v2(m_db, sql.c_str(), -1, &m_stmtById, nullptr) != SQLITE_OK) {
         logConfigSqliteError("sqlite3_prepare sql:%s db:%s failed:%s",
                              sql.c_str(), m_dbPath.c_str(), sqlite3_errmsg(m_db));
@@ -364,9 +271,7 @@ CCArray* CTable::getRowById(const std::string& id) {
         "SELECT * FROM main." + quoteSqlIdentifier(m_tableName) + " WHERE id = ?1";
     StmtExecutionScope scope(m_db, m_stmtById, fallbackSql);
     sqlite3_stmt* activeStmt = scope.stmt;
-    if (!activeStmt) {
-        return nullptr;
-    }
+    if (!activeStmt) return nullptr;
 
     if (sqlite3_bind_text(activeStmt, 1, id.c_str(), static_cast<int>(id.size()), SQLITE_TRANSIENT) != SQLITE_OK) {
         logConfigSqliteError("sqlite3_bind_text table:%s id:%s failed:%s",
@@ -399,8 +304,7 @@ CCArray* CTable::getRowById(const std::string& id) {
         return nullptr;
     }
 
-    // Copy ALL column blobs out of SQLite's active row page buffer into local std::string
-    // instances FIRST before invoking external CCFileUtils::doDecrypt or Cocos allocators!
+    // Copy all column blobs out of SQLite's active row page buffer before invoking bt_decrypt.
     const int colCount = sqlite3_data_count(activeStmt);
     std::vector<std::string> copiedCols(static_cast<size_t>((std::max)(0, colCount)));
     for (int col = 0; col < colCount; ++col) {
@@ -408,9 +312,7 @@ CCArray* CTable::getRowById(const std::string& id) {
     }
 
     CCArray* arr = CCArray::create();
-    if (!arr) {
-        return nullptr;
-    }
+    if (!arr) return nullptr;
 
     CCFileUtils* fu = ax::FileUtils::getInstance();
     for (int col = 0; col < colCount; ++col) {
@@ -423,35 +325,23 @@ CCArray* CTable::getRowById(const std::string& id) {
         if (col == colCount - 1 && fu != nullptr) {
             size_t trimmedLen = rawCol.size();
             while (trimmedLen > 0 &&
-                   (rawCol[trimmedLen - 1] == '\r' ||
-                    rawCol[trimmedLen - 1] == '\n' ||
-                    rawCol[trimmedLen - 1] == ' '  ||
-                    rawCol[trimmedLen - 1] == '\t')) {
+                   (rawCol[trimmedLen - 1] == '\r' || rawCol[trimmedLen - 1] == '\n' ||
+                    rawCol[trimmedLen - 1] == ' '  || rawCol[trimmedLen - 1] == '\t')) {
                 --trimmedLen;
             }
-            if (isEvenHexRange(rawCol.data(), trimmedLen)) {
-                std::vector<unsigned char> decoded = hexDecode(rawCol.data(), trimmedLen);
-                unsigned long decSize = static_cast<unsigned long>(decoded.size());
-                if (!decoded.empty() && bt_decrypt(decoded.data(), &decSize)) {
-                    const size_t safeLen = (decSize <= decoded.size())
-                        ? static_cast<size_t>(decSize)
-                        : decoded.size();
-                    std::string plain(reinterpret_cast<const char*>(decoded.data()), safeLen);
-                    arr->addObject(CCString::create(plain));
-                    continue;
-                }
-            } else if (rawCol.size() > 8 &&
-                       static_cast<unsigned char>(rawCol[0]) == 0xFE &&
-                       static_cast<unsigned char>(rawCol[1]) == 0xFE &&
-                       static_cast<unsigned char>(rawCol[2]) == 0xFE &&
-                       static_cast<unsigned char>(rawCol[3]) == 0xFE) {
-                std::vector<unsigned char> workBuf(rawCol.begin(), rawCol.end());
-                unsigned long decSize = static_cast<unsigned long>(workBuf.size());
-                if (bt_decrypt(workBuf.data(), &decSize)) {
-                    const size_t safeLen = (decSize <= workBuf.size())
-                        ? static_cast<size_t>(decSize)
-                        : workBuf.size();
-                    std::string plain(reinterpret_cast<const char*>(workBuf.data()), safeLen);
+            std::vector<uint8_t> workBuf;
+            std::string plain;
+            if (trimmedLen >= 2 &&
+                gclient::crypto::hexDecode(std::string_view(rawCol.data(), trimmedLen), workBuf) &&
+                tryDecryptCell(workBuf, plain)) {
+                arr->addObject(CCString::create(plain));
+                continue;
+            }
+            if (rawCol.size() > 8 &&
+                gclient::common::readLE<uint32_t>(reinterpret_cast<const uint8_t*>(rawCol.data())) ==
+                    gclient::assets::kBtDecryptMagic) {
+                workBuf.assign(rawCol.begin(), rawCol.end());
+                if (tryDecryptCell(workBuf, plain)) {
                     arr->addObject(CCString::create(plain));
                     continue;
                 }
@@ -478,22 +368,14 @@ CCArray* CTable::getColName() {
     StmtFinalizeGuard stmtGuard(stmt);
 
     const int stepRc = sqlite3_step(stmt);
-    if (stepRc == SQLITE_ROW) {
-        const int colCount = sqlite3_data_count(stmt);
-        for (int i = 0; i < colCount; ++i) {
-            const char* name = sqlite3_column_name(stmt, i);
-            arr->addObject(CCString::create(name ? name : ""));
-        }
-    } else {
-        if (stepRc != SQLITE_DONE) {
-            logConfigSqliteError("sqlite3_step getColName sql:%s rc:%d err:%s",
-                                 sql.c_str(), stepRc, sqlite3_errmsg(m_db));
-        }
-        const int colCount = sqlite3_column_count(stmt);
-        for (int i = 0; i < colCount; ++i) {
-            const char* name = sqlite3_column_name(stmt, i);
-            arr->addObject(CCString::create(name ? name : ""));
-        }
+    if (stepRc != SQLITE_ROW && stepRc != SQLITE_DONE) {
+        logConfigSqliteError("sqlite3_step getColName sql:%s rc:%d err:%s",
+                             sql.c_str(), stepRc, sqlite3_errmsg(m_db));
+    }
+    const int colCount = (stepRc == SQLITE_ROW) ? sqlite3_data_count(stmt) : sqlite3_column_count(stmt);
+    for (int i = 0; i < colCount; ++i) {
+        const char* name = sqlite3_column_name(stmt, i);
+        arr->addObject(CCString::create(name ? name : ""));
     }
     return arr;
 }
@@ -501,7 +383,7 @@ CCArray* CTable::getColName() {
 CCArray* CTable::getIdsByConditionStr(const std::string& condition) {
     std::lock_guard<std::recursive_mutex> lock(g_configSqliteMutex);
     CCArray* arr = CCArray::create();
-    if (!arr || !m_db || m_tableName.empty() || !hasNonWhitespaceCondition(condition)) {
+    if (!arr || !m_db || m_tableName.empty() || gclient::common::trimAscii(condition).empty()) {
         return arr;
     }
 
@@ -519,8 +401,7 @@ CCArray* CTable::getIdsByConditionStr(const std::string& condition) {
     while ((stepRc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const int colCount = sqlite3_data_count(stmt);
         for (int i = 0; i < colCount; ++i) {
-            const std::string colStr = copySqliteColumnBytes(stmt, i);
-            arr->addObject(CCString::create(colStr));
+            arr->addObject(CCString::create(copySqliteColumnBytes(stmt, i)));
         }
     }
     if (stepRc != SQLITE_DONE) {
@@ -546,9 +427,7 @@ CConfigurationManager* CConfigurationManager::sharedConfigurationManager(bool re
         }
         return s_configMgr;
     }
-    if (reloadFlag) {
-        s_configMgr->reload();
-    }
+    if (reloadFlag) s_configMgr->reload();
     return s_configMgr;
 }
 
@@ -567,28 +446,24 @@ CConfigurationManager::~CConfigurationManager() {
     closeAllDbs();
 }
 
-bool CConfigurationManager::init() {
-    return true;
-}
+bool CConfigurationManager::init() { return true; }
 
 void CConfigurationManager::closeAllDbs() {
     std::lock_guard<std::recursive_mutex> lock(g_configSqliteMutex);
     for (CTable* tbl : m_ownedTables) {
-        if (tbl) {
-            tbl->finalizeStatements();
-        }
+        if (tbl) tbl->finalizeStatements();
     }
-    for (auto& kv : m_dbs) {
-        if (kv.second) {
-            while (sqlite3_stmt* leftover = sqlite3_next_stmt(kv.second, nullptr)) {
+    for (auto& [path, db] : m_dbs) {
+        if (db) {
+            while (sqlite3_stmt* leftover = sqlite3_next_stmt(db, nullptr)) {
                 g_busyStatements.erase(leftover);
                 sqlite3_finalize(leftover);
             }
-            const int rc = sqlite3_close(kv.second);
+            const int rc = sqlite3_close(db);
             if (rc != SQLITE_OK) {
                 logConfigSqliteError("sqlite3_close busy for '%s' (rc=%d), falling back to sqlite3_close_v2",
-                                     kv.first.c_str(), rc);
-                sqlite3_close_v2(kv.second);
+                                     path.c_str(), rc);
+                sqlite3_close_v2(db);
             }
         }
     }
@@ -597,26 +472,17 @@ void CConfigurationManager::closeAllDbs() {
 
 bool CConfigurationManager::reload() {
     std::lock_guard<std::recursive_mutex> lock(g_configSqliteMutex);
-    for (CTable* tbl : m_ownedTables) {
-        if (tbl) {
-            tbl->finalizeStatements();
-        }
-    }
     closeAllDbs();
     m_tables.clear();
 
     bool allOk = true;
     for (CTable* tbl : m_ownedTables) {
         if (!tbl) continue;
-        std::string refreshedPath;
-        if (!tbl->dbFile().empty()) {
-            refreshedPath = normalizeDbPath(getDbFile(tbl->dbFile()));
-        }
-        if (refreshedPath.empty()) {
-            refreshedPath = tbl->dbPath();
-        }
-        sqlite3* db = openOrGetDb(refreshedPath);
-        if (!tbl->rebind(db, refreshedPath)) {
+        std::string refreshedPath = tbl->dbFile().empty()
+            ? std::string{}
+            : normalizeDbPath(getDbFile(tbl->dbFile()));
+        if (refreshedPath.empty()) refreshedPath = tbl->dbPath();
+        if (!tbl->rebind(openOrGetDb(refreshedPath), refreshedPath)) {
             allOk = false;
         }
         m_tables[refreshedPath + ":" + tbl->tableName()] = tbl;
@@ -625,24 +491,17 @@ bool CConfigurationManager::reload() {
 }
 
 sqlite3* CConfigurationManager::openOrGetDb(const std::string& normalizedPath) {
-    if (normalizedPath.empty()) {
-        return nullptr;
-    }
-    auto it = m_dbs.find(normalizedPath);
-    if (it != m_dbs.end() && it->second != nullptr) {
+    if (normalizedPath.empty()) return nullptr;
+    if (auto it = m_dbs.find(normalizedPath); it != m_dbs.end() && it->second != nullptr) {
         return it->second;
     }
 
     sqlite3* db = nullptr;
     const std::string readOnlyUri = CTable::buildReadOnlyUri(normalizedPath);
-    const int flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_URI;
-    if (sqlite3_open_v2(readOnlyUri.c_str(), &db, flags, nullptr) != SQLITE_OK) {
+    if (sqlite3_open_v2(readOnlyUri.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr) != SQLITE_OK) {
         logConfigSqliteError("CConfigManager sqlite3_open_v2 failed for '%s': %s",
-                             normalizedPath.c_str(),
-                             db ? sqlite3_errmsg(db) : "out of memory");
-        if (db) {
-            sqlite3_close(db);
-        }
+                             normalizedPath.c_str(), db ? sqlite3_errmsg(db) : "out of memory");
+        if (db) sqlite3_close(db);
         return nullptr;
     }
 
@@ -664,33 +523,21 @@ sqlite3* CConfigurationManager::openOrGetDb(const std::string& normalizedPath) {
 }
 
 std::string CConfigurationManager::getDbFile(const std::string& dbFile) {
-    if (dbFile.empty()) {
-        return {};
-    }
+    if (dbFile.empty()) return {};
     CCFileUtils* fu = ax::FileUtils::getInstance();
-    if (!fu) {
-        return {};
-    }
+    if (!fu) return {};
 
-    const std::string candidates[] = {
-        dbFile,
-        "database/" + dbFile,
-        "res/database/" + dbFile,
-    };
+    const std::string candidates[] = {dbFile, "database/" + dbFile, "res/database/" + dbFile};
     for (const std::string& cand : candidates) {
         const std::string full = fu->fullPathForFilename(cand);
-        if (!full.empty() && isRegularFileUtf8(full)) {
-            return full;
-        }
+        if (!full.empty() && isRegularFileUtf8(full)) return full;
     }
     return {};
 }
 
 CTable* CConfigurationManager::getTable(const std::string& dbFile, const std::string& tableName) {
     std::lock_guard<std::recursive_mutex> lock(g_configSqliteMutex);
-    if (dbFile.empty() || tableName.empty()) {
-        return nullptr;
-    }
+    if (dbFile.empty() || tableName.empty()) return nullptr;
 
     const std::string rawResolved = getDbFile(dbFile);
     if (rawResolved.empty()) {
@@ -701,17 +548,14 @@ CTable* CConfigurationManager::getTable(const std::string& dbFile, const std::st
 
     const std::string resolvedPath = normalizeDbPath(rawResolved);
     const std::string cacheKey = resolvedPath + ":" + tableName;
-    auto it = m_tables.find(cacheKey);
-    if (it != m_tables.end()) {
+    if (auto it = m_tables.find(cacheKey); it != m_tables.end()) {
         return it->second;
     }
 
     sqlite3* db = openOrGetDb(resolvedPath);
-    if (!db) {
-        return nullptr;
-    }
+    if (!db) return nullptr;
 
-    CTable* table = new CTable(db, resolvedPath, tableName, dbFile);
+    auto* table = new CTable(db, resolvedPath, tableName, dbFile);
     if (!table->init()) {
         delete table;
         return nullptr;

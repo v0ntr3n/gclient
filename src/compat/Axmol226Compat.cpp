@@ -1,5 +1,6 @@
 #include "compat/Axmol226Compat.h"
 #include "assets/BtDecryptHook.h"
+#include "common/KestrelBinaryReader.h"
 #include "diagnostics/CrashAndTelemetry.h"
 
 extern "C" {
@@ -7,97 +8,102 @@ extern "C" {
 #include "lauxlib.h"
 }
 #include "tolua++.h"
+#if __has_include("lua-bindings/manual/tolua_fix.h")
 #include "lua-bindings/manual/tolua_fix.h"
+#elif __has_include("tolua_fix.h")
+#include "tolua_fix.h"
+#endif
+#include "bindings/LuaBindTemplates.h"
 
 #include <algorithm>
-#include <cctype>
-#include <cmath>
 #include <cstdarg>
 #include <cstdio>
-#include <mutex>
+#include <initializer_list>
+#include <span>
 
 namespace ax {
 
-void CCLog(const char* format, ...) {
-    if (!format) return;
-    char buf[4096];
-    va_list args;
-    va_start(args, format);
-    std::vsnprintf(buf, sizeof(buf), format, args);
-    va_end(args);
-    gclient::diagnostics::CrashAndTelemetry::log(
-        gclient::diagnostics::LogLevel::Info, "CCLog", "%s", buf);
-}
-
-CCString* CCString::createWithFormat(const char* fmt, ...) {
-    if (!fmt) return create("");
-    char buf[4096];
-    va_list args;
-    va_start(args, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    return create(buf);
-}
-
 namespace {
+
+std::string formatVaList(const char* fmt, va_list args) {
+    char buf[4096];
+    std::vsnprintf(buf, sizeof(buf), fmt, args);
+    return std::string(buf);
+}
 
 ax::Object* valueToCompatObject(const ax::Value& v) {
     switch (v.getType()) {
         case ax::Value::Type::STRING:
-            return CCString::create(v.asString());
-        case ax::Value::Type::INT_I32:
-            return CCString::create(std::to_string(v.asInt()));
-        case ax::Value::Type::INT_UI32:
-            return CCString::create(std::to_string(v.asUnsignedInt()));
-        case ax::Value::Type::INT_I64:
-            return CCString::create(std::to_string(v.asInt64()));
-        case ax::Value::Type::INT_UI64:
-            return CCString::create(std::to_string(v.asUint64()));
         case ax::Value::Type::FLOAT:
-        case ax::Value::Type::DOUBLE:
-            return CCString::create(v.asString());
-        case ax::Value::Type::BOOLEAN:
-            return CCString::create(v.asBool() ? "true" : "false");
+        case ax::Value::Type::DOUBLE:   return CCString::create(v.asString());
+        case ax::Value::Type::INT_I32:  return CCString::create(std::to_string(v.asInt()));
+        case ax::Value::Type::INT_UI32: return CCString::create(std::to_string(v.asUnsignedInt()));
+        case ax::Value::Type::INT_I64:  return CCString::create(std::to_string(v.asInt64()));
+        case ax::Value::Type::INT_UI64: return CCString::create(std::to_string(v.asUint64()));
+        case ax::Value::Type::BOOLEAN:  return CCString::create(v.asBool() ? "true" : "false");
         case ax::Value::Type::VECTOR: {
             auto* arr = CCArray::create();
             for (const auto& elem : v.asValueVector()) {
-                if (auto* child = valueToCompatObject(elem)) {
-                    arr->addObject(child);
-                }
+                if (auto* child = valueToCompatObject(elem)) arr->addObject(child);
             }
             return arr;
         }
         case ax::Value::Type::MAP: {
             auto* dict = CCDictionary::create();
-            for (const auto& kv : v.asValueMap()) {
-                if (auto* child = valueToCompatObject(kv.second)) {
-                    dict->setObject(child, kv.first);
-                }
+            for (const auto& [k, val] : v.asValueMap()) {
+                if (auto* child = valueToCompatObject(val)) dict->setObject(child, k);
             }
             return dict;
         }
-        default:
-            return CCString::create("");
+        default: return CCString::create("");
     }
+}
+
+void resetWidgetHighlightRecursive(ax::Node* node) {
+    if (!node) return;
+    if (auto* widget = dynamic_cast<ax::ui::Widget*>(node)) widget->setHighlighted(false);
+    for (auto* child : node->getChildren()) resetWidgetHighlightRecursive(child);
+}
+
+template <typename DirectPred, typename SeekFn>
+ax::ui::Widget* seekInContainer(ax::Node* container, DirectPred&& pred, SeekFn&& seekFn) {
+    for (auto* child : container->getChildren()) {
+        if (auto* w = dynamic_cast<ax::ui::Widget*>(child)) {
+            if (pred(w)) return w;
+            if (auto* found = seekFn(w)) return found;
+        }
+    }
+    return nullptr;
 }
 
 } // namespace
 
+void CCLog(const char* format, ...) {
+    if (!format) return;
+    va_list args;
+    va_start(args, format);
+    const std::string msg = formatVaList(format, args);
+    va_end(args);
+    gclient::diagnostics::CrashAndTelemetry::log(
+        gclient::diagnostics::LogLevel::Info, "CCLog", "%s", msg.c_str());
+}
+
+CCString* CCString::createWithFormat(const char* fmt, ...) {
+    if (!fmt) return create("");
+    va_list args;
+    va_start(args, fmt);
+    const std::string msg = formatVaList(fmt, args);
+    va_end(args);
+    return create(msg);
+}
+
 CCDictionary* CCDictionary::createWithContentsOfFile(const char* fileName) {
-    if (!fileName || !*fileName) {
-        return create();
-    }
-    const std::string resolved = gclient::compat::ResolveConvertedAssetPath(fileName);
+    if (!fileName || !*fileName) return create();
     auto* fu = ax::FileUtils::getInstance();
-    if (!fu) {
-        return create();
-    }
-    ax::ValueMap vm = fu->getValueMapFromFile(resolved);
+    if (!fu) return create();
     auto* dict = create();
-    for (const auto& kv : vm) {
-        if (auto* obj = valueToCompatObject(kv.second)) {
-            dict->setObject(obj, kv.first);
-        }
+    for (const auto& [k, v] : fu->getValueMapFromFile(gclient::compat::ResolveConvertedAssetPath(fileName))) {
+        if (auto* obj = valueToCompatObject(v)) dict->setObject(obj, k);
     }
     return dict;
 }
@@ -105,11 +111,10 @@ CCDictionary* CCDictionary::createWithContentsOfFile(const char* fileName) {
 namespace ui {
 
 bool TouchGroup::init() {
-    if (!ax::Layer::init()) {
-        return false;
-    }
-    m_rootWidget = ax::Node::create();
+    if (!ax::Layer::init()) return false;
+    m_rootWidget = ax::ui::Widget::create();
     if (m_rootWidget) {
+        m_rootWidget->setTouchEnabled(false);
         addChild(m_rootWidget);
     }
     return true;
@@ -117,64 +122,48 @@ bool TouchGroup::init() {
 
 void TouchGroup::addWidget(ax::ui::Widget* widget) {
     if (!widget) return;
-    if (m_rootWidget) {
-        m_rootWidget->addChild(widget);
-    } else {
-        addChild(widget);
-    }
+    if (m_rootWidget) m_rootWidget->addChild(widget);
+    else addChild(widget);
 }
 
 void TouchGroup::removeWidget(ax::ui::Widget* widget) {
     if (!widget) return;
-    if (m_rootWidget && widget->getParent() == m_rootWidget) {
-        m_rootWidget->removeChild(widget, true);
-    } else if (widget->getParent() == this) {
-        removeChild(widget, true);
-    }
+    if (m_rootWidget && widget->getParent() == m_rootWidget) m_rootWidget->removeChild(widget, true);
+    else if (widget->getParent() == this) removeChild(widget, true);
 }
 
 ax::ui::Widget* TouchGroup::getWidgetByTag(int tag) {
-    ax::Node* container = m_rootWidget ? m_rootWidget : static_cast<ax::Node*>(this);
-    for (auto* child : container->getChildren()) {
-        if (auto* w = dynamic_cast<ax::ui::Widget*>(child)) {
-            if (w->getTag() == tag) return w;
-            if (auto* found = ax::ui::Helper::seekWidgetByTag(w, tag)) {
-                return found;
-            }
-        }
-    }
-    return nullptr;
+    ax::Node* root = m_rootWidget ? static_cast<ax::Node*>(m_rootWidget) : static_cast<ax::Node*>(this);
+    return seekInContainer(
+        root,
+        [tag](ax::ui::Widget* w) { return w->getTag() == tag; },
+        [tag](ax::ui::Widget* w) { return ax::ui::Helper::seekWidgetByTag(w, tag); });
 }
 
 ax::ui::Widget* TouchGroup::getWidgetByName(const char* name) {
     if (!name || !*name) return nullptr;
-    ax::Node* container = m_rootWidget ? m_rootWidget : static_cast<ax::Node*>(this);
-    for (auto* child : container->getChildren()) {
-        if (auto* w = dynamic_cast<ax::ui::Widget*>(child)) {
-            if (w->getName() == name) return w;
-            if (auto* found = ax::ui::Helper::seekWidgetByName(w, name)) {
-                return found;
-            }
-        }
-    }
-    return nullptr;
+    ax::Node* root = m_rootWidget ? static_cast<ax::Node*>(m_rootWidget) : static_cast<ax::Node*>(this);
+    return seekInContainer(
+        root,
+        [name](ax::ui::Widget* w) { return w->getName() == name; },
+        [name](ax::ui::Widget* w) { return ax::ui::Helper::seekWidgetByName(w, name); });
 }
 
 void TouchGroup::clear() {
-    if (m_rootWidget) {
-        m_rootWidget->removeAllChildrenWithCleanup(true);
-    } else {
-        removeAllChildrenWithCleanup(true);
+    if (m_rootWidget) m_rootWidget->removeAllChildrenWithCleanup(true);
+    else removeAllChildrenWithCleanup(true);
+}
+
+void TouchGroup::clearTouchStat() {
+    if (m_rootWidget) resetWidgetHighlightRecursive(m_rootWidget);
+    for (auto* child : getChildren()) {
+        if (child != m_rootWidget) resetWidgetHighlightRecursive(child);
     }
 }
 
 } // namespace ui
-
 } // namespace ax
 
-// ============================================================================
-// CocosDenshion::SimpleAudioEngine Implementation (wrapping ax::AudioEngine)
-// ============================================================================
 namespace CocosDenshion {
 
 namespace {
@@ -182,9 +171,7 @@ SimpleAudioEngine* g_sharedSimpleAudio = nullptr;
 } // namespace
 
 SimpleAudioEngine* SimpleAudioEngine::getInstance() {
-    if (!g_sharedSimpleAudio) {
-        g_sharedSimpleAudio = new SimpleAudioEngine();
-    }
+    if (!g_sharedSimpleAudio) g_sharedSimpleAudio = new SimpleAudioEngine();
     return g_sharedSimpleAudio;
 }
 
@@ -202,11 +189,9 @@ std::string SimpleAudioEngine::resolveAudioPath(const char* rawPath) const {
     if (!rawPath || !*rawPath) return {};
     std::string norm = gclient::assets::NormalizeAssetPath(rawPath);
     auto* fu = ax::FileUtils::getInstance();
-    if (!fu) return norm;
-    if (fu->isFileExist(norm)) return norm;
+    if (!fu || fu->isFileExist(norm)) return norm;
 
-    const char* exts[] = {".mp3", ".ogg", ".wav"};
-    for (const char* ext : exts) {
+    for (const char* ext : {".mp3", ".ogg", ".wav"}) {
         std::string cand = gclient::assets::ReplaceFileExtension(norm, ext);
         if (fu->isFileExist(cand)) return cand;
     }
@@ -214,10 +199,7 @@ std::string SimpleAudioEngine::resolveAudioPath(const char* rawPath) const {
 }
 
 void SimpleAudioEngine::preloadBackgroundMusic(const char* filePath) {
-    const std::string p = resolveAudioPath(filePath);
-    if (!p.empty()) {
-        ax::AudioEngine::preload(p);
-    }
+    if (const std::string p = resolveAudioPath(filePath); !p.empty()) ax::AudioEngine::preload(p);
 }
 
 void SimpleAudioEngine::playBackgroundMusic(const char* filePath, bool loop) {
@@ -237,41 +219,30 @@ void SimpleAudioEngine::stopBackgroundMusic(bool releaseData) {
         ax::AudioEngine::stop(m_bgAudioId);
         m_bgAudioId = ax::AudioEngine::INVALID_AUDIO_ID;
     }
-    if (releaseData && !m_bgFilePath.empty()) {
-        ax::AudioEngine::uncache(m_bgFilePath);
-    }
+    if (releaseData && !m_bgFilePath.empty()) ax::AudioEngine::uncache(m_bgFilePath);
 }
 
 void SimpleAudioEngine::pauseBackgroundMusic() {
-    if (m_bgAudioId != ax::AudioEngine::INVALID_AUDIO_ID) {
-        ax::AudioEngine::pause(m_bgAudioId);
-    }
+    if (m_bgAudioId != ax::AudioEngine::INVALID_AUDIO_ID) ax::AudioEngine::pause(m_bgAudioId);
 }
 
 void SimpleAudioEngine::resumeBackgroundMusic() {
-    if (m_bgAudioId != ax::AudioEngine::INVALID_AUDIO_ID) {
-        ax::AudioEngine::resume(m_bgAudioId);
-    }
+    if (m_bgAudioId != ax::AudioEngine::INVALID_AUDIO_ID) ax::AudioEngine::resume(m_bgAudioId);
 }
 
 void SimpleAudioEngine::rewindBackgroundMusic() {
-    if (m_bgAudioId != ax::AudioEngine::INVALID_AUDIO_ID) {
-        ax::AudioEngine::setCurrentTime(m_bgAudioId, 0.0f);
-    } else if (!m_bgFilePath.empty()) {
-        playBackgroundMusic(m_bgFilePath.c_str(), m_bgLoop);
-    }
+    if (m_bgAudioId != ax::AudioEngine::INVALID_AUDIO_ID) ax::AudioEngine::setCurrentTime(m_bgAudioId, 0.0f);
+    else if (!m_bgFilePath.empty()) playBackgroundMusic(m_bgFilePath.c_str(), m_bgLoop);
 }
 
 bool SimpleAudioEngine::isBackgroundMusicPlaying() {
-    if (m_bgAudioId == ax::AudioEngine::INVALID_AUDIO_ID) return false;
-    return ax::AudioEngine::getState(m_bgAudioId) == ax::AudioEngine::AudioState::PLAYING;
+    return m_bgAudioId != ax::AudioEngine::INVALID_AUDIO_ID &&
+           ax::AudioEngine::getState(m_bgAudioId) == ax::AudioEngine::AudioState::PLAYING;
 }
 
 void SimpleAudioEngine::setBackgroundMusicVolume(float volume) {
     m_musicVolume = std::clamp(volume, 0.0f, 1.0f);
-    if (m_bgAudioId != ax::AudioEngine::INVALID_AUDIO_ID) {
-        ax::AudioEngine::setVolume(m_bgAudioId, m_musicVolume);
-    }
+    if (m_bgAudioId != ax::AudioEngine::INVALID_AUDIO_ID) ax::AudioEngine::setVolume(m_bgAudioId, m_musicVolume);
 }
 
 void SimpleAudioEngine::setEffectsVolume(float volume) {
@@ -287,484 +258,254 @@ unsigned int SimpleAudioEngine::playEffect(const char* filePath, bool loop,
                                            float /*pitch*/, float /*pan*/, float gain) {
     const std::string p = resolveAudioPath(filePath);
     if (p.empty()) return static_cast<unsigned int>(ax::AudioEngine::INVALID_AUDIO_ID);
-    const float vol = std::clamp(m_effectsVolume * gain, 0.0f, 1.0f);
-    const int id = ax::AudioEngine::play2d(p, loop, vol);
+    const int id = ax::AudioEngine::play2d(p, loop, std::clamp(m_effectsVolume * gain, 0.0f, 1.0f));
     if (id != ax::AudioEngine::INVALID_AUDIO_ID) {
-        m_activeEffectIds.erase(
-            std::remove_if(m_activeEffectIds.begin(), m_activeEffectIds.end(), [](int eid) {
-                return ax::AudioEngine::getState(eid) == ax::AudioEngine::AudioState::ERROR;
-            }),
-            m_activeEffectIds.end());
+        std::erase_if(m_activeEffectIds, [](int eid) {
+            return ax::AudioEngine::getState(eid) == ax::AudioEngine::AudioState::ERROR;
+        });
         m_activeEffectIds.push_back(id);
     }
     return static_cast<unsigned int>(id);
 }
 
-void SimpleAudioEngine::pauseEffect(unsigned int soundId) {
-    ax::AudioEngine::pause(static_cast<int>(soundId));
-}
-
-void SimpleAudioEngine::pauseAllEffects() {
-    for (int id : m_activeEffectIds) {
-        ax::AudioEngine::pause(id);
-    }
-}
-
-void SimpleAudioEngine::resumeEffect(unsigned int soundId) {
-    ax::AudioEngine::resume(static_cast<int>(soundId));
-}
-
-void SimpleAudioEngine::resumeAllEffects() {
-    for (int id : m_activeEffectIds) {
-        ax::AudioEngine::resume(id);
-    }
-}
+void SimpleAudioEngine::pauseEffect(unsigned int soundId) { ax::AudioEngine::pause(static_cast<int>(soundId)); }
+void SimpleAudioEngine::pauseAllEffects() { for (int id : m_activeEffectIds) ax::AudioEngine::pause(id); }
+void SimpleAudioEngine::resumeEffect(unsigned int soundId) { ax::AudioEngine::resume(static_cast<int>(soundId)); }
+void SimpleAudioEngine::resumeAllEffects() { for (int id : m_activeEffectIds) ax::AudioEngine::resume(id); }
 
 void SimpleAudioEngine::stopEffect(unsigned int soundId) {
     const int id = static_cast<int>(soundId);
     ax::AudioEngine::stop(id);
-    m_activeEffectIds.erase(std::remove(m_activeEffectIds.begin(), m_activeEffectIds.end(), id),
-                            m_activeEffectIds.end());
+    std::erase(m_activeEffectIds, id);
 }
 
 void SimpleAudioEngine::stopAllEffects() {
-    for (int id : m_activeEffectIds) {
-        ax::AudioEngine::stop(id);
-    }
+    for (int id : m_activeEffectIds) ax::AudioEngine::stop(id);
     m_activeEffectIds.clear();
 }
 
-void SimpleAudioEngine::preloadEffect(const char* filePath) {
-    const std::string p = resolveAudioPath(filePath);
-    if (!p.empty()) {
-        ax::AudioEngine::preload(p);
-    }
-}
+void SimpleAudioEngine::preloadEffect(const char* filePath) { preloadBackgroundMusic(filePath); }
 
 void SimpleAudioEngine::unloadEffect(const char* filePath) {
-    const std::string p = resolveAudioPath(filePath);
-    if (!p.empty()) {
-        ax::AudioEngine::uncache(p);
-    }
+    if (const std::string p = resolveAudioPath(filePath); !p.empty()) ax::AudioEngine::uncache(p);
 }
 
 } // namespace CocosDenshion
 
-// ============================================================================
-// Asset Path Resolver & tolua++ Bindings for Legacy Container/UI/Audio Types
-// ============================================================================
 namespace gclient::compat {
 
 namespace {
 
-bool endsWithIgnoreCase(std::string_view s, std::string_view suffix) {
-    if (s.size() < suffix.size()) return false;
-    const size_t off = s.size() - suffix.size();
-    for (size_t i = 0; i < suffix.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(s[off + i])) !=
-            std::tolower(static_cast<unsigned char>(suffix[i]))) {
-            return false;
-        }
-    }
-    return true;
+using gclient::lua_bind::FixedName;
+using gclient::lua_bind::bindAxMethod;
+using gclient::lua_bind::bindAxMethodObjRet;
+using gclient::lua_bind::bindFlexSingleton;
+using gclient::lua_bind::firstArgIndex;
+using gclient::lua_bind::getAxObject;
+using gclient::lua_bind::optBool;
+using gclient::lua_bind::optCString;
+using gclient::lua_bind::optFloat;
+using gclient::lua_bind::optInt;
+using gclient::lua_bind::pushAxObject;
+using gclient::lua_bind::registerMethodTable;
+using SAE = CocosDenshion::SimpleAudioEngine;
+
+const char* inferAxObjectToluaType(ax::Object* obj) {
+    if (!obj) return "ax.Object";
+#define GCLIENT_TRY_TAG(CppType, TagStr) if (dynamic_cast<CppType*>(obj)) return TagStr
+    GCLIENT_TRY_TAG(ax::CCString, "CCString");
+    GCLIENT_TRY_TAG(ax::CCInteger, "CCInteger");
+    GCLIENT_TRY_TAG(ax::CCArray, "CCArray");
+    GCLIENT_TRY_TAG(ax::CCDictionary, "CCDictionary");
+    GCLIENT_TRY_TAG(ax::ui::TouchGroup, "TouchGroup");
+    GCLIENT_TRY_TAG(ax::ui::Button, "axui.Button");
+    GCLIENT_TRY_TAG(ax::ui::ImageView, "axui.ImageView");
+    GCLIENT_TRY_TAG(ax::ui::Text, "axui.Text");
+    GCLIENT_TRY_TAG(ax::ui::TextAtlas, "axui.TextAtlas");
+    GCLIENT_TRY_TAG(ax::ui::TextBMFont, "axui.TextBMFont");
+    GCLIENT_TRY_TAG(ax::ui::LoadingBar, "axui.LoadingBar");
+    GCLIENT_TRY_TAG(ax::ui::CheckBox, "axui.CheckBox");
+    GCLIENT_TRY_TAG(ax::ui::Slider, "axui.Slider");
+    GCLIENT_TRY_TAG(ax::ui::TextField, "axui.TextField");
+    GCLIENT_TRY_TAG(ax::ui::ListView, "axui.ListView");
+    GCLIENT_TRY_TAG(ax::ui::PageView, "axui.PageView");
+    GCLIENT_TRY_TAG(ax::ui::ScrollView, "axui.ScrollView");
+    GCLIENT_TRY_TAG(ax::ui::Layout, "axui.Layout");
+    GCLIENT_TRY_TAG(ax::ui::Widget, "axui.Widget");
+    GCLIENT_TRY_TAG(cocostudio::Armature, "ccs.Armature");
+    GCLIENT_TRY_TAG(ax::Sprite, "ax.Sprite");
+    GCLIENT_TRY_TAG(ax::Layer, "ax.Layer");
+    GCLIENT_TRY_TAG(ax::Node, "ax.Node");
+    GCLIENT_TRY_TAG(ax::FiniteTimeAction, "ax.FiniteTimeAction");
+    GCLIENT_TRY_TAG(ax::Action, "ax.Action");
+#undef GCLIENT_TRY_TAG
+    return "ax.Object";
 }
 
-template <typename T>
-void pushAxObject(lua_State* L, T* obj, const char* typeName) {
-    if (!obj) {
-        lua_pushnil(L);
-        return;
-    }
-    auto* base = static_cast<ax::Object*>(obj);
-    toluafix_pushusertype_object(L, static_cast<int>(base->_ID), &base->_luaID,
-                                 static_cast<void*>(base), typeName);
-}
-
-template <typename T>
-T* getAxObject(lua_State* L, int idx) {
-    if (!L || lua_type(L, idx) != LUA_TUSERDATA) return nullptr;
-    auto* raw = static_cast<ax::Object*>(tolua_tousertype(L, idx, nullptr));
-    return raw ? dynamic_cast<T*>(raw) : nullptr;
-}
-
-// --- CCString Lua methods ---
-int lua_CCString_create(lua_State* L) {
-    const char* s = lua_tostring(L, 2);
-    pushAxObject(L, ax::CCString::create(s ? s : ""), "CCString");
+int pushTypedAxObject(lua_State* L, ax::Object* obj) {
+    pushAxObject(L, obj, inferAxObjectToluaType(obj));
     return 1;
 }
+
+template <typename T, FixedName Tag>
+int lua_createDefault(lua_State* L) {
+    pushAxObject(L, T::create(), Tag.c_str());
+    return 1;
+}
+
+int lua_CCString_create(lua_State* L) {
+    pushAxObject(L, ax::CCString::create(optCString(L, 2, "")), "CCString");
+    return 1;
+}
+
 int lua_CCString_getCString(lua_State* L) {
     auto* self = getAxObject<ax::CCString>(L, 1);
     lua_pushstring(L, self ? self->getCString() : "");
     return 1;
 }
-int lua_CCString_length(lua_State* L) {
-    auto* self = getAxObject<ax::CCString>(L, 1);
-    lua_pushinteger(L, self ? static_cast<lua_Integer>(self->length()) : 0);
-    return 1;
-}
-int lua_CCString_intValue(lua_State* L) {
-    auto* self = getAxObject<ax::CCString>(L, 1);
-    lua_pushinteger(L, self ? self->intValue() : 0);
-    return 1;
-}
-int lua_CCString_floatValue(lua_State* L) {
-    auto* self = getAxObject<ax::CCString>(L, 1);
-    lua_pushnumber(L, self ? static_cast<lua_Number>(self->floatValue()) : 0.0);
-    return 1;
-}
-int lua_CCString_boolValue(lua_State* L) {
-    auto* self = getAxObject<ax::CCString>(L, 1);
-    lua_pushboolean(L, (self && self->boolValue()) ? 1 : 0);
-    return 1;
-}
 
-// --- CCInteger Lua methods ---
 int lua_CCInteger_create(lua_State* L) {
-    const int v = static_cast<int>(lua_tointeger(L, 2));
-    pushAxObject(L, ax::CCInteger::create(v), "CCInteger");
-    return 1;
-}
-int lua_CCInteger_getValue(lua_State* L) {
-    auto* self = getAxObject<ax::CCInteger>(L, 1);
-    lua_pushinteger(L, self ? self->getValue() : 0);
+    pushAxObject(L, ax::CCInteger::create(optInt<int>(L, 2, 0)), "CCInteger");
     return 1;
 }
 
-// Push dynamic runtime type name for elements stored in CCArray/CCDictionary
-const char* inferAxObjectToluaType(ax::Object* obj) {
-    if (!obj) return "ax.Object";
-    if (dynamic_cast<ax::CCString*>(obj)) return "CCString";
-    if (dynamic_cast<ax::CCInteger*>(obj)) return "CCInteger";
-    if (dynamic_cast<ax::CCArray*>(obj)) return "CCArray";
-    if (dynamic_cast<ax::CCDictionary*>(obj)) return "CCDictionary";
-    if (dynamic_cast<ax::ui::TouchGroup*>(obj)) return "TouchGroup";
-    if (dynamic_cast<ax::ui::Button*>(obj)) return "axui.Button";
-    if (dynamic_cast<ax::ui::ImageView*>(obj)) return "axui.ImageView";
-    if (dynamic_cast<ax::ui::Text*>(obj)) return "axui.Text";
-    if (dynamic_cast<ax::ui::TextAtlas*>(obj)) return "axui.TextAtlas";
-    if (dynamic_cast<ax::ui::TextBMFont*>(obj)) return "axui.TextBMFont";
-    if (dynamic_cast<ax::ui::LoadingBar*>(obj)) return "axui.LoadingBar";
-    if (dynamic_cast<ax::ui::CheckBox*>(obj)) return "axui.CheckBox";
-    if (dynamic_cast<ax::ui::Slider*>(obj)) return "axui.Slider";
-    if (dynamic_cast<ax::ui::TextField*>(obj)) return "axui.TextField";
-    if (dynamic_cast<ax::ui::ListView*>(obj)) return "axui.ListView";
-    if (dynamic_cast<ax::ui::PageView*>(obj)) return "axui.PageView";
-    if (dynamic_cast<ax::ui::ScrollView*>(obj)) return "axui.ScrollView";
-    if (dynamic_cast<ax::ui::Layout*>(obj)) return "axui.Layout";
-    if (dynamic_cast<ax::ui::Widget*>(obj)) return "axui.Widget";
-    if (dynamic_cast<cocostudio::Armature*>(obj)) return "ccs.Armature";
-    if (dynamic_cast<ax::Sprite*>(obj)) return "ax.Sprite";
-    if (dynamic_cast<ax::Layer*>(obj)) return "ax.Layer";
-    if (dynamic_cast<ax::Node*>(obj)) return "ax.Node";
-    if (dynamic_cast<ax::FiniteTimeAction*>(obj)) return "ax.FiniteTimeAction";
-    if (dynamic_cast<ax::Action*>(obj)) return "ax.Action";
-    return "ax.Object";
-}
-
-// --- CCArray Lua methods ---
-int lua_CCArray_create(lua_State* L) {
-    pushAxObject(L, ax::CCArray::create(), "CCArray");
-    return 1;
-}
 int lua_CCArray_createWithCapacity(lua_State* L) {
-    const size_t cap = static_cast<size_t>((std::max)(lua_Integer{0}, lua_tointeger(L, 2)));
+    const auto cap = static_cast<size_t>((std::max)(lua_Integer{0}, optInt<lua_Integer>(L, 2, 0)));
     pushAxObject(L, ax::CCArray::createWithCapacity(cap), "CCArray");
     return 1;
 }
-int lua_CCArray_count(lua_State* L) {
-    auto* self = getAxObject<ax::CCArray>(L, 1);
-    lua_pushinteger(L, self ? static_cast<lua_Integer>(self->count()) : 0);
-    return 1;
-}
+
 int lua_CCArray_objectAtIndex(lua_State* L) {
     auto* self = getAxObject<ax::CCArray>(L, 1);
-    const lua_Integer idx = lua_tointeger(L, 2);
-    if (!self || idx < 0) {
-        lua_pushnil(L);
-        return 1;
-    }
-    ax::Object* elem = self->objectAtIndex(static_cast<size_t>(idx));
-    pushAxObject(L, elem, inferAxObjectToluaType(elem));
-    return 1;
+    const lua_Integer idx = optInt<lua_Integer>(L, 2, -1);
+    if (!self || idx < 0) { lua_pushnil(L); return 1; }
+    return pushTypedAxObject(L, self->objectAtIndex(static_cast<size_t>(idx)));
 }
+
 int lua_CCArray_lastObject(lua_State* L) {
     auto* self = getAxObject<ax::CCArray>(L, 1);
-    ax::Object* elem = self ? self->lastObject() : nullptr;
-    pushAxObject(L, elem, inferAxObjectToluaType(elem));
-    return 1;
+    return pushTypedAxObject(L, self ? self->lastObject() : nullptr);
 }
+
 int lua_CCArray_addObject(lua_State* L) {
     auto* self = getAxObject<ax::CCArray>(L, 1);
-    auto* obj = getAxObject<ax::Object>(L, 2);
-    if (self && obj) {
-        self->addObject(obj);
-    } else if (self && lua_type(L, 2) == LUA_TSTRING) {
-        self->addObject(ax::CCString::create(lua_tostring(L, 2)));
-    }
+    if (!self) return 0;
+    if (auto* obj = getAxObject<ax::Object>(L, 2)) self->addObject(obj);
+    else if (lua_type(L, 2) == LUA_TSTRING) self->addObject(ax::CCString::create(optCString(L, 2, "")));
     return 0;
 }
+
 int lua_CCArray_insertObject(lua_State* L) {
     auto* self = getAxObject<ax::CCArray>(L, 1);
-    auto* obj = getAxObject<ax::Object>(L, 2);
-    const size_t idx = static_cast<size_t>((std::max)(lua_Integer{0}, lua_tointeger(L, 3)));
+    auto* obj  = getAxObject<ax::Object>(L, 2);
+    const auto idx = static_cast<size_t>((std::max)(lua_Integer{0}, optInt<lua_Integer>(L, 3, 0)));
     if (self && obj) self->insertObject(obj, idx);
     return 0;
 }
-int lua_CCArray_removeObject(lua_State* L) {
-    auto* self = getAxObject<ax::CCArray>(L, 1);
-    auto* obj = getAxObject<ax::Object>(L, 2);
-    if (self && obj) self->removeObject(obj);
-    return 0;
-}
+
 int lua_CCArray_removeObjectAtIndex(lua_State* L) {
     auto* self = getAxObject<ax::CCArray>(L, 1);
-    const lua_Integer idx = lua_tointeger(L, 2);
-    if (self && idx >= 0) self->removeObjectAtIndex(static_cast<size_t>(idx));
+    if (const lua_Integer idx = optInt<lua_Integer>(L, 2, -1); self && idx >= 0) {
+        self->removeObjectAtIndex(static_cast<size_t>(idx));
+    }
     return 0;
 }
-int lua_CCArray_removeLastObject(lua_State* L) {
-    auto* self = getAxObject<ax::CCArray>(L, 1);
-    if (self) self->removeLastObject();
-    return 0;
-}
-int lua_CCArray_removeAllObjects(lua_State* L) {
-    auto* self = getAxObject<ax::CCArray>(L, 1);
-    if (self) self->removeAllObjects();
-    return 0;
-}
-int lua_CCArray_containsObject(lua_State* L) {
-    auto* self = getAxObject<ax::CCArray>(L, 1);
-    auto* obj = getAxObject<ax::Object>(L, 2);
-    lua_pushboolean(L, (self && obj && self->containsObject(obj)) ? 1 : 0);
+
+int lua_CCDictionary_createWithContentsOfFile(lua_State* L) {
+    pushAxObject(L, ax::CCDictionary::createWithContentsOfFile(lua_tostring(L, 2)), "CCDictionary");
     return 1;
 }
 
-// --- CCDictionary Lua methods ---
-int lua_CCDictionary_create(lua_State* L) {
-    pushAxObject(L, ax::CCDictionary::create(), "CCDictionary");
-    return 1;
-}
-int lua_CCDictionary_createWithContentsOfFile(lua_State* L) {
-    const char* f = lua_tostring(L, 2);
-    pushAxObject(L, ax::CCDictionary::createWithContentsOfFile(f), "CCDictionary");
-    return 1;
-}
-int lua_CCDictionary_count(lua_State* L) {
-    auto* self = getAxObject<ax::CCDictionary>(L, 1);
-    lua_pushinteger(L, self ? static_cast<lua_Integer>(self->count()) : 0);
-    return 1;
-}
 int lua_CCDictionary_objectForKey(lua_State* L) {
     auto* self = getAxObject<ax::CCDictionary>(L, 1);
-    if (!self) {
-        lua_pushnil(L);
-        return 1;
-    }
-    ax::Object* elem = nullptr;
-    if (lua_type(L, 2) == LUA_TNUMBER) {
-        elem = self->objectForKey(static_cast<intptr_t>(lua_tointeger(L, 2)));
-    } else if (const char* k = lua_tostring(L, 2)) {
-        elem = self->objectForKey(std::string(k));
-    }
-    pushAxObject(L, elem, inferAxObjectToluaType(elem));
-    return 1;
+    if (!self) { lua_pushnil(L); return 1; }
+    ax::Object* elem = (lua_type(L, 2) == LUA_TNUMBER)
+        ? self->objectForKey(static_cast<intptr_t>(lua_tointeger(L, 2)))
+        : (lua_isstring(L, 2) ? self->objectForKey(std::string(optCString(L, 2, ""))) : nullptr);
+    return pushTypedAxObject(L, elem);
 }
+
 int lua_CCDictionary_valueForKey(lua_State* L) {
     auto* self = getAxObject<ax::CCDictionary>(L, 1);
     const char* k = lua_tostring(L, 2);
-    if (self && k) {
-        const ax::CCString* s = self->valueForKey(k);
-        pushAxObject(L, ax::CCString::create(s ? s->getCString() : ""), "CCString");
-        return 1;
-    }
-    pushAxObject(L, ax::CCString::create(""), "CCString");
+    const ax::CCString* s = (self && k) ? self->valueForKey(k) : nullptr;
+    pushAxObject(L, ax::CCString::create(s ? s->getCString() : ""), "CCString");
     return 1;
 }
+
 int lua_CCDictionary_setObject(lua_State* L) {
     auto* self = getAxObject<ax::CCDictionary>(L, 1);
-    auto* obj = getAxObject<ax::Object>(L, 2);
+    auto* obj  = getAxObject<ax::Object>(L, 2);
     if (!self || !obj) return 0;
-    if (lua_type(L, 3) == LUA_TNUMBER) {
-        self->setObject(obj, static_cast<intptr_t>(lua_tointeger(L, 3)));
-    } else if (const char* k = lua_tostring(L, 3)) {
-        self->setObject(obj, std::string(k));
-    }
+    if (lua_type(L, 3) == LUA_TNUMBER) self->setObject(obj, static_cast<intptr_t>(lua_tointeger(L, 3)));
+    else if (const char* k = lua_tostring(L, 3)) self->setObject(obj, std::string(k));
     return 0;
 }
+
 int lua_CCDictionary_removeObjectForKey(lua_State* L) {
     auto* self = getAxObject<ax::CCDictionary>(L, 1);
     if (!self) return 0;
-    if (lua_type(L, 2) == LUA_TNUMBER) {
-        self->removeObjectForKey(static_cast<intptr_t>(lua_tointeger(L, 2)));
-    } else if (const char* k = lua_tostring(L, 2)) {
-        self->removeObjectForKey(std::string(k));
-    }
+    if (lua_type(L, 2) == LUA_TNUMBER) self->removeObjectForKey(static_cast<intptr_t>(lua_tointeger(L, 2)));
+    else if (const char* k = lua_tostring(L, 2)) self->removeObjectForKey(std::string(k));
     return 0;
-}
-int lua_CCDictionary_removeAllObjects(lua_State* L) {
-    auto* self = getAxObject<ax::CCDictionary>(L, 1);
-    if (self) self->removeAllObjects();
-    return 0;
-}
-int lua_CCDictionary_allKeys(lua_State* L) {
-    auto* self = getAxObject<ax::CCDictionary>(L, 1);
-    pushAxObject(L, self ? self->allKeys() : ax::CCArray::create(), "CCArray");
-    return 1;
 }
 
-// --- TouchGroup Lua methods ---
-int lua_TouchGroup_create(lua_State* L) {
-    pushAxObject(L, ax::ui::TouchGroup::create(), "TouchGroup");
-    return 1;
-}
-int lua_TouchGroup_addWidget(lua_State* L) {
-    auto* self = getAxObject<ax::ui::TouchGroup>(L, 1);
-    auto* w = getAxObject<ax::ui::Widget>(L, 2);
-    if (self && w) self->addWidget(w);
-    return 0;
-}
-int lua_TouchGroup_removeWidget(lua_State* L) {
-    auto* self = getAxObject<ax::ui::TouchGroup>(L, 1);
-    auto* w = getAxObject<ax::ui::Widget>(L, 2);
-    if (self && w) self->removeWidget(w);
-    return 0;
-}
 int lua_TouchGroup_getWidgetByTag(lua_State* L) {
     auto* self = getAxObject<ax::ui::TouchGroup>(L, 1);
-    const int tag = static_cast<int>(lua_tointeger(L, 2));
-    ax::ui::Widget* w = self ? self->getWidgetByTag(tag) : nullptr;
-    pushAxObject(L, w, inferAxObjectToluaType(w));
-    return 1;
+    return pushTypedAxObject(L, self ? self->getWidgetByTag(optInt<int>(L, 2, 0)) : nullptr);
 }
+
 int lua_TouchGroup_getWidgetByName(lua_State* L) {
     auto* self = getAxObject<ax::ui::TouchGroup>(L, 1);
     const char* name = lua_tostring(L, 2);
-    ax::ui::Widget* w = (self && name) ? self->getWidgetByName(name) : nullptr;
-    pushAxObject(L, w, inferAxObjectToluaType(w));
-    return 1;
+    return pushTypedAxObject(L, (self && name) ? self->getWidgetByName(name) : nullptr);
 }
-int lua_TouchGroup_clear(lua_State* L) {
+
+int lua_TouchGroup_getRootWidget(lua_State* L) {
     auto* self = getAxObject<ax::ui::TouchGroup>(L, 1);
-    if (self) self->clear();
-    return 0;
+    return pushTypedAxObject(L, self ? self->getRootWidget() : nullptr);
 }
-int lua_TouchGroup_setTouchPriority(lua_State* L) {
-    auto* self = getAxObject<ax::ui::TouchGroup>(L, 1);
-    if (self) self->setTouchPriority(static_cast<int>(lua_tointeger(L, 2)));
-    return 0;
-}
-int lua_TouchGroup_getTouchPriority(lua_State* L) {
-    auto* self = getAxObject<ax::ui::TouchGroup>(L, 1);
-    lua_pushinteger(L, self ? self->getTouchPriority() : 0);
+
+int lua_SAE_sharedEngine(lua_State* L) {
+    pushAxObject(L, SAE::sharedEngine(), "SimpleAudioEngine");
     return 1;
 }
 
-// --- SimpleAudioEngine Lua methods ---
-int lua_SAE_sharedEngine(lua_State* L) {
-    pushAxObject(L, CocosDenshion::SimpleAudioEngine::sharedEngine(), "SimpleAudioEngine");
-    return 1;
-}
-int lua_SAE_preloadBackgroundMusic(lua_State* L) {
-    if (const char* p = lua_tostring(L, 2)) {
-        CocosDenshion::SimpleAudioEngine::sharedEngine()->preloadBackgroundMusic(p);
-    }
-    return 0;
-}
-int lua_SAE_playBackgroundMusic(lua_State* L) {
-    const char* p = lua_tostring(L, 2);
-    const bool loop = lua_gettop(L) >= 3 ? (lua_toboolean(L, 3) != 0) : false;
-    if (p) CocosDenshion::SimpleAudioEngine::sharedEngine()->playBackgroundMusic(p, loop);
-    return 0;
-}
-int lua_SAE_stopBackgroundMusic(lua_State* L) {
-    const bool rel = lua_gettop(L) >= 2 ? (lua_toboolean(L, 2) != 0) : false;
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->stopBackgroundMusic(rel);
-    return 0;
-}
-int lua_SAE_pauseBackgroundMusic(lua_State* /*L*/) {
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->pauseBackgroundMusic();
-    return 0;
-}
-int lua_SAE_resumeBackgroundMusic(lua_State* /*L*/) {
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->resumeBackgroundMusic();
-    return 0;
-}
-int lua_SAE_rewindBackgroundMusic(lua_State* /*L*/) {
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->rewindBackgroundMusic();
-    return 0;
-}
-int lua_SAE_willPlayBackgroundMusic(lua_State* L) {
-    lua_pushboolean(L, 1);
-    return 1;
-}
-int lua_SAE_isBackgroundMusicPlaying(lua_State* L) {
-    lua_pushboolean(L, CocosDenshion::SimpleAudioEngine::sharedEngine()->isBackgroundMusicPlaying() ? 1 : 0);
-    return 1;
-}
-int lua_SAE_getBackgroundMusicVolume(lua_State* L) {
-    lua_pushnumber(L, CocosDenshion::SimpleAudioEngine::sharedEngine()->getBackgroundMusicVolume());
-    return 1;
-}
-int lua_SAE_setBackgroundMusicVolume(lua_State* L) {
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->setBackgroundMusicVolume(
-        static_cast<float>(lua_tonumber(L, 2)));
-    return 0;
-}
-int lua_SAE_getEffectsVolume(lua_State* L) {
-    lua_pushnumber(L, CocosDenshion::SimpleAudioEngine::sharedEngine()->getEffectsVolume());
-    return 1;
-}
-int lua_SAE_setEffectsVolume(lua_State* L) {
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->setEffectsVolume(
-        static_cast<float>(lua_tonumber(L, 2)));
-    return 0;
-}
 int lua_SAE_playEffect(lua_State* L) {
-    const char* p = lua_tostring(L, 2);
-    const bool loop = lua_gettop(L) >= 3 ? (lua_toboolean(L, 3) != 0) : false;
-    const unsigned int id = p ? CocosDenshion::SimpleAudioEngine::sharedEngine()->playEffect(p, loop) : 0u;
+    const int base = firstArgIndex(L);
+    const char* p  = lua_tostring(L, base);
+    const bool loop = optBool(L, base + 1, false);
+    const float pitch = optFloat<float>(L, base + 2, 1.0f);
+    const float pan   = optFloat<float>(L, base + 3, 0.0f);
+    const float gain  = optFloat<float>(L, base + 4, 1.0f);
+    const unsigned int id = p ? SAE::sharedEngine()->playEffect(p, loop, pitch, pan, gain) : 0u;
     lua_pushinteger(L, static_cast<lua_Integer>(id));
     return 1;
 }
-int lua_SAE_pauseEffect(lua_State* L) {
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->pauseEffect(
-        static_cast<unsigned int>(lua_tointeger(L, 2)));
-    return 0;
-}
-int lua_SAE_pauseAllEffects(lua_State* /*L*/) {
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->pauseAllEffects();
-    return 0;
-}
-int lua_SAE_resumeEffect(lua_State* L) {
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->resumeEffect(
-        static_cast<unsigned int>(lua_tointeger(L, 2)));
-    return 0;
-}
-int lua_SAE_resumeAllEffects(lua_State* /*L*/) {
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->resumeAllEffects();
-    return 0;
-}
-int lua_SAE_stopEffect(lua_State* L) {
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->stopEffect(
-        static_cast<unsigned int>(lua_tointeger(L, 2)));
-    return 0;
-}
-int lua_SAE_stopAllEffects(lua_State* /*L*/) {
-    CocosDenshion::SimpleAudioEngine::sharedEngine()->stopAllEffects();
-    return 0;
-}
-int lua_SAE_preloadEffect(lua_State* L) {
-    if (const char* p = lua_tostring(L, 2)) {
-        CocosDenshion::SimpleAudioEngine::sharedEngine()->preloadEffect(p);
+
+void registerCompatClass(lua_State* L,
+                         const char* name,
+                         const char* base,
+                         std::span<const luaL_Reg> methods,
+                         std::initializer_list<const char*> aliasTypes = {}) {
+    tolua_usertype(L, name);
+    for (const char* alias : aliasTypes) tolua_usertype(L, alias);
+    tolua_cclass(L, name, name, base, nullptr);
+    tolua_beginmodule(L, name);
+    for (const auto& m : methods) {
+        if (m.name && m.func) tolua_function(L, m.name, m.func);
     }
-    return 0;
-}
-int lua_SAE_unloadEffect(lua_State* L) {
-    if (const char* p = lua_tostring(L, 2)) {
-        CocosDenshion::SimpleAudioEngine::sharedEngine()->unloadEffect(p);
+    tolua_endmodule(L);
+
+    luaL_getmetatable(L, name);
+    if (lua_istable(L, -1)) {
+        registerMethodTable(L, -1, methods);
+        for (const char* alias : aliasTypes) {
+            lua_pushvalue(L, -1);
+            lua_setfield(L, LUA_REGISTRYINDEX, alias);
+        }
     }
-    return 0;
+    lua_pop(L, 1);
 }
 
 } // namespace
@@ -773,24 +514,22 @@ std::string ResolveConvertedAssetPath(const std::string& rawPath) {
     if (rawPath.empty()) return {};
     const std::string norm = gclient::assets::NormalizeAssetPath(rawPath);
     auto* fu = ax::FileUtils::getInstance();
-    if (!fu) return norm;
-    if (fu->isFileExist(norm)) {
-        return norm;
-    }
+    if (!fu || fu->isFileExist(norm)) return norm;
 
-    // Converted Resources_Axmol_Converted maps .pvr.ccz and .pkm -> .png
-    if (endsWithIgnoreCase(norm, ".pvr.ccz")) {
-        const std::string png = norm.substr(0, norm.size() - 8) + ".png";
-        if (fu->isFileExist(png)) return png;
-    } else if (endsWithIgnoreCase(norm, ".pkm") || endsWithIgnoreCase(norm, ".pvr")) {
-        const std::string png = norm.substr(0, norm.size() - 4) + ".png";
-        if (fu->isFileExist(png)) return png;
-    } else if (endsWithIgnoreCase(norm, ".plistb")) {
-        const std::string plist = norm.substr(0, norm.size() - 1);
-        if (fu->isFileExist(plist)) return plist;
-    } else if (endsWithIgnoreCase(norm, ".jsonb")) {
-        const std::string json = norm.substr(0, norm.size() - 1);
-        if (fu->isFileExist(json)) return json;
+    struct ExtRule { std::string_view suffix; size_t trimLen; const char* replacement; };
+    static constexpr ExtRule kRules[] = {
+        {".pvr.ccz", 8, ".png"},
+        {".pkm",     4, ".png"},
+        {".pvr",     4, ".png"},
+        {".plistb",  7, ".plist"},
+        {".jsonb",   6, ".json"},
+    };
+    for (const auto& r : kRules) {
+        if (gclient::common::endsWithAsciiCI(norm, r.suffix)) {
+            std::string cand = norm.substr(0, norm.size() - r.trimLen) + r.replacement;
+            if (fu->isFileExist(cand)) return cand;
+            break;
+        }
     }
     return norm;
 }
@@ -798,113 +537,100 @@ std::string ResolveConvertedAssetPath(const std::string& rawPath) {
 void RegisterAxmol226CompatLuaBindings(lua_State* L) {
     if (!L) return;
 
+    static const luaL_Reg kCCStringMethods[] = {
+        {"create",      lua_CCString_create},
+        {"getCString",  lua_CCString_getCString},
+        {"length",      bindAxMethod<&ax::CCString::length>},
+        {"intValue",    bindAxMethod<&ax::CCString::intValue>},
+        {"uintValue",   bindAxMethod<&ax::CCString::uintValue>},
+        {"floatValue",  bindAxMethod<&ax::CCString::floatValue>},
+        {"doubleValue", bindAxMethod<&ax::CCString::doubleValue>},
+        {"boolValue",   bindAxMethod<&ax::CCString::boolValue>},
+    };
+    static const luaL_Reg kCCIntegerMethods[] = {
+        {"create",   lua_CCInteger_create},
+        {"getValue", bindAxMethod<&ax::CCInteger::getValue>},
+    };
+    static const luaL_Reg kCCArrayMethods[] = {
+        {"create",                  lua_createDefault<ax::CCArray, "CCArray">},
+        {"createWithCapacity",      lua_CCArray_createWithCapacity},
+        {"count",                   bindAxMethod<&ax::CCArray::count>},
+        {"objectAtIndex",           lua_CCArray_objectAtIndex},
+        {"lastObject",              lua_CCArray_lastObject},
+        {"addObject",               lua_CCArray_addObject},
+        {"insertObject",            lua_CCArray_insertObject},
+        {"removeObject",            bindAxMethod<&ax::CCArray::fastRemoveObject>},
+        {"removeObjectAtIndex",     lua_CCArray_removeObjectAtIndex},
+        {"removeLastObject",        bindAxMethod<&ax::CCArray::removeLastObject>},
+        {"removeAllObjects",        bindAxMethod<&ax::CCArray::removeAllObjects>},
+        {"fastRemoveObject",        bindAxMethod<&ax::CCArray::fastRemoveObject>},
+        {"fastRemoveObjectAtIndex", lua_CCArray_removeObjectAtIndex},
+        {"containsObject",          bindAxMethod<&ax::CCArray::containsObject>},
+    };
+    static const luaL_Reg kCCDictionaryMethods[] = {
+        {"create",                   lua_createDefault<ax::CCDictionary, "CCDictionary">},
+        {"createWithContentsOfFile", lua_CCDictionary_createWithContentsOfFile},
+        {"count",                    bindAxMethod<&ax::CCDictionary::count>},
+        {"objectForKey",             lua_CCDictionary_objectForKey},
+        {"valueForKey",              lua_CCDictionary_valueForKey},
+        {"setObject",                lua_CCDictionary_setObject},
+        {"removeObjectForKey",       lua_CCDictionary_removeObjectForKey},
+        {"removeAllObjects",         bindAxMethod<&ax::CCDictionary::removeAllObjects>},
+        {"allKeys",                  bindAxMethodObjRet<"CCArray", &ax::CCDictionary::allKeys>},
+    };
+    static const luaL_Reg kTouchGroupMethods[] = {
+        {"create",           lua_createDefault<ax::ui::TouchGroup, "TouchGroup">},
+        {"addWidget",        bindAxMethod<&ax::ui::TouchGroup::addWidget>},
+        {"removeWidget",     bindAxMethod<&ax::ui::TouchGroup::removeWidget>},
+        {"getWidgetByTag",   lua_TouchGroup_getWidgetByTag},
+        {"getWidgetByName",  lua_TouchGroup_getWidgetByName},
+        {"getRootWidget",    lua_TouchGroup_getRootWidget},
+        {"clear",            bindAxMethod<&ax::ui::TouchGroup::clear>},
+        {"clearTouchStat",   bindAxMethod<&ax::ui::TouchGroup::clearTouchStat>},
+        {"setTouchPriority", bindAxMethod<&ax::ui::TouchGroup::setTouchPriority>},
+        {"getTouchPriority", bindAxMethod<&ax::ui::TouchGroup::getTouchPriority>},
+    };
+    static const luaL_Reg kSAEMethods[] = {
+        {"sharedEngine",             lua_SAE_sharedEngine},
+        {"getInstance",              lua_SAE_sharedEngine},
+        {"preloadBackgroundMusic",   bindFlexSingleton<&SAE::sharedEngine, &SAE::preloadBackgroundMusic>},
+        {"playBackgroundMusic",      bindFlexSingleton<&SAE::sharedEngine, &SAE::playBackgroundMusic>},
+        {"stopBackgroundMusic",      bindFlexSingleton<&SAE::sharedEngine, &SAE::stopBackgroundMusic>},
+        {"pauseBackgroundMusic",     bindFlexSingleton<&SAE::sharedEngine, &SAE::pauseBackgroundMusic>},
+        {"resumeBackgroundMusic",    bindFlexSingleton<&SAE::sharedEngine, &SAE::resumeBackgroundMusic>},
+        {"rewindBackgroundMusic",    bindFlexSingleton<&SAE::sharedEngine, &SAE::rewindBackgroundMusic>},
+        {"willPlayBackgroundMusic",  bindFlexSingleton<&SAE::sharedEngine, &SAE::willPlayBackgroundMusic>},
+        {"isBackgroundMusicPlaying", bindFlexSingleton<&SAE::sharedEngine, &SAE::isBackgroundMusicPlaying>},
+        {"getBackgroundMusicVolume", bindFlexSingleton<&SAE::sharedEngine, &SAE::getBackgroundMusicVolume>},
+        {"setBackgroundMusicVolume", bindFlexSingleton<&SAE::sharedEngine, &SAE::setBackgroundMusicVolume>},
+        {"getEffectsVolume",         bindFlexSingleton<&SAE::sharedEngine, &SAE::getEffectsVolume>},
+        {"setEffectsVolume",         bindFlexSingleton<&SAE::sharedEngine, &SAE::setEffectsVolume>},
+        {"playEffect",               lua_SAE_playEffect},
+        {"pauseEffect",              bindFlexSingleton<&SAE::sharedEngine, &SAE::pauseEffect>},
+        {"pauseAllEffects",          bindFlexSingleton<&SAE::sharedEngine, &SAE::pauseAllEffects>},
+        {"resumeEffect",             bindFlexSingleton<&SAE::sharedEngine, &SAE::resumeEffect>},
+        {"resumeAllEffects",         bindFlexSingleton<&SAE::sharedEngine, &SAE::resumeAllEffects>},
+        {"stopEffect",               bindFlexSingleton<&SAE::sharedEngine, &SAE::stopEffect>},
+        {"stopAllEffects",           bindFlexSingleton<&SAE::sharedEngine, &SAE::stopAllEffects>},
+        {"preloadEffect",            bindFlexSingleton<&SAE::sharedEngine, &SAE::preloadEffect>},
+        {"unloadEffect",             bindFlexSingleton<&SAE::sharedEngine, &SAE::unloadEffect>},
+    };
+
     tolua_open(L);
     tolua_module(L, nullptr, 0);
     tolua_beginmodule(L, nullptr);
 
-    tolua_usertype(L, "CCString");
-    tolua_cclass(L, "CCString", "CCString", "ax.Object", nullptr);
-    tolua_beginmodule(L, "CCString");
-    tolua_function(L, "create", lua_CCString_create);
-    tolua_function(L, "getCString", lua_CCString_getCString);
-    tolua_function(L, "length", lua_CCString_length);
-    tolua_function(L, "intValue", lua_CCString_intValue);
-    tolua_function(L, "uintValue", lua_CCString_intValue);
-    tolua_function(L, "floatValue", lua_CCString_floatValue);
-    tolua_function(L, "doubleValue", lua_CCString_floatValue);
-    tolua_function(L, "boolValue", lua_CCString_boolValue);
-    tolua_endmodule(L);
+    registerCompatClass(L, "CCString", "ax.Object", kCCStringMethods);
+    registerCompatClass(L, "CCInteger", "ax.Object", kCCIntegerMethods);
+    registerCompatClass(L, "CCArray", "ax.Object", kCCArrayMethods, {"cocos2d::CCArray"});
+    registerCompatClass(L, "CCDictionary", "ax.Object", kCCDictionaryMethods);
+    registerCompatClass(L, "TouchGroup", "ax.Layer", kTouchGroupMethods,
+                        {"UILayer", "axui.TouchGroup", "ccui.TouchGroup"});
+    registerCompatClass(L, "SimpleAudioEngine", "ax.Object", kSAEMethods);
 
-    tolua_usertype(L, "CCInteger");
-    tolua_cclass(L, "CCInteger", "CCInteger", "ax.Object", nullptr);
-    tolua_beginmodule(L, "CCInteger");
-    tolua_function(L, "create", lua_CCInteger_create);
-    tolua_function(L, "getValue", lua_CCInteger_getValue);
-    tolua_endmodule(L);
-
-    tolua_usertype(L, "CCArray");
-    tolua_usertype(L, "cocos2d::CCArray");
-    tolua_cclass(L, "CCArray", "CCArray", "ax.Object", nullptr);
-    tolua_beginmodule(L, "CCArray");
-    tolua_function(L, "create", lua_CCArray_create);
-    tolua_function(L, "createWithCapacity", lua_CCArray_createWithCapacity);
-    tolua_function(L, "count", lua_CCArray_count);
-    tolua_function(L, "objectAtIndex", lua_CCArray_objectAtIndex);
-    tolua_function(L, "lastObject", lua_CCArray_lastObject);
-    tolua_function(L, "addObject", lua_CCArray_addObject);
-    tolua_function(L, "insertObject", lua_CCArray_insertObject);
-    tolua_function(L, "removeObject", lua_CCArray_removeObject);
-    tolua_function(L, "removeObjectAtIndex", lua_CCArray_removeObjectAtIndex);
-    tolua_function(L, "removeLastObject", lua_CCArray_removeLastObject);
-    tolua_function(L, "removeAllObjects", lua_CCArray_removeAllObjects);
-    tolua_function(L, "fastRemoveObject", lua_CCArray_removeObject);
-    tolua_function(L, "fastRemoveObjectAtIndex", lua_CCArray_removeObjectAtIndex);
-    tolua_function(L, "containsObject", lua_CCArray_containsObject);
-    tolua_endmodule(L);
-
-    // Alias cocos2d::CCArray metatable to CCArray metatable so tolua++ functions registered
-    // under either spelling resolve identically.
-    luaL_getmetatable(L, "CCArray");
-    if (lua_istable(L, -1)) {
-        lua_setfield(L, LUA_REGISTRYINDEX, "cocos2d::CCArray");
-    } else {
-        lua_pop(L, 1);
-    }
-
-    tolua_usertype(L, "CCDictionary");
-    tolua_cclass(L, "CCDictionary", "CCDictionary", "ax.Object", nullptr);
-    tolua_beginmodule(L, "CCDictionary");
-    tolua_function(L, "create", lua_CCDictionary_create);
-    tolua_function(L, "createWithContentsOfFile", lua_CCDictionary_createWithContentsOfFile);
-    tolua_function(L, "count", lua_CCDictionary_count);
-    tolua_function(L, "objectForKey", lua_CCDictionary_objectForKey);
-    tolua_function(L, "valueForKey", lua_CCDictionary_valueForKey);
-    tolua_function(L, "setObject", lua_CCDictionary_setObject);
-    tolua_function(L, "removeObjectForKey", lua_CCDictionary_removeObjectForKey);
-    tolua_function(L, "removeAllObjects", lua_CCDictionary_removeAllObjects);
-    tolua_function(L, "allKeys", lua_CCDictionary_allKeys);
-    tolua_endmodule(L);
-
-    tolua_usertype(L, "TouchGroup");
-    tolua_cclass(L, "TouchGroup", "TouchGroup", "ax.Layer", nullptr);
-    tolua_beginmodule(L, "TouchGroup");
-    tolua_function(L, "create", lua_TouchGroup_create);
-    tolua_function(L, "addWidget", lua_TouchGroup_addWidget);
-    tolua_function(L, "removeWidget", lua_TouchGroup_removeWidget);
-    tolua_function(L, "getWidgetByTag", lua_TouchGroup_getWidgetByTag);
-    tolua_function(L, "getWidgetByName", lua_TouchGroup_getWidgetByName);
-    tolua_function(L, "clear", lua_TouchGroup_clear);
-    tolua_function(L, "setTouchPriority", lua_TouchGroup_setTouchPriority);
-    tolua_function(L, "getTouchPriority", lua_TouchGroup_getTouchPriority);
-    tolua_endmodule(L);
-
-    tolua_usertype(L, "SimpleAudioEngine");
-    tolua_cclass(L, "SimpleAudioEngine", "SimpleAudioEngine", "ax.Object", nullptr);
-    tolua_beginmodule(L, "SimpleAudioEngine");
-    tolua_function(L, "sharedEngine", lua_SAE_sharedEngine);
-    tolua_function(L, "getInstance", lua_SAE_sharedEngine);
-    tolua_function(L, "preloadBackgroundMusic", lua_SAE_preloadBackgroundMusic);
-    tolua_function(L, "playBackgroundMusic", lua_SAE_playBackgroundMusic);
-    tolua_function(L, "stopBackgroundMusic", lua_SAE_stopBackgroundMusic);
-    tolua_function(L, "pauseBackgroundMusic", lua_SAE_pauseBackgroundMusic);
-    tolua_function(L, "resumeBackgroundMusic", lua_SAE_resumeBackgroundMusic);
-    tolua_function(L, "rewindBackgroundMusic", lua_SAE_rewindBackgroundMusic);
-    tolua_function(L, "willPlayBackgroundMusic", lua_SAE_willPlayBackgroundMusic);
-    tolua_function(L, "isBackgroundMusicPlaying", lua_SAE_isBackgroundMusicPlaying);
-    tolua_function(L, "getBackgroundMusicVolume", lua_SAE_getBackgroundMusicVolume);
-    tolua_function(L, "setBackgroundMusicVolume", lua_SAE_setBackgroundMusicVolume);
-    tolua_function(L, "getEffectsVolume", lua_SAE_getEffectsVolume);
-    tolua_function(L, "setEffectsVolume", lua_SAE_setEffectsVolume);
-    tolua_function(L, "playEffect", lua_SAE_playEffect);
-    tolua_function(L, "pauseEffect", lua_SAE_pauseEffect);
-    tolua_function(L, "pauseAllEffects", lua_SAE_pauseAllEffects);
-    tolua_function(L, "resumeEffect", lua_SAE_resumeEffect);
-    tolua_function(L, "resumeAllEffects", lua_SAE_resumeAllEffects);
-    tolua_function(L, "stopEffect", lua_SAE_stopEffect);
-    tolua_function(L, "stopAllEffects", lua_SAE_stopAllEffects);
-    tolua_function(L, "preloadEffect", lua_SAE_preloadEffect);
-    tolua_function(L, "unloadEffect", lua_SAE_unloadEffect);
-    tolua_endmodule(L);
+    lua_getglobal(L, "TouchGroup");
+    if (!lua_isnil(L, -1)) lua_setglobal(L, "UILayer");
+    else lua_pop(L, 1);
 
     tolua_endmodule(L);
 }

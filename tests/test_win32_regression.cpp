@@ -43,6 +43,8 @@ extern "C" {
 #include <unistd.h>
 #endif
 
+#include "TestHarness.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -65,65 +67,112 @@ namespace fs = std::filesystem;
 
 namespace {
 
-int g_passedTests = 0;
-int g_failedTests = 0;
+using gclient::test::ScopedTempDir;
+using gclient::test::makeScopeExit;
 
-#define REQUIRE_TRUE(expr)                                                                 \
-    do {                                                                                   \
-        if (!(expr)) {                                                                     \
-            std::fprintf(stderr, "[FAIL] %s:%d: assertion failed: %s\n", __FILE__,         \
-                         __LINE__, #expr);                                                 \
-            std::fflush(stderr);                                                           \
-            return false;                                                                  \
-        }                                                                                  \
-    } while (0)
+void closeSocketCrossPlatform(SOCKET fd) noexcept {
+    if (fd == INVALID_SOCKET) return;
+#ifdef _WIN32
+    ::closesocket(fd);
+#else
+    ::close(fd);
+#endif
+}
 
-#define REQUIRE_EQ(lhs, rhs)                                                               \
-    do {                                                                                   \
-        const auto _l = (lhs);                                                             \
-        const auto _r = (rhs);                                                             \
-        if (!(_l == _r)) {                                                                 \
-            std::fprintf(stderr, "[FAIL] %s:%d: expected (%s == %s)\n", __FILE__,          \
-                         __LINE__, #lhs, #rhs);                                            \
-            std::fflush(stderr);                                                           \
-            return false;                                                                  \
-        }                                                                                  \
-    } while (0)
-
-#define REQUIRE_NEAR(lhs, rhs, eps)                                                        \
-    do {                                                                                   \
-        const double _l = static_cast<double>(lhs);                                        \
-        const double _r = static_cast<double>(rhs);                                        \
-        const double _e = static_cast<double>(eps);                                        \
-        if (!(std::fabs(_l - _r) <= _e)) {                                                 \
-            std::fprintf(stderr, "[FAIL] %s:%d: expected |%s - %s| <= %g (got %g vs %g)\n",\
-                         __FILE__, __LINE__, #lhs, #rhs, _e, _l, _r);                      \
-            std::fflush(stderr);                                                           \
-            return false;                                                                  \
-        }                                                                                  \
-    } while (0)
-
-void runTestCase(const char* name, const std::function<bool()>& fn) {
-    std::printf("[RUN ] %s\n", name);
-    std::fflush(stdout);
-    bool ok = false;
-    try {
-        ok = fn();
-    } catch (const std::exception& ex) {
-        std::fprintf(stderr, "[EXCP] %s threw std::exception: %s\n", name, ex.what());
-        ok = false;
-    } catch (...) {
-        std::fprintf(stderr, "[EXCP] %s threw unknown exception\n", name);
-        ok = false;
+struct ScopedSocket {
+    SOCKET fd = INVALID_SOCKET;
+    explicit ScopedSocket(SOCKET s = INVALID_SOCKET) noexcept : fd(s) {}
+    ScopedSocket(const ScopedSocket&) = delete;
+    ScopedSocket& operator=(const ScopedSocket&) = delete;
+    ScopedSocket(ScopedSocket&& o) noexcept : fd(o.fd) { o.fd = INVALID_SOCKET; }
+    ~ScopedSocket() noexcept { reset(); }
+    void reset(SOCKET next = INVALID_SOCKET) noexcept {
+        if (fd != INVALID_SOCKET) closeSocketCrossPlatform(fd);
+        fd = next;
     }
-    if (ok) {
-        ++g_passedTests;
-        std::printf("[ OK ] %s\n", name);
-    } else {
-        ++g_failedTests;
-        std::printf("[FAIL] %s\n", name);
+};
+
+struct LoopbackTcpListener {
+    ScopedSocket listenSock;
+    unsigned int port = 0;
+
+    bool bindEphemeral(int backlog = 4) {
+        listenSock.reset(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
+        if (listenSock.fd == INVALID_SOCKET) return false;
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(0);
+        if (::bind(listenSock.fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            ::listen(listenSock.fd, backlog) != 0) {
+            return false;
+        }
+#ifdef _WIN32
+        int addrLen = sizeof(addr);
+#else
+        socklen_t addrLen = sizeof(addr);
+#endif
+        if (::getsockname(listenSock.fd, reinterpret_cast<sockaddr*>(&addr), &addrLen) != 0) {
+            return false;
+        }
+        port = ntohs(addr.sin_port);
+        return port > 0;
     }
-    std::fflush(stdout);
+
+    ScopedSocket acceptOne() {
+        return ScopedSocket(::accept(listenSock.fd, nullptr, nullptr));
+    }
+};
+
+struct ScopedLuaVm {
+    lua_State* L = nullptr;
+
+    explicit ScopedLuaVm(bool withAmf3 = false) : L(luaL_newstate()) {
+        if (L != nullptr) {
+            luaL_openlibs(L);
+            if (withAmf3) luaopen_amf3_extensions(L);
+        }
+    }
+    ScopedLuaVm(const ScopedLuaVm&) = delete;
+    ScopedLuaVm& operator=(const ScopedLuaVm&) = delete;
+    ~ScopedLuaVm() noexcept {
+        if (L != nullptr) lua_close(L);
+    }
+
+    bool execChecked(const char* script, const char* errTag) const {
+        if (luaL_dostring(L, script) != 0) {
+            const char* err = lua_tostring(L, -1);
+            std::fprintf(stderr, "[%s] %s\n", errTag, err ? err : "(null)");
+            return false;
+        }
+        return true;
+    }
+};
+
+struct ScopedDiagnosticsSession {
+    ScopedTempDir tempRoot;
+    bool installed = false;
+
+    ScopedDiagnosticsSession(const char* folderName, const char* appName, double flushSec = 0.0)
+        : tempRoot(fs::temp_directory_path() / folderName, false) {
+        gclient::diagnostics::DiagnosticsConfig cfg;
+        cfg.logDirectory = (tempRoot.path / "logs").u8string();
+        cfg.dumpDirectory = (tempRoot.path / "dumps").u8string();
+        cfg.appName = appName;
+        if (flushSec > 0.0) cfg.metricsFlushIntervalSec = flushSec;
+        installed = gclient::diagnostics::CrashAndTelemetry::install(cfg);
+    }
+    ~ScopedDiagnosticsSession() noexcept {
+        if (installed) {
+            gclient::diagnostics::CrashAndTelemetry::clearLuaState();
+            gclient::diagnostics::CrashAndTelemetry::shutdown();
+        }
+    }
+};
+
+void writeBinaryString(const fs::path& dst, const std::string& data) {
+    std::ofstream ofs(dst, std::ios::binary | std::ios::trunc);
+    ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
 }
 
 // ============================================================================
@@ -543,62 +592,35 @@ bool testIntegerOverflowArithmeticContracts() {
 }
 
 bool testCrashAndTelemetryNanSortAndLuaHooks() {
-    // Scenario 9: NaN / +Inf / -Inf frame delta injection must NEVER violate std::sort strict weak ordering
-    const fs::path tempRoot = fs::temp_directory_path() / "kestrel_telemetry_test";
-    std::error_code ec;
-    fs::remove_all(tempRoot, ec);
-
-    gclient::diagnostics::DiagnosticsConfig cfg;
-    cfg.logDirectory = (tempRoot / "logs").u8string();
-    cfg.dumpDirectory = (tempRoot / "dumps").u8string();
-    cfg.appName = "kestrel_test";
-    cfg.metricsFlushIntervalSec = 0.25;
-
-    REQUIRE_TRUE(gclient::diagnostics::CrashAndTelemetry::install(cfg));
-
-    lua_State* L = luaL_newstate();
-    REQUIRE_TRUE(L != nullptr);
-    luaL_openlibs(L);
-    gclient::diagnostics::CrashAndTelemetry::installLuaHooks(L);
+    ScopedDiagnosticsSession diag("kestrel_telemetry_test", "kestrel_test", 0.25);
+    REQUIRE_TRUE(diag.installed);
+    ScopedLuaVm vm;
+    REQUIRE_TRUE(vm.L != nullptr);
+    gclient::diagnostics::CrashAndTelemetry::installLuaHooks(vm.L);
 
     const float nanVal = std::numeric_limits<float>::quiet_NaN();
     const float posInf = std::numeric_limits<float>::infinity();
-    const float negInf = -std::numeric_limits<float>::infinity();
-
     for (int i = 0; i < 600; ++i) {
-        if (i % 17 == 0) {
-            gclient::diagnostics::CrashAndTelemetry::recordFrame(nanVal);
-        } else if (i % 23 == 0) {
-            gclient::diagnostics::CrashAndTelemetry::recordFrame(posInf);
-        } else if (i % 29 == 0) {
-            gclient::diagnostics::CrashAndTelemetry::recordFrame(negInf);
-        } else if (i % 31 == 0) {
-            gclient::diagnostics::CrashAndTelemetry::recordFrame(-0.5f);
-        } else {
-            gclient::diagnostics::CrashAndTelemetry::recordFrame(0.0333f);
-        }
+        const float sample = (i % 17 == 0) ? nanVal
+                           : (i % 23 == 0) ? posInf
+                           : (i % 29 == 0) ? -posInf
+                           : (i % 31 == 0) ? -0.5f : 0.0333f;
+        gclient::diagnostics::CrashAndTelemetry::recordFrame(sample);
     }
 
     const auto snap = gclient::diagnostics::CrashAndTelemetry::getLatestSnapshot();
-    REQUIRE_TRUE(std::isfinite(snap.avgFps));
-    REQUIRE_TRUE(std::isfinite(snap.avgFrameMs));
-    REQUIRE_TRUE(std::isfinite(snap.p95FrameMs));
-    REQUIRE_TRUE(std::isfinite(snap.maxFrameMs));
+    REQUIRE_TRUE(std::isfinite(snap.avgFps) && std::isfinite(snap.avgFrameMs) &&
+                 std::isfinite(snap.p95FrameMs) && std::isfinite(snap.maxFrameMs));
     REQUIRE_TRUE(snap.totalFrames >= 500);
 
-    // Verify Lua __G__TRACKBACK__ hook executes cleanly without leaking Lua stack slots
-    const int topBefore = lua_gettop(L);
-    lua_getglobal(L, "__G__TRACKBACK__");
-    REQUIRE_TRUE(lua_isfunction(L, -1));
-    lua_pushstring(L, "synthetic_lua_error");
-    REQUIRE_EQ(lua_pcall(L, 1, 1, 0), 0);
-    lua_pop(L, 1);
-    REQUIRE_EQ(lua_gettop(L), topBefore);
-
+    const int topBefore = lua_gettop(vm.L);
+    lua_getglobal(vm.L, "__G__TRACKBACK__");
+    REQUIRE_TRUE(lua_isfunction(vm.L, -1));
+    lua_pushstring(vm.L, "synthetic_lua_error");
+    REQUIRE_EQ(lua_pcall(vm.L, 1, 1, 0), 0);
+    lua_pop(vm.L, 1);
+    REQUIRE_EQ(lua_gettop(vm.L), topBefore);
     gclient::diagnostics::CrashAndTelemetry::clearLuaState();
-    lua_close(L);
-    gclient::diagnostics::CrashAndTelemetry::shutdown();
-    fs::remove_all(tempRoot, ec);
     return true;
 }
 
@@ -668,26 +690,19 @@ bool testBtDecryptKeyLifetimeAndPathNormalization() {
 // ============================================================================
 
 bool testUnicodeAtomicHotUpdaterAndTornManifestRecovery() {
-    const fs::path unicodeRoot =
-        fs::temp_directory_path() / fs::u8path(u8"Kestrel Hotfix Tiếng Việt 日本語 Space");
+    ScopedTempDir unicodeRoot(fs::temp_directory_path() / fs::u8path(u8"Kestrel Hotfix Tiếng Việt 日本語 Space"));
     std::error_code ec;
-    fs::remove_all(unicodeRoot, ec);
-
-    const fs::path baseRes = unicodeRoot / fs::u8path(u8"Resources Base");
-    const fs::path patchRoot = unicodeRoot / fs::u8path(u8"Patch Overlay Tiếng Việt");
-    const fs::path remoteSource = unicodeRoot / fs::u8path(u8"Remote CDN");
+    const fs::path baseRes = unicodeRoot.path / fs::u8path(u8"Resources Base");
+    const fs::path patchRoot = unicodeRoot.path / fs::u8path(u8"Patch Overlay Tiếng Việt");
+    const fs::path remoteSource = unicodeRoot.path / fs::u8path(u8"Remote CDN");
     fs::create_directories(baseRes, ec);
     fs::create_directories(remoteSource, ec);
 
     const fs::path remoteScript = remoteSource / "main_v2.lua";
     const std::string v1Content = "return 'version_1_ok'\n";
     const std::string v2Content = "return 'version_2_faulty'\n";
-    {
-        std::ofstream f1(remoteSource / "main_v1.lua", std::ios::binary);
-        f1.write(v1Content.data(), static_cast<std::streamsize>(v1Content.size()));
-        std::ofstream f2(remoteScript, std::ios::binary);
-        f2.write(v2Content.data(), static_cast<std::streamsize>(v2Content.size()));
-    }
+    writeBinaryString(remoteSource / "main_v1.lua", v1Content);
+    writeBinaryString(remoteScript, v2Content);
 
     std::string shaV1, shaV2, hashErr;
     REQUIRE_TRUE(gclient::update::AtomicHotUpdater::computeFileHash(
@@ -708,41 +723,28 @@ bool testUnicodeAtomicHotUpdaterAndTornManifestRecovery() {
             std::error_code copyEc;
             fs::create_directories(dst.parent_path(), copyEc);
             fs::copy_file(fs::u8path(url), dst, fs::copy_options::overwrite_existing, copyEc);
-            if (copyEc) {
-                errOut = copyEc.message();
-                return false;
-            }
-            return true;
+            if (copyEc) errOut = copyEc.message();
+            return !copyEc;
         });
 
-    // Reject path traversal before touching disk
-    REQUIRE_TRUE(!gclient::update::AtomicHotUpdater::isSafeRelativePath("../evil.dll"));
-    REQUIRE_TRUE(!gclient::update::AtomicHotUpdater::isSafeRelativePath("C:/evil.lua"));
+    REQUIRE_FALSE(gclient::update::AtomicHotUpdater::isSafeRelativePath("../evil.dll"));
+    REQUIRE_FALSE(gclient::update::AtomicHotUpdater::isSafeRelativePath("C:/evil.lua"));
     REQUIRE_TRUE(gclient::update::AtomicHotUpdater::isSafeRelativePath("scripts/main.lua"));
 
-    // Apply v1.0.1 and confirm startup health
     gclient::update::PatchManifest m1;
     m1.patchVersion = "1.0.1";
     m1.baseVersion = "1.0.0";
     m1.contract.requiredNativeBindings = {"luaopen_amf3"};
-    gclient::update::PatchFileEntry e1;
-    e1.relativePath = "scripts/main.lua";
-    e1.downloadUrl = (remoteSource / "main_v1.lua").u8string();
-    e1.expectedSize = v1Content.size();
-    e1.sha256 = shaV1;
-    m1.files.push_back(e1);
+    m1.files.push_back({"scripts/main.lua", (remoteSource / "main_v1.lua").u8string(), v1Content.size(), shaV1, {}});
 
-    const auto r1 = updater.applyPatch(m1);
-    REQUIRE_TRUE(r1.ok());
+    REQUIRE_TRUE(updater.applyPatch(m1).ok());
     REQUIRE_TRUE(updater.confirmStartupSuccess().ok());
 
-    // Apply v1.0.2 (Checksum mismatch first -> must reject cleanly)
     gclient::update::PatchManifest mBad = m1;
     mBad.patchVersion = "1.0.9";
     mBad.files[0].sha256 = std::string(64, '0');
     REQUIRE_EQ(updater.stagePatch(mBad).status, gclient::update::UpdateStatus::ChecksumMismatch);
 
-    // Apply valid v1.0.2 and simulate 2 consecutive crash-before-confirm boots -> auto-rollback to 1.0.1!
     gclient::update::PatchManifest m2 = m1;
     m2.patchVersion = "1.0.2";
     m2.files[0].downloadUrl = remoteScript.u8string();
@@ -750,43 +752,25 @@ bool testUnicodeAtomicHotUpdaterAndTornManifestRecovery() {
     m2.files[0].sha256 = shaV2;
     REQUIRE_TRUE(updater.applyPatch(m2).ok());
 
-    // Boot attempt #1 crashes before confirmStartupSuccess() -> failures becomes 1
-    const auto boot1 = updater.initializeAndCheckStartupHealth();
-    REQUIRE_TRUE(!boot1.rolledBack);
-    REQUIRE_EQ(boot1.activeVersion, std::string("1.0.2"));
-
-    // Boot attempt #2 crashes before confirmStartupSuccess() -> failures becomes 2
-    const auto boot2 = updater.initializeAndCheckStartupHealth();
-    REQUIRE_TRUE(!boot2.rolledBack);
-    REQUIRE_EQ(boot2.activeVersion, std::string("1.0.2"));
-
-    // Boot attempt #3 sees consecutiveBootFailures (2) >= maxBootFailuresBeforeRollback (2) -> auto-rolls back!
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const auto boot = updater.initializeAndCheckStartupHealth();
+        REQUIRE_FALSE(boot.rolledBack);
+        REQUIRE_EQ(boot.activeVersion, std::string("1.0.2"));
+    }
     const auto boot3 = updater.initializeAndCheckStartupHealth();
     REQUIRE_TRUE(boot3.rolledBack);
     REQUIRE_EQ(boot3.activeVersion, std::string("1.0.1"));
     REQUIRE_EQ(boot3.rolledBackFromVersion, std::string("1.0.2"));
 
-    // Simulate torn active_manifest.json -> must recover from previous_manifest.json!
-    {
-        std::ofstream corrupt(patchRoot / "active_manifest.json", std::ios::binary | std::ios::trunc);
-        corrupt << "{ truncated_json";
-    }
+    writeBinaryString(patchRoot / "active_manifest.json", "{ truncated_json");
     const auto recovered = updater.getActiveState();
-    REQUIRE_TRUE(recovered.has_value());
-    REQUIRE_TRUE(!recovered->activeVersion.empty());
-
-    fs::remove_all(unicodeRoot, ec);
+    REQUIRE_TRUE(recovered.has_value() && !recovered->activeVersion.empty());
     return true;
 }
 
 bool testSqliteReadOnlyUnicodeUri() {
-    // Scenario 15: Verify SQLite3 RFC 8089 read-only URI works with spaces, '#', '?', and Unicode
-    const fs::path dir =
-        fs::temp_directory_path() / fs::u8path(u8"Kestrel DB Tiếng Việt #1");
-    std::error_code ec;
-    fs::remove_all(dir, ec);
-    fs::create_directories(dir, ec);
-    const fs::path dbFile = dir / "DB_Item_Config.db";
+    ScopedTempDir dir(fs::temp_directory_path() / fs::u8path(u8"Kestrel DB Tiếng Việt #1"));
+    const fs::path dbFile = dir.path / "DB_Item_Config.db";
 
     sqlite3* writer = nullptr;
     REQUIRE_EQ(sqlite3_open_v2(dbFile.u8string().c_str(), &writer,
@@ -831,8 +815,6 @@ bool testSqliteReadOnlyUnicodeUri() {
     REQUIRE_EQ(std::string(itemName), std::string("Kestrel Blade"));
     sqlite3_finalize(stmt);
     REQUIRE_EQ(sqlite3_close(reader), SQLITE_OK); // Zero leaked statements -> SQLITE_OK!
-
-    fs::remove_all(dir, ec);
     return true;
 }
 
@@ -893,31 +875,16 @@ bool testCNetworkLoopbackReentrantAndDestroySafety() {
     WinsockSession ws;
     REQUIRE_TRUE(ws.isInitialized());
 
-    // Bind an ephemeral IPv4 loopback listener
-    SOCKET listenSock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    REQUIRE_TRUE(listenSock != INVALID_SOCKET);
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(0);
-    REQUIRE_EQ(::bind(listenSock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)), 0);
-    REQUIRE_EQ(::listen(listenSock, 4), 0);
-
-#ifdef _WIN32
-    int addrLen = sizeof(addr);
-#else
-    socklen_t addrLen = sizeof(addr);
-#endif
-    REQUIRE_EQ(::getsockname(listenSock, reinterpret_cast<sockaddr*>(&addr), &addrLen), 0);
-    const unsigned int port = ntohs(addr.sin_port);
+    LoopbackTcpListener listener;
+    REQUIRE_TRUE(listener.bindEphemeral(4));
+    const unsigned int port = listener.port;
 
     std::atomic<bool> serverReceivedOk{false};
-    std::thread serverThread([listenSock, &serverReceivedOk]() {
-        SOCKET client = ::accept(listenSock, nullptr, nullptr);
-        if (client != INVALID_SOCKET) {
+    std::thread serverThread([&listener, &serverReceivedOk]() {
+        ScopedSocket client = listener.acceptOne();
+        if (client.fd != INVALID_SOCKET) {
             char buf[256] = {};
-            const auto n = ::recv(client, buf, sizeof(buf), 0);
+            const auto n = ::recv(client.fd, buf, sizeof(buf), 0);
             if (n >= static_cast<int>(LCPacket::kTotalHeaderSize)) {
                 LCPacket::DecodedPacket pkt{};
                 if (LCPacket::parseLCPacket(buf, static_cast<size_t>(n), pkt) &&
@@ -927,19 +894,10 @@ bool testCNetworkLoopbackReentrantAndDestroySafety() {
             }
             const std::string reply1 = LCPacket::makeLCPacket("pong_packet_1", true);
             const std::string reply2 = LCPacket::makeLCPacket("pong_packet_2", false);
-            ::send(client, reply1.data(), static_cast<int>(reply1.size()), 0);
-            ::send(client, reply2.data(), static_cast<int>(reply2.size()), 0);
-#ifdef _WIN32
-            ::closesocket(client);
-#else
-            ::close(client);
-#endif
+            ::send(client.fd, reply1.data(), static_cast<int>(reply1.size()), 0);
+            ::send(client.fd, reply2.data(), static_cast<int>(reply2.size()), 0);
         }
-#ifdef _WIN32
-        ::closesocket(listenSock);
-#else
-        ::close(listenSock);
-#endif
+        listener.listenSock.reset();
     });
 
     CNetwork* net = CNetwork::sharedNetwork();
@@ -1593,80 +1551,52 @@ struct Issue8AssetEnv {
     std::vector<Issue8SpriteFrame> plistFrames;
     std::vector<Issue8SpriteFrame> diskFiles;
 
-    const Issue8SpriteFrame* findSpriteFrameWithFallback(const std::string& rawName) const {
-        std::string s = rawName;
-        for (char& c : s) {
-            if (c == '\\') c = '/';
-        }
+    static std::vector<std::string> buildPrefixCandidates(std::string s) {
+        std::replace(s.begin(), s.end(), '\\', '/');
         while (!s.empty() && s.front() == '#') s.erase(s.begin());
-        if (s.empty()) return nullptr;
+        if (s.empty()) return {};
+        std::vector<std::string> out{s};
+        if (s.rfind("res/jsonUI/", 0) == 0 && s.size() > 11) out.push_back(s.substr(11));
+        if (s.rfind("res/", 0) == 0 && s.size() > 4) out.push_back(s.substr(4));
+        if (s.rfind("gameImage/", 0) == 0 && s.size() > 10) out.push_back("images/" + s.substr(10));
+        return out;
+    }
 
-        auto matchKey = [&](const std::string& k) -> const Issue8SpriteFrame* {
+    const Issue8SpriteFrame* findSpriteFrameWithFallback(const std::string& rawName) const {
+        auto cands = buildPrefixCandidates(rawName);
+        if (cands.empty()) return nullptr;
+        const size_t slash = cands[0].find_last_of('/');
+        if (slash != std::string::npos && slash + 1 < cands[0].size()) {
+            cands.push_back(cands[0].substr(slash + 1));
+        }
+        for (const std::string& k : cands) {
             for (const auto& f : plistFrames) {
                 if (f.key == k) return &f;
             }
-            const size_t sl = k.find_last_of('/');
-            const size_t dt = k.find_last_of('.');
+            const size_t sl = k.find_last_of('/'), dt = k.find_last_of('.');
             if (dt == std::string::npos || (sl != std::string::npos && dt < sl)) {
                 const std::string withPng = k + ".png";
                 for (const auto& f : plistFrames) {
                     if (f.key == withPng) return &f;
                 }
             }
-            return nullptr;
-        };
-
-        if (const auto* f = matchKey(s)) return f;
-        if (s.rfind("res/jsonUI/", 0) == 0 && s.size() > 11) {
-            if (const auto* f = matchKey(s.substr(11))) return f;
-        }
-        if (s.rfind("res/", 0) == 0 && s.size() > 4) {
-            if (const auto* f = matchKey(s.substr(4))) return f;
-        }
-        if (s.rfind("gameImage/", 0) == 0 && s.size() > 10) {
-            if (const auto* f = matchKey("images/" + s.substr(10))) return f;
-        }
-        const size_t slash = s.find_last_of('/');
-        if (slash != std::string::npos && slash + 1 < s.size()) {
-            if (const auto* f = matchKey(s.substr(slash + 1))) return f;
         }
         return nullptr;
     }
 
     const Issue8SpriteFrame* loadTextureWithFallback(const std::string& rawName) const {
-        std::string s = rawName;
-        for (char& c : s) {
-            if (c == '\\') c = '/';
-        }
-        while (!s.empty() && s.front() == '#') s.erase(s.begin());
-        if (s.empty()) return nullptr;
-
-        auto stripExt = [](const std::string& p) -> std::string {
-            if (p.size() > 8 && p.compare(p.size() - 8, 8, ".pvr.ccz") == 0) {
-                return p.substr(0, p.size() - 8);
-            }
-            const size_t sl = p.find_last_of('/');
-            const size_t dt = p.find_last_of('.');
-            if (dt != std::string::npos && (sl == std::string::npos || dt > sl)) {
-                return p.substr(0, dt);
-            }
-            return p;
-        };
-
-        const std::string bases[4] = {
-            s,
-            (s.rfind("res/jsonUI/", 0) == 0 && s.size() > 11) ? s.substr(11) : std::string(),
-            (s.rfind("res/", 0) == 0 && s.size() > 4) ? s.substr(4) : std::string(),
-            (s.rfind("gameImage/", 0) == 0 && s.size() > 10) ? ("images/" + s.substr(10)) : std::string(),
-        };
         static const char* const kExts[] = {".pvr.ccz", ".pkm", ".png", ".webp", ".jpg", ".jpeg"};
-
-        for (const std::string& base : bases) {
-            if (base.empty()) continue;
+        for (const std::string& base : buildPrefixCandidates(rawName)) {
             for (const auto& f : diskFiles) {
                 if (f.key == base) return &f;
             }
-            const std::string stem = stripExt(base);
+            std::string stem = base;
+            if (stem.size() > 8 && stem.compare(stem.size() - 8, 8, ".pvr.ccz") == 0) {
+                stem.resize(stem.size() - 8);
+            } else {
+                const size_t sl = stem.find_last_of('/'), dt = stem.find_last_of('.');
+                if (dt != std::string::npos && (sl == std::string::npos || dt > sl)) stem.resize(dt);
+            }
             for (const char* ext : kExts) {
                 const std::string cand = stem + ext;
                 for (const auto& f : diskFiles) {
@@ -1893,6 +1823,17 @@ public:
         if (!nodes->containsObject(node)) nodes->addObject(node);
     }
 
+    static void drainTrackedArrayToSnapshot(Issue8Array* bucket, std::vector<Issue8Node*>& snapshot) {
+        if (!bucket || bucket->arr.empty()) return;
+        for (auto* obj : bucket->arr) {
+            if (auto* n = static_cast<Issue8Node*>(obj)) {
+                n->retain();
+                snapshot.push_back(n);
+            }
+        }
+        bucket->removeAllObjects();
+    }
+
     void removeChild(Issue8Node* child, bool cleanup = true) override {
         if (!child) return;
         child->retain();
@@ -1902,53 +1843,21 @@ public:
         child->release();
     }
 
-    virtual void removeNode(Issue8Node* node) {
-        if (!node) return;
-        node->retain();
-        Issue8Node::removeChild(node, true);
-        if (nodes) nodes->removeObject(node);
-        if (widgetChildren) widgetChildren->removeObject(node);
-        node->release();
-    }
+    virtual void removeNode(Issue8Node* node) { removeChild(node, true); }
 
     virtual void removeAllNodes() {
-        if (nodes && !nodes->arr.empty()) {
-            std::vector<Issue8Node*> snapshot;
-            snapshot.reserve(nodes->arr.size());
-            for (size_t i = 0; i < nodes->arr.size(); ++i) {
-                if (auto* pNode = static_cast<Issue8Node*>(nodes->arr[i])) {
-                    pNode->retain();
-                    snapshot.push_back(pNode);
-                }
-            }
-            nodes->removeAllObjects();
-            for (Issue8Node* n : snapshot) {
-                Issue8Node::removeChild(n, true);
-                n->release();
-            }
+        std::vector<Issue8Node*> snapshot;
+        drainTrackedArrayToSnapshot(nodes, snapshot);
+        for (Issue8Node* n : snapshot) {
+            Issue8Node::removeChild(n, true);
+            n->release();
         }
     }
 
     void removeAllChildrenWithCleanup(bool cleanup = true) override {
         std::vector<Issue8Node*> snapshot;
-        if (widgetChildren && !widgetChildren->arr.empty()) {
-            for (auto* obj : widgetChildren->arr) {
-                if (auto* c = static_cast<Issue8Node*>(obj)) {
-                    c->retain();
-                    snapshot.push_back(c);
-                }
-            }
-            widgetChildren->removeAllObjects();
-        }
-        if (nodes && !nodes->arr.empty()) {
-            for (auto* obj : nodes->arr) {
-                if (auto* n = static_cast<Issue8Node*>(obj)) {
-                    n->retain();
-                    snapshot.push_back(n);
-                }
-            }
-            nodes->removeAllObjects();
-        }
+        drainTrackedArrayToSnapshot(widgetChildren, snapshot);
+        drainTrackedArrayToSnapshot(nodes, snapshot);
         for (Issue8Node* item : snapshot) {
             Issue8Node::removeChild(item, cleanup);
             item->release();
@@ -2649,19 +2558,12 @@ bool testStarburstSeamAndGlowRingOffscreenPixelVerification() {
 // ============================================================================
 
 bool testLayer1CConnectionProtectedLuaCallbacks() {
-    const fs::path tempRoot = fs::temp_directory_path() / "kestrel_net_layer1_test";
-    std::error_code ec;
-    fs::remove_all(tempRoot, ec);
+    ScopedDiagnosticsSession diag("kestrel_net_layer1_test", "kestrel_layer1");
+    REQUIRE_TRUE(diag.installed);
 
-    gclient::diagnostics::DiagnosticsConfig cfg;
-    cfg.logDirectory = (tempRoot / "logs").u8string();
-    cfg.dumpDirectory = (tempRoot / "dumps").u8string();
-    cfg.appName = "kestrel_layer1";
-    REQUIRE_TRUE(gclient::diagnostics::CrashAndTelemetry::install(cfg));
-
-    lua_State* L = luaL_newstate();
+    ScopedLuaVm vm;
+    lua_State* L = vm.L;
     REQUIRE_TRUE(L != nullptr);
-    luaL_openlibs(L);
     gclient::diagnostics::CrashAndTelemetry::installLuaHooks(L);
 
     REQUIRE_EQ(luaL_dostring(L, R"LUA(
@@ -2702,30 +2604,17 @@ bool testLayer1CConnectionProtectedLuaCallbacks() {
         gclient::net::WinsockSession ws;
         REQUIRE_TRUE(ws.isInitialized());
 
-        SOCKET listenSock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        REQUIRE_TRUE(listenSock != INVALID_SOCKET);
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = htons(0);
-        REQUIRE_EQ(::bind(listenSock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)), 0);
-        REQUIRE_EQ(::listen(listenSock, 4), 0);
-#ifdef _WIN32
-        int addrLen = sizeof(addr);
-#else
-        socklen_t addrLen = sizeof(addr);
-#endif
-        REQUIRE_EQ(::getsockname(listenSock, reinterpret_cast<sockaddr*>(&addr), &addrLen), 0);
-        const unsigned int port = ntohs(addr.sin_port);
+        LoopbackTcpListener listener;
+        REQUIRE_TRUE(listener.bindEphemeral(4));
 
         auto conn = std::make_unique<gclient::net::CConnection>();
         conn->setStandaloneLuaState(L);
         conn->registerBodyFunc(bodyRef);
         conn->registerCloseFunc(closeRef);
-        REQUIRE_TRUE(conn->connect("127.0.0.1", port));
+        REQUIRE_TRUE(conn->connect("127.0.0.1", listener.port));
 
-        SOCKET serverClient = ::accept(listenSock, nullptr, nullptr);
-        REQUIRE_TRUE(serverClient != INVALID_SOCKET);
+        ScopedSocket serverClient = listener.acceptOne();
+        REQUIRE_TRUE(serverClient.fd != INVALID_SOCKET);
 
         auto makeRawFrame = [](const std::string& payload) {
             std::string f(8 + payload.size(), '\0');
@@ -2735,7 +2624,7 @@ bool testLayer1CConnectionProtectedLuaCallbacks() {
             return f;
         };
         const std::string wire = makeRawFrame("CRASH_PACKET_1") + makeRawFrame("VALID_PACKET_2");
-        REQUIRE_TRUE(::send(serverClient, wire.data(), static_cast<int>(wire.size()), 0) == static_cast<int>(wire.size()));
+        REQUIRE_TRUE(::send(serverClient.fd, wire.data(), static_cast<int>(wire.size()), 0) == static_cast<int>(wire.size()));
 
         auto* netMgr = gclient::net::CNetwork::sharedNetwork();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -2767,13 +2656,6 @@ bool testLayer1CConnectionProtectedLuaCallbacks() {
 
         conn.reset();
         gclient::net::CNetwork::destroySharedNetwork();
-#ifdef _WIN32
-        ::closesocket(serverClient);
-        ::closesocket(listenSock);
-#else
-        ::close(serverClient);
-        ::close(listenSock);
-#endif
     }
 
     // Subcase 1B: Fallback to debug.traceback when __GCLIENT_NATIVE_TRACKBACK__ is absent
@@ -2788,17 +2670,14 @@ bool testLayer1CConnectionProtectedLuaCallbacks() {
         REQUIRE_EQ(lua_gettop(L), savedTop);
     }
 
-    if (luaL_dostring(L, R"LUA(
+    REQUIRE_TRUE(vm.execChecked(R"LUA(
         assert(#_G.__CAPTURED_CCLUALOG >= 3, "Expected >= 3 CCLuaLog entries, got " .. tostring(#_G.__CAPTURED_CCLUALOG))
         assert(string.find(_G.__CAPTURED_CCLUALOG[1], "nilTbl", 1, true) ~= nil, "log1=" .. tostring(_G.__CAPTURED_CCLUALOG[1]))
         assert(string.find(_G.__CAPTURED_CCLUALOG[1], "stack traceback:", 1, true) ~= nil, "tb1=" .. tostring(_G.__CAPTURED_CCLUALOG[1]))
         assert(string.find(_G.__CAPTURED_CCLUALOG[2], "nilConn", 1, true) ~= nil, "log2=" .. tostring(_G.__CAPTURED_CCLUALOG[2]))
         assert(string.find(_G.__CAPTURED_CCLUALOG[3], "nilTbl", 1, true) ~= nil, "log3=" .. tostring(_G.__CAPTURED_CCLUALOG[3]))
         assert(string.find(_G.__CAPTURED_CCLUALOG[3], "stack traceback:", 1, true) ~= nil, "tb3=" .. tostring(_G.__CAPTURED_CCLUALOG[3]))
-    )LUA") != 0) {
-        std::fprintf(stderr, "[Layer1 Assert Err] %s\n", lua_tostring(L, -1));
-        return false;
-    }
+    )LUA", "Layer1 Assert Err"));
 
     REQUIRE_EQ(lua_gettop(L), savedTop);
     REQUIRE_EQ(static_cast<int>(lua_tointeger(L, 1)), 12345);
@@ -2808,9 +2687,6 @@ bool testLayer1CConnectionProtectedLuaCallbacks() {
     luaL_unref(L, LUA_REGISTRYINDEX, bodyRef);
     luaL_unref(L, LUA_REGISTRYINDEX, closeRef);
     gclient::diagnostics::CrashAndTelemetry::clearLuaState();
-    lua_close(L);
-    gclient::diagnostics::CrashAndTelemetry::shutdown();
-    fs::remove_all(tempRoot, ec);
     return true;
 }
 
@@ -2821,13 +2697,9 @@ bool testNetworkDataLoadingResilienceAndBindableDataRecovery() {
 
     // Layer 2: Test InstallNetworkResilienceHookImpl against clean APK-equivalent modules + real C++ Amf3Module
     {
-        lua_State* L = luaL_newstate();
-        REQUIRE_TRUE(L != nullptr);
-        luaL_openlibs(L);
-        luaopen_amf3_extensions(L);
-
-        // Install C++-injected Lua resilience hook BEFORE requiring Network / BindableData / BaseProxy
-        gclient::bindings::InstallNetworkResilienceHookImpl(L);
+        ScopedLuaVm vm(true);
+        REQUIRE_TRUE(vm.L != nullptr);
+        gclient::bindings::InstallNetworkResilienceHookImpl(vm.L);
 
         static const char* const kCleanHarnessChunks[] = {
             R"LUA(
@@ -3333,16 +3205,8 @@ bool testNetworkDataLoadingResilienceAndBindableDataRecovery() {
         };
 
         std::string fullTestScript;
-        for (const char* part : kCleanHarnessChunks) {
-            fullTestScript.append(part);
-        }
-        if (luaL_dostring(L, fullTestScript.c_str()) != 0) {
-            const char* err = lua_tostring(L, -1);
-            std::fprintf(stderr, "[LuaCleanHarness FAIL] %s\n", err ? err : "(null)");
-            lua_close(L);
-            return false;
-        }
-        lua_close(L);
+        for (const char* part : kCleanHarnessChunks) fullTestScript.append(part);
+        REQUIRE_TRUE(vm.execChecked(fullTestScript.c_str(), "LuaCleanHarness FAIL"));
     }
 
     // Optional integration check against real decrypted_scripts (V12/V15) if present on local test machine
@@ -3350,11 +3214,9 @@ bool testNetworkDataLoadingResilienceAndBindableDataRecovery() {
     if (fs::exists(realScriptsDir / "system/Network.lua") &&
         fs::exists(realScriptsDir / "core/BaseProxy.lua") &&
         fs::exists(realScriptsDir / "core/BindableData.lua")) {
-        lua_State* L = luaL_newstate();
-        REQUIRE_TRUE(L != nullptr);
-        luaL_openlibs(L);
-        luaopen_amf3_extensions(L);
-        gclient::bindings::InstallNetworkResilienceHookImpl(L);
+        ScopedLuaVm vm(true);
+        REQUIRE_TRUE(vm.L != nullptr);
+        gclient::bindings::InstallNetworkResilienceHookImpl(vm.L);
 
         const std::string bootRealScripts =
             "package.path = '" + realScriptsDir.string() + "/?.lua;' .. package.path\n" +
@@ -3437,13 +3299,7 @@ bool testNetworkDataLoadingResilienceAndBindableDataRecovery() {
                 assert(g.loadingManager._reconnectLoading ~= nil and g.loadingManager._reconnectLoading.shown == true)
             )LUA";
 
-        if (luaL_dostring(L, bootRealScripts.c_str()) != 0) {
-            const char* err = lua_tostring(L, -1);
-            std::fprintf(stderr, "[RealDecryptedScripts V15 FAIL] %s\n", err ? err : "(null)");
-            lua_close(L);
-            return false;
-        }
-        lua_close(L);
+        REQUIRE_TRUE(vm.execChecked(bootRealScripts.c_str(), "RealDecryptedScripts V15 FAIL"));
     }
 
     return true;
@@ -3478,10 +3334,9 @@ bool testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim() {
     REQUIRE_TRUE(plat != nullptr);
     plat->setAuthProvider(std::make_shared<bt::LocalStubAuthProvider>());
 
-    lua_State* L = luaL_newstate();
+    ScopedLuaVm payVm(true);
+    lua_State* L = payVm.L;
     REQUIRE_TRUE(L != nullptr);
-    luaL_openlibs(L);
-    luaopen_amf3_extensions(L);
     REQUIRE_EQ(tolua_Platform_open(L), 1);
     lua_pop(L, 1);
     gclient::bindings::InstallNetworkResilienceHookImpl(L);
@@ -3505,16 +3360,12 @@ bool testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim() {
         end
         Platform:getInstance():initSDK("{}", sdkHandler)
     )LUA";
-    if (luaL_dostring(L, partAScript) != 0) {
-        std::fprintf(stderr, "[PartA init FAIL] %s\n", lua_tostring(L, -1));
-        lua_close(L);
-        return false;
-    }
+    REQUIRE_TRUE(payVm.execChecked(partAScript, "PartA init FAIL"));
     plat->tickLoop(); // drains kInit
     plat->pay("{\"ProductId\":\"1001\"}");
     plat->tickLoop(); // drains kPay
 
-    const char* partAVerify = R"LUA(
+    REQUIRE_TRUE(payVm.execChecked(R"LUA(
         assert(_G.__MSG_BOX_CALLS == 0, "Platform::pay must NOT trigger blocking CCMessageBox!")
         local sawPayOk = false
         for _, item in ipairs(_G.__SDK_EVENTS) do
@@ -3523,12 +3374,7 @@ bool testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim() {
             end
         end
         assert(sawPayOk, "Expected kPay callback with errornu='0'!")
-    )LUA";
-    if (luaL_dostring(L, partAVerify) != 0) {
-        std::fprintf(stderr, "[PartA verify FAIL] %s\n", lua_tostring(L, -1));
-        lua_close(L);
-        return false;
-    }
+    )LUA", "PartA verify FAIL"));
 
     // 2. Verify VNG Platform Key Normalization (SDKUtil.getPL + userdata.platform),
     //    PayReader:getRowById(nil / VN ID pairs / synthetic fallback),
@@ -3784,64 +3630,36 @@ bool testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim() {
         g.SDKUtil.pay("1603", "5000", "04", "PostReloadBuy", "VND", "", {4, 2, 1603})
         assert(#sentNormal == 4 and sentNormal[4].method == "pay.instantBuy" and sentNormal[4].args.product_name == "PostReloadBuy")
     )LUA";
-    if (luaL_dostring(L, partBAndCScript) != 0) {
-        std::fprintf(stderr, "[PartBC FAIL] %s\n", lua_tostring(L, -1));
-        lua_close(L);
-        return false;
-    }
+    REQUIRE_TRUE(payVm.execChecked(partBAndCScript, "PartBC FAIL"));
     plat->tickLoop();
-    lua_close(L);
 
     // 4. Loopback TCP + AMF3 + LCPacket wire verification of SDKUtil.pay -> pay.instantBuy!
-    SOCKET listenSock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    REQUIRE_TRUE(listenSock != INVALID_SOCKET);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(0);
-    REQUIRE_EQ(::bind(listenSock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)), 0);
-    REQUIRE_EQ(::listen(listenSock, 2), 0);
-#ifdef _WIN32
-    int addrLen = sizeof(addr);
-#else
-    socklen_t addrLen = sizeof(addr);
-#endif
-    REQUIRE_EQ(::getsockname(listenSock, reinterpret_cast<sockaddr*>(&addr), &addrLen), 0);
-    const unsigned int port = ntohs(addr.sin_port);
+    LoopbackTcpListener wireListener;
+    REQUIRE_TRUE(wireListener.bindEphemeral(2));
 
     std::string capturedAmfPayload;
-    std::thread wireServer([listenSock, &capturedAmfPayload]() {
-        SOCKET client = ::accept(listenSock, nullptr, nullptr);
-        if (client != INVALID_SOCKET) {
+    std::thread wireServer([&wireListener, &capturedAmfPayload]() {
+        ScopedSocket client = wireListener.acceptOne();
+        if (client.fd != INVALID_SOCKET) {
             char buf[2048] = {};
-            const auto n = ::recv(client, buf, sizeof(buf), 0);
+            const auto n = ::recv(client.fd, buf, sizeof(buf), 0);
             if (n >= static_cast<int>(LCPacket::kTotalHeaderSize)) {
                 LCPacket::DecodedPacket pkt{};
                 if (LCPacket::parseLCPacket(buf, static_cast<size_t>(n), pkt)) {
                     capturedAmfPayload = pkt.payload;
                 }
             }
-#ifdef _WIN32
-            ::closesocket(client);
-#else
-            ::close(client);
-#endif
         }
-#ifdef _WIN32
-        ::closesocket(listenSock);
-#else
-        ::close(listenSock);
-#endif
+        wireListener.listenSock.reset();
     });
 
     CNetwork* net = CNetwork::sharedNetwork();
     CConnection* conn = net->newConnection();
-    REQUIRE_TRUE(conn->connect("127.0.0.1", port));
+    REQUIRE_TRUE(conn->connect("127.0.0.1", wireListener.port));
 
-    lua_State* wireL = luaL_newstate();
+    ScopedLuaVm wireVm(true);
+    lua_State* wireL = wireVm.L;
     REQUIRE_TRUE(wireL != nullptr);
-    luaL_openlibs(wireL);
-    luaopen_amf3_extensions(wireL);
     gclient::bindings::InstallNetworkResilienceHookImpl(wireL);
 
     lua_pushlightuserdata(wireL, conn);
@@ -3910,7 +3728,6 @@ bool testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim() {
         assert(env.args.pay_row.id == 1703 and env.args.pay_row.consume_money == 5000)
     )LUA";
     REQUIRE_EQ(luaL_dostring(wireL, verifyWireLua), 0);
-    lua_close(wireL);
     std::error_code cleanEc;
     fs::remove("device_uuid.txt", cleanEc);
     fs::remove("sdk_cookies.txt", cleanEc);
@@ -3920,49 +3737,24 @@ bool testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim() {
 } // namespace
 
 int main() {
-    std::printf("======================================================================\n");
-    std::printf("Kestrel Canvas Win32 C++17 Modernization & Startup Regression Suite\n");
-    std::printf("======================================================================\n");
-
-    runTestCase("01_StartupLifecycle_PrematureWmSize_And_StormDeduplication",
-                testStartupLifecycleAndPrematureWmSize);
-    runTestCase("02_MinimizedLaunch_And_FailedPartialInitRollback",
-                testMinimizedLaunchAndFailedInitRollback);
-    runTestCase("03_CCLabelAtlas_ZeroDivideGuard_And_DeferredTextureRecovery",
-                testCCLabelAtlasZeroGuardAndDeferredRecovery);
-    runTestCase("04_32Bit_FntAndZip_IntegerOverflowContracts",
-                testIntegerOverflowArithmeticContracts);
-    runTestCase("05_CrashAndTelemetry_NanInfSortStrictWeakOrdering_And_LuaHooks",
-                testCrashAndTelemetryNanSortAndLuaHooks);
-    runTestCase("06_BtDecryptHook_DeepCopiedKeyLifetime_And_PathNormalization",
-                testBtDecryptKeyLifetimeAndPathNormalization);
-    runTestCase("07_AtomicHotUpdater_UnicodePaths_Rollback_And_TornManifestRecovery",
-                testUnicodeAtomicHotUpdaterAndTornManifestRecovery);
-    runTestCase("08_SQLite3_ReadOnlyUri_UnicodeAndSpecialCharPaths",
-                testSqliteReadOnlyUnicodeUri);
-    runTestCase("09_LCPacket_CStringOverload_Md5BeforeInflate_And_ZipBombCap",
-                testLCPacketFramingAndOverloadSafety);
-    runTestCase("10_CNetwork_LoopbackFraming_ReentrantDoRead_And_DestroyUafBarrier",
-                testCNetworkLoopbackReentrantAndDestroySafety);
-    runTestCase("11_XmlbBitCache_RealBinaryLayout_StickyBlend_And_ColorClamp",
-                testXmlbBitCacheBinaryLayoutStickyBlendAndColorClamp);
-    runTestCase("12_PlistbLoader_BinaryParse_RotatedFrames_And_SkinSubRectUvClamp",
-                testPlistbParseRotatedFramesAndSkinSubRectUvClamp);
-    runTestCase("13_PvrRgba8Unpack_PremulAlpha_And_BlendPipeline",
-                testPvrRgba8UnpackPremulAlphaAndBlendPipeline);
-    runTestCase("14_StarburstSeam_And_GlowRing_OffscreenPixelVerification",
-                testStarburstSeamAndGlowRingOffscreenPixelVerification);
-    runTestCase("15_Issue8_GainItemPanel_50PlusLifecycle_GetNodesSync_And_ImageViewIcons",
-                testIssue8GainItemPanelLifecycleAndImageViewRendering);
-    runTestCase("16_Win32MouseRouting_DpiViewport_And_FuncMenuTouchGroupCycles",
-                testWin32MouseRoutingDpiViewportAndFuncMenuCycles);
-    runTestCase("17_NetworkAndDataLoading_CrashResilience_And_BindableDataRecovery",
-                testNetworkDataLoadingResilienceAndBindableDataRecovery);
-    runTestCase("18_InstantBuy_VngPlatformNormalization_And_BtPlatformPayShim",
-                testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim);
-
-    std::printf("======================================================================\n");
-    std::printf("Summary: %d passed, %d failed\n", g_passedTests, g_failedTests);
-    std::printf("======================================================================\n");
-    return (g_failedTests == 0) ? 0 : 1;
+    gclient::test::TestSuite suite("Kestrel Canvas Win32 C++17 Modernization & Startup Regression Suite");
+    suite.run("01_StartupLifecycle_PrematureWmSize_And_StormDeduplication", testStartupLifecycleAndPrematureWmSize);
+    suite.run("02_MinimizedLaunch_And_FailedPartialInitRollback", testMinimizedLaunchAndFailedInitRollback);
+    suite.run("03_CCLabelAtlas_ZeroDivideGuard_And_DeferredTextureRecovery", testCCLabelAtlasZeroGuardAndDeferredRecovery);
+    suite.run("04_32Bit_FntAndZip_IntegerOverflowContracts", testIntegerOverflowArithmeticContracts);
+    suite.run("05_CrashAndTelemetry_NanInfSortStrictWeakOrdering_And_LuaHooks", testCrashAndTelemetryNanSortAndLuaHooks);
+    suite.run("06_BtDecryptHook_DeepCopiedKeyLifetime_And_PathNormalization", testBtDecryptKeyLifetimeAndPathNormalization);
+    suite.run("07_AtomicHotUpdater_UnicodePaths_Rollback_And_TornManifestRecovery", testUnicodeAtomicHotUpdaterAndTornManifestRecovery);
+    suite.run("08_SQLite3_ReadOnlyUri_UnicodeAndSpecialCharPaths", testSqliteReadOnlyUnicodeUri);
+    suite.run("09_LCPacket_CStringOverload_Md5BeforeInflate_And_ZipBombCap", testLCPacketFramingAndOverloadSafety);
+    suite.run("10_CNetwork_LoopbackFraming_ReentrantDoRead_And_DestroyUafBarrier", testCNetworkLoopbackReentrantAndDestroySafety);
+    suite.run("11_XmlbBitCache_RealBinaryLayout_StickyBlend_And_ColorClamp", testXmlbBitCacheBinaryLayoutStickyBlendAndColorClamp);
+    suite.run("12_PlistbLoader_BinaryParse_RotatedFrames_And_SkinSubRectUvClamp", testPlistbParseRotatedFramesAndSkinSubRectUvClamp);
+    suite.run("13_PvrRgba8Unpack_PremulAlpha_And_BlendPipeline", testPvrRgba8UnpackPremulAlphaAndBlendPipeline);
+    suite.run("14_StarburstSeam_And_GlowRing_OffscreenPixelVerification", testStarburstSeamAndGlowRingOffscreenPixelVerification);
+    suite.run("15_Issue8_GainItemPanel_50PlusLifecycle_GetNodesSync_And_ImageViewIcons", testIssue8GainItemPanelLifecycleAndImageViewRendering);
+    suite.run("16_Win32MouseRouting_DpiViewport_And_FuncMenuTouchGroupCycles", testWin32MouseRoutingDpiViewportAndFuncMenuCycles);
+    suite.run("17_NetworkAndDataLoading_CrashResilience_And_BindableDataRecovery", testNetworkDataLoadingResilienceAndBindableDataRecovery);
+    suite.run("18_InstantBuy_VngPlatformNormalization_And_BtPlatformPayShim", testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim);
+    return suite.finishWithBanner();
 }

@@ -1,14 +1,10 @@
 cmake_minimum_required(VERSION 3.25...4.1)
 
-if(POLICY CMP0091)
-    cmake_policy(SET CMP0091 NEW)
-endif()
-if(POLICY CMP0141)
-    cmake_policy(SET CMP0141 NEW)
-endif()
-if(POLICY CMP0079)
-    cmake_policy(SET CMP0079 NEW)
-endif()
+foreach(_pol IN ITEMS CMP0091 CMP0141 CMP0079)
+    if(POLICY ${_pol})
+        cmake_policy(SET ${_pol} NEW)
+    endif()
+endforeach()
 
 # Enforce consistent dynamic CRT (/MD in Release, /MDd in Debug) across all CMake targets
 # BEFORE project() creates compiler probes or subtargets.
@@ -20,7 +16,6 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL" CACHE 
 # ==============================================================================
 # APP_NAME MUST match the executable target name expected by ax_setup_app_config()
 set(APP_NAME gclient)
-
 set(_AX_LUA_PROJ TRUE)
 set(_AX_USE_PREBUILT FALSE)
 
@@ -29,19 +24,14 @@ set(_AX_USE_PREBUILT FALSE)
 set(AX_USE_LUAJIT ON CACHE BOOL "Use 64-bit LuaJIT 2.1 instead of Lua 5.4" FORCE)
 
 # Enable required Axmol extensions (axlua requires GUI, CocoStudio, Spine, and FairyGUI)
-set(AX_EXT_HINT ON CACHE BOOL "Enable Axmol extensions" FORCE)
-set(AX_ENABLE_EXT_LUA ON CACHE BOOL "Build Axmol Lua bindings" FORCE)
-set(AX_ENABLE_EXT_GUI ON CACHE BOOL "Build Axmol GUI extension" FORCE)
-set(AX_ENABLE_EXT_COCOSTUDIO ON CACHE BOOL "Build Axmol CocoStudio extension" FORCE)
-set(AX_ENABLE_EXT_SPINE ON CACHE BOOL "Build Axmol Spine 4.2 extension" FORCE)
-set(AX_ENABLE_EXT_FAIRYGUI ON CACHE BOOL "Build Axmol FairyGUI extension" FORCE)
+foreach(_ext_on IN ITEMS AX_EXT_HINT AX_ENABLE_EXT_LUA AX_ENABLE_EXT_GUI AX_ENABLE_EXT_COCOSTUDIO AX_ENABLE_EXT_SPINE AX_ENABLE_EXT_FAIRYGUI)
+    set(${_ext_on} ON CACHE BOOL "Enable ${_ext_on}" FORCE)
+endforeach()
 
 # Disable optional heavy desktop extras not required by Kestrel Canvas
-set(AX_ENABLE_EXT_IMGUI OFF CACHE BOOL "Disable ImGui extension" FORCE)
-set(AX_ENABLE_EXT_INSPECTOR OFF CACHE BOOL "Disable Inspector extension" FORCE)
-set(AX_ENABLE_MSEDGE_WEBVIEW2 OFF CACHE BOOL "Disable Edge WebView2 NuGet dependency" FORCE)
-set(AX_ENABLE_MFMEDIA OFF CACHE BOOL "Disable Media Foundation video player" FORCE)
-set(AX_WITH_DOCTEST OFF CACHE BOOL "Disable Axmol doctest" FORCE)
+foreach(_ext_off IN ITEMS AX_ENABLE_EXT_IMGUI AX_ENABLE_EXT_INSPECTOR AX_ENABLE_MSEDGE_WEBVIEW2 AX_ENABLE_MFMEDIA AX_WITH_DOCTEST)
+    set(${_ext_off} OFF CACHE BOOL "Disable ${_ext_off}" FORCE)
+endforeach()
 
 project(${APP_NAME}
     VERSION 2.0.0
@@ -52,7 +42,6 @@ project(${APP_NAME}
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
@@ -62,6 +51,11 @@ option(GCLIENT_ENABLE_LUAPROFILER "Register optional luaopen_luaprofiler binding
 option(GCLIENT_BUILD_TESTS "Build unit, LuaJIT 2.1 ABI, and regression test targets (CTest)" OFF)
 option(GCLIENT_ENABLE_ASAN "Enable MSVC AddressSanitizer (/fsanitize=address) diagnostic build" OFF)
 option(GCLIENT_SHIPPING_RELEASE "Enforce strict shipping Release hygiene (forbids ASan/Debug CRTs)" OFF)
+
+# Optional compile-time bootstrap defaults (overridden at runtime by CLI / KESTREL_* / COBALT_* env vars)
+set(KESTREL_DEFAULT_MAPI_URL "" CACHE STRING "Optional default MAPI endpoint URL baked into AppConfig")
+set(KESTREL_DEFAULT_GAME_HOST "" CACHE STRING "Optional default game relay/server host baked into AppConfig")
+set(KESTREL_DEFAULT_GAME_PORT "0" CACHE STRING "Optional default game relay/server port baked into AppConfig")
 
 if(WIN32 AND MSVC)
     if(GCLIENT_ENFORCE_WIN64 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -197,10 +191,7 @@ target_include_directories(gclient_proto SYSTEM PUBLIC "${GCLIENT_PROTO_GEN_DIR}
 target_link_libraries(gclient_proto PUBLIC protobuf::libprotobuf)
 if(MSVC)
     target_compile_options(gclient_proto PRIVATE
-        /W0
-        /FS
-        /utf-8
-        /Zc:char8_t-
+        /W0 /FS /utf-8 /Zc:char8_t-
         $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/Zi /O2>
     )
 else()
@@ -208,13 +199,20 @@ else()
 endif()
 
 # ==============================================================================
-# 5. Common Axmol Interface & Compiler Settings
+# 5. Common Axmol Interface, Shared `src/common` Headers & Compiler Settings
 # ==============================================================================
-add_library(gclient_axmol_interface INTERFACE)
-target_include_directories(gclient_axmol_interface INTERFACE
+set(GCLIENT_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/common"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compat/include"
 )
+file(GLOB GCLIENT_COMMON_HEADERS CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/*.hpp"
+)
+
+add_library(gclient_axmol_interface INTERFACE)
+target_include_directories(gclient_axmol_interface INTERFACE ${GCLIENT_INCLUDE_DIRS})
 target_include_directories(gclient_axmol_interface SYSTEM INTERFACE
     "${_AX_ROOT}"
     "${_AX_ROOT}/core"
@@ -265,17 +263,25 @@ target_compile_definitions(gclient_build_options INTERFACE
     $<$<BOOL:${GCLIENT_ENABLE_LUAPROFILER}>:GCLIENT_ENABLE_LUAPROFILER=1>
 )
 
+if(NOT KESTREL_DEFAULT_MAPI_URL STREQUAL "")
+    target_compile_definitions(gclient_build_options INTERFACE
+        KESTREL_DEFAULT_MAPI_URL="${KESTREL_DEFAULT_MAPI_URL}"
+    )
+endif()
+if(NOT KESTREL_DEFAULT_GAME_HOST STREQUAL "")
+    target_compile_definitions(gclient_build_options INTERFACE
+        KESTREL_DEFAULT_GAME_HOST="${KESTREL_DEFAULT_GAME_HOST}"
+    )
+endif()
+if(KESTREL_DEFAULT_GAME_PORT GREATER 0)
+    target_compile_definitions(gclient_build_options INTERFACE
+        KESTREL_DEFAULT_GAME_PORT=${KESTREL_DEFAULT_GAME_PORT}
+    )
+endif()
+
 if(MSVC)
     target_compile_options(gclient_build_options INTERFACE
-        /W3
-        /MP
-        /FS
-        /utf-8
-        /EHsc
-        /permissive-
-        /Zc:__cplusplus
-        /Zc:char8_t-
-        /bigobj
+        /W3 /MP /FS /utf-8 /EHsc /permissive- /Zc:__cplusplus /Zc:char8_t- /bigobj
         $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/Zi /O2 /Oi>
     )
     if(GCLIENT_ENABLE_ASAN)
@@ -304,18 +310,15 @@ endfunction()
 add_library(gclient_diagnostics STATIC
     src/diagnostics/CrashAndTelemetry.h
     src/diagnostics/CrashAndTelemetry.cpp
+    ${GCLIENT_COMMON_HEADERS}
 )
-target_include_directories(gclient_diagnostics PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/compat/include"
-)
+target_include_directories(gclient_diagnostics PUBLIC ${GCLIENT_INCLUDE_DIRS})
 target_link_libraries(gclient_diagnostics
     PUBLIC
         gclient_build_options
         gclient_axmol_interface
     PRIVATE
-        $<$<PLATFORM_ID:Windows>:dbghelp>
-        $<$<PLATFORM_ID:Windows>:psapi>
+        $<$<PLATFORM_ID:Windows>:dbghelp psapi>
 )
 
 add_library(gclient_compat STATIC
@@ -323,11 +326,9 @@ add_library(gclient_compat STATIC
     src/compat/Axmol226Compat.cpp
     src/compat/Lua226CompatShim.h
     src/compat/Lua226CompatShim.cpp
+    ${GCLIENT_COMMON_HEADERS}
 )
-target_include_directories(gclient_compat PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/compat/include"
-)
+target_include_directories(gclient_compat PUBLIC ${GCLIENT_INCLUDE_DIRS})
 target_link_libraries(gclient_compat PUBLIC
     gclient_build_options
     gclient_axmol_interface
@@ -344,12 +345,8 @@ function(gclient_add_module MODULE_NAME SUBDIR)
         "${mod_dir}/*.hpp"
     )
 
-    add_library(${MODULE_NAME} STATIC ${mod_sources})
-    target_include_directories(${MODULE_NAME} PUBLIC
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/compat/include"
-        "${mod_dir}"
-    )
+    add_library(${MODULE_NAME} STATIC ${mod_sources} ${GCLIENT_COMMON_HEADERS})
+    target_include_directories(${MODULE_NAME} PUBLIC ${GCLIENT_INCLUDE_DIRS} "${mod_dir}")
     target_link_libraries(${MODULE_NAME} PUBLIC
         gclient_build_options
         gclient_axmol_interface
@@ -361,17 +358,8 @@ function(gclient_add_module MODULE_NAME SUBDIR)
         OpenSSL::SSL
         OpenSSL::Crypto
         ZLIB::ZLIB
+        $<$<PLATFORM_ID:Windows>:ws2_32 bcrypt crypt32 user32 gdi32 advapi32>
     )
-    if(WIN32)
-        target_link_libraries(${MODULE_NAME} PUBLIC
-            ws2_32
-            bcrypt
-            crypt32
-            user32
-            gdi32
-            advapi32
-        )
-    endif()
 endfunction()
 
 gclient_add_module(gclient_assets   assets)
@@ -394,25 +382,21 @@ target_link_libraries(gclient_platform PUBLIC gclient_assets)
 # ==============================================================================
 # 7. Main Windows x64 Executable Target (GCLIENT.exe + GCLIENT.pdb + axslc)
 # ==============================================================================
+set(GCLIENT_APP_SOURCES
+    src/main.cpp
+    src/AppDelegate.h
+    src/AppDelegate.cpp
+    ${GCLIENT_COMMON_HEADERS}
+)
 if(WIN32)
-    add_executable(${APP_NAME} WIN32
-        src/main.cpp
-        src/AppDelegate.h
-        src/AppDelegate.cpp
-    )
+    add_executable(${APP_NAME} WIN32 ${GCLIENT_APP_SOURCES})
 else()
-    add_executable(${APP_NAME}
-        src/main.cpp
-        src/AppDelegate.h
-        src/AppDelegate.cpp
-    )
+    add_executable(${APP_NAME} ${GCLIENT_APP_SOURCES})
 endif()
 
-target_include_directories(${APP_NAME} PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/compat/include"
-)
+target_include_directories(${APP_NAME} PRIVATE ${GCLIENT_INCLUDE_DIRS})
 
+# Plain target_link_libraries signature MUST be retained for ax_setup_app_config() compatibility (CMP0023)
 target_link_libraries(${APP_NAME}
     gclient_build_options
     gclient_bindings
@@ -433,9 +417,7 @@ target_link_libraries(${APP_NAME}
 # Configure Axmol app layout (bin/gclient/<Config>, /STACK:4194304, /SUBSYSTEM:WINDOWS, axslc shaders)
 ax_setup_app_config(${APP_NAME})
 
-set_target_properties(${APP_NAME} PROPERTIES
-    OUTPUT_NAME "GCLIENT"
-)
+set_target_properties(${APP_NAME} PROPERTIES OUTPUT_NAME "GCLIENT")
 gclient_apply_exe_link_options(${APP_NAME})
 
 if(WINDOWS AND NOT _AX_USE_PREBUILT)
@@ -462,9 +444,45 @@ if(GCLIENT_BUILD_TESTS)
         endif()
     endfunction()
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_win32_regression.cpp")
-        add_executable(gclient_win32_regression_tests
-            tests/test_win32_regression.cpp
+    function(gclient_add_cpp_test TARGET_NAME)
+        cmake_parse_arguments(TEST "" "MAIN_SOURCE" "SOURCES;DEFINITIONS;LIBS;WIN32_LIBS;TEST_ARGS" ${ARGN})
+        if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${TEST_MAIN_SOURCE}")
+            return()
+        endif()
+
+        add_executable(${TARGET_NAME}
+            "${TEST_MAIN_SOURCE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/TestHarness.h"
+            ${GCLIENT_COMMON_HEADERS}
+            ${TEST_SOURCES}
+        )
+        target_compile_features(${TARGET_NAME} PRIVATE cxx_std_20)
+        target_include_directories(${TARGET_NAME} PRIVATE
+            ${GCLIENT_INCLUDE_DIRS}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+        )
+        target_compile_definitions(${TARGET_NAME} PRIVATE
+            ${TEST_DEFINITIONS}
+            $<$<PLATFORM_ID:Windows>:WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS>
+        )
+        target_link_libraries(${TARGET_NAME} PRIVATE
+            ${TEST_LIBS}
+            $<$<PLATFORM_ID:Windows>:${TEST_WIN32_LIBS}>
+            $<$<NOT:$<PLATFORM_ID:Windows>>:pthread dl>
+        )
+        if(MSVC)
+            target_compile_options(${TARGET_NAME} PRIVATE /W3 /utf-8 /EHsc /permissive- /Zc:char8_t- /FS /Zi)
+            gclient_apply_exe_link_options(${TARGET_NAME})
+        else()
+            target_compile_options(${TARGET_NAME} PRIVATE -fno-char8_t)
+        endif()
+        gclient_stage_test_runtime_dlls(${TARGET_NAME})
+        add_test(NAME ${TARGET_NAME} COMMAND ${TARGET_NAME} ${TEST_TEST_ARGS})
+    endfunction()
+
+    gclient_add_cpp_test(gclient_win32_regression_tests
+        MAIN_SOURCE tests/test_win32_regression.cpp
+        SOURCES
             src/assets/BtDecryptHook.cpp
             src/assets/PlistbLoader.cpp
             src/assets/XmlbArmatureLoader.cpp
@@ -477,102 +495,47 @@ if(GCLIENT_BUILD_TESTS)
             src/platform/tolua_Platform.cpp
             src/update/AtomicHotUpdater.cpp
             src/diagnostics/CrashAndTelemetry.cpp
-        )
-        target_compile_features(gclient_win32_regression_tests PRIVATE cxx_std_20)
-        target_include_directories(gclient_win32_regression_tests PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/compat/include"
-        )
-        target_compile_definitions(gclient_win32_regression_tests PRIVATE
+        DEFINITIONS
             GCLIENT_STANDALONE_BUILD=1
-            $<$<PLATFORM_ID:Windows>:WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS _WINSOCK_DEPRECATED_NO_WARNINGS>
-        )
-        target_link_libraries(gclient_win32_regression_tests PRIVATE
-            luajit
-            ZLIB::ZLIB
-            SQLite::SQLite3
-            CURL::libcurl
-            OpenSSL::SSL
-            OpenSSL::Crypto
-            $<$<PLATFORM_ID:Windows>:ws2_32 bcrypt crypt32 dbghelp psapi user32 gdi32 advapi32 shell32>
-            $<$<NOT:$<PLATFORM_ID:Windows>>:pthread dl>
-        )
-        if(MSVC)
-            target_compile_options(gclient_win32_regression_tests PRIVATE /W3 /utf-8 /EHsc /permissive- /Zc:char8_t- /FS /Zi)
-            gclient_apply_exe_link_options(gclient_win32_regression_tests)
-        else()
-            target_compile_options(gclient_win32_regression_tests PRIVATE -fno-char8_t)
-        endif()
-        gclient_stage_test_runtime_dlls(gclient_win32_regression_tests)
-        add_test(NAME gclient_win32_regression_tests COMMAND gclient_win32_regression_tests)
-    endif()
+            $<$<PLATFORM_ID:Windows>:_WINSOCK_DEPRECATED_NO_WARNINGS>
+        LIBS
+            luajit ZLIB::ZLIB SQLite::SQLite3 CURL::libcurl OpenSSL::SSL OpenSSL::Crypto
+        WIN32_LIBS
+            ws2_32 bcrypt crypt32 dbghelp psapi user32 gdi32 advapi32 shell32
+    )
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_luajit_abi.cpp")
-        add_executable(gclient_luajit_abi_tests
-            tests/test_luajit_abi.cpp
+    gclient_add_cpp_test(gclient_luajit_abi_tests
+        MAIN_SOURCE tests/test_luajit_abi.cpp
+        SOURCES
             src/net/Amf3Module.cpp
             src/compat/Lua226CompatShim.cpp
             src/diagnostics/CrashAndTelemetry.cpp
-        )
-        target_compile_features(gclient_luajit_abi_tests PRIVATE cxx_std_20)
-        target_include_directories(gclient_luajit_abi_tests PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/compat/include"
-        )
-        target_compile_definitions(gclient_luajit_abi_tests PRIVATE
-            $<$<PLATFORM_ID:Windows>:WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS>
-        )
-        target_link_libraries(gclient_luajit_abi_tests PRIVATE
+        LIBS
             luajit
-            $<$<PLATFORM_ID:Windows>:dbghelp psapi kernel32>
-            $<$<NOT:$<PLATFORM_ID:Windows>>:pthread dl>
-        )
-        if(MSVC)
-            target_compile_options(gclient_luajit_abi_tests PRIVATE /W3 /utf-8 /EHsc /permissive- /Zc:char8_t- /FS /Zi)
-            gclient_apply_exe_link_options(gclient_luajit_abi_tests)
-        else()
-            target_compile_options(gclient_luajit_abi_tests PRIVATE -fno-char8_t)
-        endif()
-        gclient_stage_test_runtime_dlls(gclient_luajit_abi_tests)
-        add_test(NAME gclient_luajit_abi_tests COMMAND gclient_luajit_abi_tests)
-    endif()
+        WIN32_LIBS
+            dbghelp psapi kernel32
+    )
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cobalt_relay_e2e.cpp")
-        add_executable(gclient_cobalt_relay_e2e_tests
-            tests/test_cobalt_relay_e2e.cpp
+    gclient_add_cpp_test(gclient_cobalt_relay_e2e_tests
+        MAIN_SOURCE tests/test_cobalt_relay_e2e.cpp
+        SOURCES
             src/assets/BtDecryptHook.cpp
             src/net/Amf3Module.cpp
             src/net/LCPacket.cpp
             src/net/CConnection.cpp
             src/net/CNetwork.cpp
             src/update/AtomicHotUpdater.cpp
-        )
-        target_compile_features(gclient_cobalt_relay_e2e_tests PRIVATE cxx_std_20)
-        target_include_directories(gclient_cobalt_relay_e2e_tests PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/compat/include"
-        )
-        target_compile_definitions(gclient_cobalt_relay_e2e_tests PRIVATE
+        DEFINITIONS
             GCLIENT_STANDALONE_BUILD=1
             GCLIENT_WITH_LUAJIT_AMF3=1
-            $<$<PLATFORM_ID:Windows>:WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS _WINSOCK_DEPRECATED_NO_WARNINGS>
-        )
-        target_link_libraries(gclient_cobalt_relay_e2e_tests PRIVATE
-            luajit
-            ZLIB::ZLIB
-            OpenSSL::Crypto
-            $<$<PLATFORM_ID:Windows>:ws2_32 bcrypt crypt32 user32 advapi32 shell32>
-            $<$<NOT:$<PLATFORM_ID:Windows>>:pthread dl>
-        )
-        if(MSVC)
-            target_compile_options(gclient_cobalt_relay_e2e_tests PRIVATE /W3 /utf-8 /EHsc /permissive- /Zc:char8_t- /FS /Zi)
-            gclient_apply_exe_link_options(gclient_cobalt_relay_e2e_tests)
-        else()
-            target_compile_options(gclient_cobalt_relay_e2e_tests PRIVATE -fno-char8_t)
-        endif()
-        gclient_stage_test_runtime_dlls(gclient_cobalt_relay_e2e_tests)
-        add_test(NAME gclient_cobalt_relay_e2e_tests COMMAND gclient_cobalt_relay_e2e_tests --self-test)
-    endif()
+            $<$<PLATFORM_ID:Windows>:_WINSOCK_DEPRECATED_NO_WARNINGS>
+        LIBS
+            luajit ZLIB::ZLIB OpenSSL::Crypto
+        WIN32_LIBS
+            ws2_32 bcrypt crypt32 user32 advapi32 shell32
+        TEST_ARGS
+            --self-test
+    )
 
     if(Python3_Interpreter_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_patch_and_pe_validator.py")
         add_test(

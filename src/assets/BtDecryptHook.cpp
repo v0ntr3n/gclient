@@ -1,5 +1,9 @@
 #include "BtDecryptHook.h"
 
+#include "common/KestrelBinaryReader.h"
+#include "common/KestrelCrypto.h"
+#include "common/KestrelUtf8.h"
+
 #include <atomic>
 #include <cctype>
 #include <cstdio>
@@ -31,9 +35,8 @@ namespace assets {
 
 namespace {
 
-// ============================================================================
-// Pluggable Key Table Slot (#include "07_bt_decrypt_keys.inc")
-// ============================================================================
+using gclient::common::readLE;
+
 #if defined(__has_include)
 #if __has_include("07_bt_decrypt_keys.inc")
 #include "07_bt_decrypt_keys.inc"
@@ -47,31 +50,19 @@ namespace {
 static const BtKeyEntry kBtDefaultKeyTables[kBtKeyTableCount] = {};
 #endif
 
-std::mutex                g_runtimeKeyTablesMutex;
-std::vector<uint8_t>      g_runtimeKeyStorage[kBtKeyTableCount];
-BtKeyEntry                g_runtimeKeyTables[kBtKeyTableCount] = {};
-std::atomic<bool>         g_warnedMissingKeys{false};
+std::mutex           g_runtimeKeyTablesMutex;
+std::vector<uint8_t> g_runtimeKeyStorage[kBtKeyTableCount];
+BtKeyEntry           g_runtimeKeyTables[kBtKeyTableCount] = {};
+std::atomic<bool>    g_warnedMissingKeys{false};
 
 #if !defined(GCLIENT_STANDALONE_BUILD)
 gclient::diagnostics::LogLevel ParseLogLevel(const char* level) {
-    if (!level) {
-        return gclient::diagnostics::LogLevel::Info;
-    }
-    if (std::strcmp(level, "ERROR") == 0) {
-        return gclient::diagnostics::LogLevel::Error;
-    }
-    if (std::strcmp(level, "WARN") == 0) {
-        return gclient::diagnostics::LogLevel::Warn;
-    }
-    if (std::strcmp(level, "DEBUG") == 0) {
-        return gclient::diagnostics::LogLevel::Debug;
-    }
-    if (std::strcmp(level, "TRACE") == 0) {
-        return gclient::diagnostics::LogLevel::Trace;
-    }
-    if (std::strcmp(level, "FATAL") == 0) {
-        return gclient::diagnostics::LogLevel::Fatal;
-    }
+    if (!level) return gclient::diagnostics::LogLevel::Info;
+    if (std::strcmp(level, "ERROR") == 0) return gclient::diagnostics::LogLevel::Error;
+    if (std::strcmp(level, "WARN") == 0)  return gclient::diagnostics::LogLevel::Warn;
+    if (std::strcmp(level, "DEBUG") == 0) return gclient::diagnostics::LogLevel::Debug;
+    if (std::strcmp(level, "TRACE") == 0) return gclient::diagnostics::LogLevel::Trace;
+    if (std::strcmp(level, "FATAL") == 0) return gclient::diagnostics::LogLevel::Fatal;
     return gclient::diagnostics::LogLevel::Info;
 }
 #endif
@@ -80,43 +71,35 @@ void LogMessage(const char* level, const char* text) {
     const char* safeLevel = level ? level : "INFO";
     const char* safeText  = text ? text : "";
 #if !defined(GCLIENT_STANDALONE_BUILD)
-    const gclient::diagnostics::LogLevel diagLevel = ParseLogLevel(safeLevel);
-    gclient::diagnostics::CrashAndTelemetry::log(diagLevel, "BtDecryptHook", "%s", safeText);
+    gclient::diagnostics::CrashAndTelemetry::log(
+        ParseLogLevel(safeLevel), "BtDecryptHook", "%s", safeText);
     cocos2d::CCLog("[BtDecryptHook][%s] %s", safeLevel, safeText);
 #elif defined(GCLIENT_ENABLE_COCOS2DX)
     cocos2d::CCLog("[BtDecryptHook][%s] %s", safeLevel, safeText);
-#if defined(_WIN32)
-    std::string dbg = std::string("[BtDecryptHook][") + safeLevel + "] " + safeText + "\n";
-    OutputDebugStringA(dbg.c_str());
-#endif
 #else
     std::fprintf(stderr, "[BtDecryptHook][%s] %s\n", safeLevel, safeText);
-#if defined(_WIN32)
-    std::string dbg = std::string("[BtDecryptHook][") + safeLevel + "] " + safeText + "\n";
-    OutputDebugStringA(dbg.c_str());
 #endif
+#if defined(_WIN32) && defined(GCLIENT_STANDALONE_BUILD)
+    const std::string dbg = std::string("[BtDecryptHook][") + safeLevel + "] " + safeText + "\n";
+    OutputDebugStringA(dbg.c_str());
 #endif
 }
 
 void WarnIfKeysMissingOnce() {
-    if (g_warnedMissingKeys.load(std::memory_order_relaxed)) {
+    if (g_warnedMissingKeys.load(std::memory_order_relaxed) || HasDecryptKeys()) {
         return;
     }
-    if (!HasDecryptKeys()) {
-        bool expected = false;
-        if (g_warnedMissingKeys.compare_exchange_strong(expected, true)) {
-            LogMessage(
-                "WARN",
-                "07_bt_decrypt_keys.inc is not present and no runtime key tables are registered. "
-                "Encrypted assets with 0xFEFEFEFE headers will fail decryption until key tables are supplied.");
-        }
+    bool expected = false;
+    if (g_warnedMissingKeys.compare_exchange_strong(expected, true)) {
+        LogMessage(
+            "WARN",
+            "07_bt_decrypt_keys.inc is not present and no runtime key tables are registered. "
+            "Encrypted assets with 0xFEFEFEFE headers will fail decryption until key tables are supplied.");
     }
 }
 
 BtKeyEntry ResolveKeyTable(uint8_t keyIndex) {
-    if (keyIndex > kBtMaxKeyIndex) {
-        return {};
-    }
+    if (keyIndex > kBtMaxKeyIndex) return {};
     {
         std::lock_guard<std::mutex> lock(g_runtimeKeyTablesMutex);
         if (g_runtimeKeyTables[keyIndex].data != nullptr &&
@@ -141,13 +124,6 @@ const char* StatusToString(DecryptStatus status) {
     }
 }
 
-uint32_t ReadLE32(const uint8_t* ptr) {
-    return static_cast<uint32_t>(ptr[0]) |
-           (static_cast<uint32_t>(ptr[1]) << 8) |
-           (static_cast<uint32_t>(ptr[2]) << 16) |
-           (static_cast<uint32_t>(ptr[3]) << 24);
-}
-
 } // namespace
 
 bool HasDecryptKeys() {
@@ -166,20 +142,16 @@ bool RegisterKeyTable(uint8_t keyIndex, const uint8_t* keyData, uint32_t keyLeng
         keyLength > kBtMaxKeyLength) {
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lock(g_runtimeKeyTablesMutex);
-        g_runtimeKeyStorage[keyIndex].assign(keyData, keyData + keyLength);
-        g_runtimeKeyTables[keyIndex].data   = g_runtimeKeyStorage[keyIndex].data();
-        g_runtimeKeyTables[keyIndex].length = keyLength;
-    }
+    std::lock_guard<std::mutex> lock(g_runtimeKeyTablesMutex);
+    g_runtimeKeyStorage[keyIndex].assign(keyData, keyData + keyLength);
+    g_runtimeKeyTables[keyIndex].data   = g_runtimeKeyStorage[keyIndex].data();
+    g_runtimeKeyTables[keyIndex].length = keyLength;
     return true;
 }
 
 bool IsBtEncryptedBuffer(const uint8_t* data, size_t size) {
-    if (data == nullptr || size < kBtDecryptHeaderSize) {
-        return false;
-    }
-    return ReadLE32(data) == kBtDecryptMagic;
+    return data != nullptr && size >= kBtDecryptHeaderSize &&
+           readLE<uint32_t>(data) == kBtDecryptMagic;
 }
 
 void LogDecryptFailure(const DecryptResult& diag, const char* contextPath) {
@@ -201,82 +173,67 @@ void LogDecryptFailure(const DecryptResult& diag, const char* contextPath) {
 
 uint32_t DecryptBasic(uint8_t* data, uint32_t totalSize, DecryptResult* outDiag) {
     DecryptResult diag;
+    auto finish = [&](DecryptStatus st, const char* msg, uint32_t rc) -> uint32_t {
+        diag.status  = st;
+        diag.message = msg;
+        if (outDiag) *outDiag = diag;
+        return rc;
+    };
+
     if (data == nullptr) {
-        diag.status  = DecryptStatus::InvalidBuffer;
-        diag.message = "Null buffer passed to DecryptBasic";
-        if (outDiag) *outDiag = diag;
-        return 3u;
+        return finish(DecryptStatus::InvalidBuffer, "Null buffer passed to DecryptBasic", 3u);
     }
-
     if (totalSize < kBtDecryptHeaderSize) {
-        diag.status            = DecryptStatus::TruncatedHeader;
         diag.actualPayloadSize = 0;
-        diag.message           = "Buffer smaller than 32-byte Game Client header";
-        if (outDiag) *outDiag = diag;
-        return 3u;
+        return finish(DecryptStatus::TruncatedHeader,
+                      "Buffer smaller than 32-byte Game Client header",
+                      3u);
     }
 
-    diag.magic             = ReadLE32(data);
-    diag.headerPayloadSize = ReadLE32(data + 4);
+    diag.magic             = readLE<uint32_t>(data);
+    diag.headerPayloadSize = readLE<uint32_t>(data + 4);
     diag.algoIndex         = data[8];
     diag.keyIndex          = data[9];
 
     if (diag.magic != kBtDecryptMagic) {
-        diag.status  = DecryptStatus::NotEncrypted;
-        diag.message = "Missing 0xFEFEFEFE magic in DecryptBasic";
-        if (outDiag) *outDiag = diag;
-        return 3u;
+        return finish(DecryptStatus::NotEncrypted, "Missing 0xFEFEFEFE magic in DecryptBasic", 3u);
     }
     if (diag.algoIndex != 0 && diag.algoIndex != 1) {
-        diag.status  = DecryptStatus::UnsupportedAlgoIndex;
-        diag.message = "Unsupported encryption algorithm index in DecryptBasic";
-        if (outDiag) *outDiag = diag;
-        return 3u;
+        return finish(DecryptStatus::UnsupportedAlgoIndex,
+                      "Unsupported encryption algorithm index in DecryptBasic",
+                      3u);
     }
 
     const uint32_t payloadLen = totalSize - static_cast<uint32_t>(kBtDecryptHeaderSize);
     diag.actualPayloadSize    = payloadLen;
 
     if (payloadLen != diag.headerPayloadSize) {
-        diag.status  = DecryptStatus::PayloadLengthMismatch;
-        diag.message = "Header payload size does not match (totalSize - 32)";
-        if (outDiag) *outDiag = diag;
-        return 3u;
+        return finish(DecryptStatus::PayloadLengthMismatch,
+                      "Header payload size does not match (totalSize - 32)",
+                      3u);
     }
-
     if (diag.keyIndex > kBtMaxKeyIndex) {
-        diag.status  = DecryptStatus::InvalidKeyIndex;
-        diag.message = "Key index out of range (expected 0..15)";
-        if (outDiag) *outDiag = diag;
-        return 3u;
+        return finish(DecryptStatus::InvalidKeyIndex, "Key index out of range (expected 0..15)", 3u);
     }
 
     const BtKeyEntry key = ResolveKeyTable(diag.keyIndex);
     if (key.data == nullptr || key.length == 0) {
         WarnIfKeysMissingOnce();
-        diag.status  = DecryptStatus::MissingKeyTable;
-        diag.message = "Key table slot is empty (drop 07_bt_decrypt_keys.inc or register key)";
-        if (outDiag) *outDiag = diag;
-        return 3u;
+        return finish(DecryptStatus::MissingKeyTable,
+                      "Key table slot is empty (drop 07_bt_decrypt_keys.inc or register key)",
+                      3u);
     }
 
-    // Matches decrypt_basic @ 0x340e4c:
-    // XORs every even byte (i = 0, 2, 4, ...) of payload with
-    // HASH_BITS[(i + (payloadLen % keyLen)) % keyLen].
     if (payloadLen > 0) {
         uint8_t*       payload = data + kBtDecryptHeaderSize;
         const uint32_t keyLen  = key.length;
         const uint32_t offset  = payloadLen % keyLen;
         for (uint32_t i = 0; i < payloadLen; i += 2) {
-            const uint32_t idx = (i + offset) % keyLen;
-            payload[i] ^= key.data[idx];
+            payload[i] ^= key.data[(i + offset) % keyLen];
         }
     }
 
-    diag.status  = DecryptStatus::Ok;
-    diag.message = "Decrypted successfully";
-    if (outDiag) *outDiag = diag;
-    return 0u;
+    return finish(DecryptStatus::Ok, "Decrypted successfully", 0u);
 }
 
 bool DecryptBuffer(uint8_t* data,
@@ -284,63 +241,51 @@ bool DecryptBuffer(uint8_t* data,
                    const char* contextPath,
                    DecryptResult* outDiag) {
     DecryptResult diag;
+    auto fail = [&](DecryptStatus st, const char* msg, bool logErr) -> bool {
+        diag.status  = st;
+        diag.message = msg;
+        if (logErr) LogDecryptFailure(diag, contextPath);
+        if (outDiag) *outDiag = diag;
+        return false;
+    };
+
     if (data == nullptr || size == nullptr) {
-        diag.status  = DecryptStatus::InvalidBuffer;
-        diag.message = "Null data or size pointer";
-        LogDecryptFailure(diag, contextPath);
-        if (outDiag) *outDiag = diag;
-        return false;
+        return fail(DecryptStatus::InvalidBuffer, "Null data or size pointer", true);
     }
-
     if (*size < kBtDecryptHeaderSize) {
-        diag.status            = DecryptStatus::NotEncrypted;
         diag.actualPayloadSize = *size;
-        diag.message           = "Buffer shorter than 32-byte header; treating as plaintext";
-        if (outDiag) *outDiag = diag;
-        return false;
+        return fail(DecryptStatus::NotEncrypted,
+                    "Buffer shorter than 32-byte header; treating as plaintext",
+                    false);
     }
 
-    diag.magic             = ReadLE32(data);
-    diag.headerPayloadSize = ReadLE32(data + 4);
+    diag.magic             = readLE<uint32_t>(data);
+    diag.headerPayloadSize = readLE<uint32_t>(data + 4);
     diag.algoIndex         = data[8];
     diag.keyIndex          = data[9];
     diag.actualPayloadSize = *size - kBtDecryptHeaderSize;
 
-    // Plaintext pass-through: magic != 0xFEFEFEFE is normal for unencrypted assets.
     if (diag.magic != kBtDecryptMagic) {
-        diag.status  = DecryptStatus::NotEncrypted;
-        diag.message = "No 0xFEFEFEFE header; plaintext asset";
-        if (outDiag) *outDiag = diag;
-        return false;
+        return fail(DecryptStatus::NotEncrypted, "No 0xFEFEFEFE header; plaintext asset", false);
     }
-
-    // Dispatch on algoIndex (off_CC01A0[a1[8] + 16]):
-    // algoIndex == 0 or 1 => decrypt_basic (07_bt_decrypt_keys.inc documents header[8] == 1).
     if (diag.algoIndex != 0 && diag.algoIndex != 1) {
-        diag.status  = DecryptStatus::UnsupportedAlgoIndex;
-        diag.message = "Unsupported encryption algorithm index in header[8]";
+        return fail(DecryptStatus::UnsupportedAlgoIndex,
+                    "Unsupported encryption algorithm index in header[8]",
+                    true);
+    }
+
+    if (DecryptBasic(data, static_cast<uint32_t>(*size), &diag) != 0u) {
         LogDecryptFailure(diag, contextPath);
         if (outDiag) *outDiag = diag;
         return false;
     }
 
-    const uint32_t rc = DecryptBasic(data, static_cast<uint32_t>(*size), &diag);
-    if (rc != 0u) {
-        LogDecryptFailure(diag, contextPath);
-        if (outDiag) *outDiag = diag;
-        return false;
-    }
-
-    // Strip the 32-byte header safely using memmove (overlapping regions) and
-    // always NUL-terminate (plus clear the remaining reclaimed header tail) so
-    // 0-byte encrypted payloads and text assets (.plist, .fnt, .json) never
-    // expose trailing ciphertext or 0xFEFEFEFE to C-string parsers.
     const size_t payloadLen = *size - kBtDecryptHeaderSize;
     if (payloadLen > 0) {
         std::memmove(data, data + kBtDecryptHeaderSize, payloadLen);
     }
     data[payloadLen] = '\0';
-    if (kBtDecryptHeaderSize > 1) {
+    if constexpr (kBtDecryptHeaderSize > 1) {
         std::memset(data + payloadLen + 1, 0, kBtDecryptHeaderSize - 1);
     }
     *size = payloadLen;
@@ -350,9 +295,7 @@ bool DecryptBuffer(uint8_t* data,
 }
 
 std::string NormalizeAssetPath(const std::string& rawPath) {
-    if (rawPath.empty()) {
-        return std::string();
-    }
+    if (rawPath.empty()) return {};
 
     std::string unified;
     unified.reserve(rawPath.size());
@@ -367,31 +310,23 @@ std::string NormalizeAssetPath(const std::string& rawPath) {
 
     if (unified.size() >= 2 && unified[0] == '/' && unified[1] == '/' &&
         (unified.size() == 2 || unified[2] != '/')) {
-        // Windows UNC prefix "//server/share/..."
         prefix               = "//";
         pos                  = 2;
         isAbsolute           = true;
         minProtectedSegments = 2;
     } else if (unified[0] == '/') {
-        // POSIX leading slash
         prefix     = "/";
         isAbsolute = true;
-        while (pos < unified.size() && unified[pos] == '/') {
-            ++pos;
-        }
+        while (pos < unified.size() && unified[pos] == '/') ++pos;
     } else if (unified.size() >= 2 &&
                std::isalpha(static_cast<unsigned char>(unified[0])) &&
                unified[1] == ':') {
         if (unified.size() >= 3 && unified[2] == '/') {
-            // Windows drive-absolute prefix "C:/"
             prefix     = unified.substr(0, 3);
             pos        = 3;
             isAbsolute = true;
-            while (pos < unified.size() && unified[pos] == '/') {
-                ++pos;
-            }
+            while (pos < unified.size() && unified[pos] == '/') ++pos;
         } else {
-            // Windows drive-relative prefix "C:"
             prefix     = unified.substr(0, 2);
             pos        = 2;
             isAbsolute = false;
@@ -402,20 +337,15 @@ std::string NormalizeAssetPath(const std::string& rawPath) {
 
     std::vector<std::string> segments;
     while (pos < unified.size()) {
-        while (pos < unified.size() && unified[pos] == '/') {
-            ++pos;
-        }
-        if (pos >= unified.size()) {
-            break;
-        }
+        while (pos < unified.size() && unified[pos] == '/') ++pos;
+        if (pos >= unified.size()) break;
+
         const size_t nextSlash = unified.find('/', pos);
         const size_t segEnd    = (nextSlash == std::string::npos) ? unified.size() : nextSlash;
         std::string  seg       = unified.substr(pos, segEnd - pos);
         pos                    = segEnd;
 
-        if (seg.empty() || seg == ".") {
-            continue;
-        }
+        if (seg.empty() || seg == ".") continue;
         if (seg == "..") {
             if (segments.size() > minProtectedSegments && segments.back() != "..") {
                 segments.pop_back();
@@ -428,27 +358,18 @@ std::string NormalizeAssetPath(const std::string& rawPath) {
     }
 
     if (segments.empty()) {
-        if (!prefix.empty()) {
-            return prefix;
-        }
-        if (unified == ".") {
-            return ".";
-        }
-        return std::string();
+        if (!prefix.empty()) return prefix;
+        return (unified == ".") ? std::string(".") : std::string();
     }
 
     std::string out = prefix;
     for (size_t i = 0; i < segments.size(); ++i) {
-        if (i > 0) {
-            out.push_back('/');
-        }
+        if (i > 0) out.push_back('/');
         out.append(segments[i]);
     }
-
     if (hadTrailingSlash && !out.empty() && out.back() != '/') {
         out.push_back('/');
     }
-
     return out;
 }
 
@@ -456,21 +377,11 @@ std::string ResolveRelativeAssetPath(const std::string& relativePath,
                                      const std::string& baseFilePath) {
     const std::string normRel  = NormalizeAssetPath(relativePath);
     const std::string normBase = NormalizeAssetPath(baseFilePath);
-
-    if (normRel.empty()) {
-        return normBase;
-    }
-
-    // Already absolute (POSIX root, UNC, or Windows drive letter like C:/...).
-    if (normRel[0] == '/' || (normRel.size() >= 2 && normRel[1] == ':')) {
-        return normRel;
-    }
+    if (normRel.empty()) return normBase;
+    if (normRel[0] == '/' || (normRel.size() >= 2 && normRel[1] == ':')) return normRel;
 
     const size_t slashPos = normBase.find_last_of('/');
-    if (slashPos == std::string::npos) {
-        return normRel;
-    }
-
+    if (slashPos == std::string::npos) return normRel;
     return NormalizeAssetPath(normBase.substr(0, slashPos + 1) + normRel);
 }
 
@@ -478,9 +389,7 @@ std::string ReplaceFileExtension(const std::string& path, const std::string& new
     const std::string norm     = NormalizeAssetPath(path);
     const size_t      slashPos = norm.find_last_of('/');
     const size_t      dotPos   = norm.find_last_of('.');
-
-    if (dotPos == std::string::npos ||
-        (slashPos != std::string::npos && dotPos < slashPos)) {
+    if (dotPos == std::string::npos || (slashPos != std::string::npos && dotPos < slashPos)) {
         return norm + newExt;
     }
     return norm.substr(0, dotPos) + newExt;
@@ -488,69 +397,56 @@ std::string ReplaceFileExtension(const std::string& path, const std::string& new
 
 #if defined(_WIN32) && (defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD))
 namespace {
-unsigned char* ReadRawBinaryWin32(const std::string& utf8OrLocalPath, unsigned long* outSize) {
-    if (outSize) {
-        *outSize = 0;
-    }
-    if (utf8OrLocalPath.empty()) {
-        return nullptr;
-    }
-    auto tryOpenWide = [](UINT codePage, DWORD flags, const std::string& s) -> FILE* {
-        const int req = ::MultiByteToWideChar(
-            codePage, flags, s.data(), static_cast<int>(s.size()), nullptr, 0);
-        if (req <= 0) {
-            return nullptr;
-        }
-        std::wstring wide(static_cast<size_t>(req), L'\0');
-        if (::MultiByteToWideChar(
-                codePage, flags, s.data(), static_cast<int>(s.size()), wide.data(), req) <= 0) {
-            return nullptr;
-        }
+FILE* OpenWin32ReadBinary(const std::string& utf8OrLocalPath) {
+    auto openNormalizedWide = [](std::wstring wide) -> FILE* {
+        if (wide.empty()) return nullptr;
         for (wchar_t& ch : wide) {
-            if (ch == L'/') {
-                ch = L'\\';
-            }
+            if (ch == L'/') ch = L'\\';
         }
         return ::_wfopen(wide.c_str(), L"rb");
     };
 
-    FILE* fp = tryOpenWide(CP_UTF8, MB_ERR_INVALID_CHARS, utf8OrLocalPath);
-    if (!fp) {
-        fp = tryOpenWide(CP_UTF8, 0, utf8OrLocalPath);
+    if (FILE* fp = openNormalizedWide(gclient::utf8::utf8ToWide(utf8OrLocalPath))) {
+        return fp;
     }
-    if (!fp) {
-        fp = tryOpenWide(CP_ACP, 0, utf8OrLocalPath);
-    }
-    if (!fp) {
+    const int req = ::MultiByteToWideChar(
+        CP_ACP, 0, utf8OrLocalPath.data(), static_cast<int>(utf8OrLocalPath.size()), nullptr, 0);
+    if (req <= 0) return nullptr;
+    std::wstring acpWide(static_cast<size_t>(req), L'\0');
+    if (::MultiByteToWideChar(CP_ACP, 0, utf8OrLocalPath.data(),
+                              static_cast<int>(utf8OrLocalPath.size()), acpWide.data(), req) <= 0) {
         return nullptr;
     }
+    return openNormalizedWide(std::move(acpWide));
+}
+
+unsigned char* ReadRawBinaryWin32(const std::string& utf8OrLocalPath, unsigned long* outSize) {
+    if (outSize) *outSize = 0;
+    if (utf8OrLocalPath.empty()) return nullptr;
+
+    FILE* fp = OpenWin32ReadBinary(utf8OrLocalPath);
+    if (!fp) return nullptr;
 
     if (::_fseeki64(fp, 0, SEEK_END) != 0) {
         std::fclose(fp);
         return nullptr;
     }
     const long long fileLen = ::_ftelli64(fp);
-    if (fileLen <= 0 || fileLen > 0x7FFFFFFFLL) {
-        std::fclose(fp);
-        return nullptr;
-    }
-    if (::_fseeki64(fp, 0, SEEK_SET) != 0) {
+    if (fileLen <= 0 || fileLen > 0x7FFFFFFFLL || ::_fseeki64(fp, 0, SEEK_SET) != 0) {
         std::fclose(fp);
         return nullptr;
     }
 
-    const size_t rawLen = static_cast<size_t>(fileLen);
-    unsigned char* buf = new unsigned char[rawLen + kBtDecryptHeaderSize + 1u];
-    const size_t nRead = std::fread(buf, 1u, rawLen, fp);
+    const size_t   rawLen = static_cast<size_t>(fileLen);
+    unsigned char* buf    = new unsigned char[rawLen + kBtDecryptHeaderSize + 1u];
+    const size_t   nRead  = std::fread(buf, 1u, rawLen, fp);
     std::fclose(fp);
     if (nRead != rawLen) {
         delete[] buf;
         return nullptr;
     }
     buf[rawLen] = '\0';
-    if (outSize) {
-        *outSize = static_cast<unsigned long>(rawLen);
-    }
+    if (outSize) *outSize = static_cast<unsigned long>(rawLen);
     return buf;
 }
 } // namespace
@@ -559,23 +455,16 @@ unsigned char* ReadRawBinaryWin32(const std::string& utf8OrLocalPath, unsigned l
 unsigned char* LoadAndDecryptFileData(const std::string& filePath,
                                       unsigned long* outSize,
                                       DecryptResult* outDiag) {
-    if (outSize) {
-        *outSize = 0;
-    }
+    if (outSize) *outSize = 0;
 #if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
     const std::string normPath = NormalizeAssetPath(filePath);
-    if (normPath.empty()) {
-        return nullptr;
-    }
+    if (normPath.empty()) return nullptr;
 
-    unsigned long  rawSize       = 0;
-    unsigned char* buffer        = nullptr;
-    bool           fromCocosHeap = false;
-    std::string    fullPath      = normPath;
+    unsigned long  rawSize  = 0;
+    unsigned char* buffer   = nullptr;
+    std::string    fullPath = normPath;
 
 #if defined(_WIN32)
-    // Open absolute Win32 / UNC paths directly via UTF-16 _wfopen so Unicode directories
-    // never suffer CP_ACP mojibake or trigger blocking CCFileUtils MessageBoxA popups.
     if (normPath[0] == '/' || (normPath.size() >= 2 && normPath[1] == ':')) {
         buffer = ReadRawBinaryWin32(normPath, &rawSize);
     }
@@ -583,16 +472,11 @@ unsigned char* LoadAndDecryptFileData(const std::string& filePath,
 
     if (!buffer) {
         auto* fu = ax::FileUtils::getInstance();
-        if (!fu) {
-            return nullptr;
-        }
+        if (!fu) return nullptr;
+
         const std::string compatNorm = gclient::compat::ResolveConvertedAssetPath(normPath);
-        const std::string resolved = fu->fullPathForFilename(compatNorm);
-        if (!resolved.empty()) {
-            fullPath = resolved;
-        } else {
-            fullPath = compatNorm;
-        }
+        const std::string resolved   = fu->fullPathForFilename(compatNorm);
+        fullPath                     = resolved.empty() ? compatNorm : resolved;
 #if defined(_WIN32)
         buffer = ReadRawBinaryWin32(fullPath, &rawSize);
         if (!buffer && fullPath != compatNorm) {
@@ -606,7 +490,7 @@ unsigned char* LoadAndDecryptFileData(const std::string& filePath,
             fu->setPopupNotify(prevPopup);
             if (!fileData.isNull() && fileData.getSize() > 0) {
                 rawSize = static_cast<unsigned long>(fileData.getSize());
-                buffer = new unsigned char[fileData.getSize() + kBtDecryptHeaderSize + 1u];
+                buffer  = new unsigned char[fileData.getSize() + kBtDecryptHeaderSize + 1u];
                 std::memcpy(buffer, fileData.getBytes(), fileData.getSize());
                 buffer[fileData.getSize()] = '\0';
             }
@@ -618,8 +502,8 @@ unsigned char* LoadAndDecryptFileData(const std::string& filePath,
         return nullptr;
     }
 
-    // Guard truncated 0xFEFEFEFE files (< 32 bytes) so raw magic bytes never leak.
-    if (rawSize >= 4 && rawSize < kBtDecryptHeaderSize && ReadLE32(buffer) == kBtDecryptMagic) {
+    if (rawSize >= 4 && rawSize < kBtDecryptHeaderSize &&
+        readLE<uint32_t>(buffer) == kBtDecryptMagic) {
         DecryptResult diag;
         diag.status            = DecryptStatus::TruncatedHeader;
         diag.magic             = kBtDecryptMagic;
@@ -631,9 +515,6 @@ unsigned char* LoadAndDecryptFileData(const std::string& filePath,
         return nullptr;
     }
 
-    // If CCFileUtils::getFileData did not strip the 0xFEFEFEFE header (or if its
-    // callback failed), run DecryptBuffer explicitly and reject any failure or
-    // 0-byte payload rather than returning raw ciphertext to callers.
     if (IsBtEncryptedBuffer(buffer, static_cast<size_t>(rawSize))) {
         size_t sz = static_cast<size_t>(rawSize);
         if (!DecryptBuffer(buffer, &sz, fullPath.c_str(), outDiag) || sz == 0) {
@@ -647,20 +528,8 @@ unsigned char* LoadAndDecryptFileData(const std::string& filePath,
         outDiag->message           = "Plaintext or already decrypted by CCFileUtils";
     }
 
-    if (fromCocosHeap) {
-        // Re-home buffer into GCLIENT.exe's CRT heap (+1 NUL byte) so caller `delete[]` never crosses DLL heaps.
-        unsigned char* ownedCopy = new unsigned char[static_cast<size_t>(rawSize) + 1u];
-        std::memcpy(ownedCopy, buffer, static_cast<size_t>(rawSize));
-        ownedCopy[rawSize] = '\0';
-        delete[] buffer;
-        buffer = ownedCopy;
-    } else {
-        buffer[rawSize] = '\0';
-    }
-
-    if (outSize) {
-        *outSize = rawSize;
-    }
+    buffer[rawSize] = '\0';
+    if (outSize) *outSize = rawSize;
     return buffer;
 #else
     (void)filePath;
@@ -671,14 +540,12 @@ unsigned char* LoadAndDecryptFileData(const std::string& filePath,
 
 void InstallBtDecryptHook(cocos2d::CCFileUtils* fileUtils) {
     WarnIfKeysMissingOnce();
-
 #if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
     cocos2d::CCFileUtils* fu = fileUtils ? fileUtils : ax::FileUtils::getInstance();
     if (!fu) {
-        LogMessage("ERROR", "InstallBtDecryptHook called before CCFileUtils::sharedFileUtils() is ready");
-        return;
+        LogMessage("ERROR",
+                   "InstallBtDecryptHook called before CCFileUtils::sharedFileUtils() is ready");
     }
-// Axmol 2.11.5 uses pre-converted assets + LoadAndDecryptFileData pass-through.
 #else
     (void)fileUtils;
 #endif
@@ -688,32 +555,23 @@ void InstallBtDecryptHook(cocos2d::CCFileUtils* fileUtils) {
 } // namespace gclient
 
 bool bt_decrypt(unsigned char* data, unsigned long* size) {
-    if (data == nullptr || size == nullptr) {
-        return false;
-    }
-    size_t sz = static_cast<size_t>(*size);
+    if (data == nullptr || size == nullptr) return false;
+    size_t     sz = static_cast<size_t>(*size);
     const bool ok = gclient::assets::DecryptBuffer(data, &sz, nullptr, nullptr);
-    if (ok) {
-        *size = static_cast<unsigned long>(sz);
-    }
+    if (ok) *size = static_cast<unsigned long>(sz);
     return ok;
 }
 
 bool bt_decrypt_u64(uint8_t* data, uint64_t* size) {
-    if (data == nullptr || size == nullptr || *size > 0xFFFFFFFFull) {
-        return false;
-    }
-    size_t sz = static_cast<size_t>(*size);
+    if (data == nullptr || size == nullptr || *size > 0xFFFFFFFFull) return false;
+    size_t     sz = static_cast<size_t>(*size);
     const bool ok = gclient::assets::DecryptBuffer(data, &sz, nullptr, nullptr);
-    if (ok) {
-        *size = static_cast<uint64_t>(sz);
-    }
+    if (ok) *size = static_cast<uint64_t>(sz);
     return ok;
 }
 
 uint32_t decrypt_basic(uint8_t* data, int totalSize) {
-    if (totalSize < 0) {
-        return 3u;
-    }
-    return gclient::assets::DecryptBasic(data, static_cast<uint32_t>(totalSize), nullptr);
+    return (totalSize < 0)
+               ? 3u
+               : gclient::assets::DecryptBasic(data, static_cast<uint32_t>(totalSize), nullptr);
 }

@@ -1,16 +1,22 @@
 #include "AtomicHotUpdater.h"
 
+#include "common/KestrelBinaryReader.h"
+#include "common/KestrelCrypto.h"
+#include "common/KestrelHttp.h"
+#include "common/KestrelJson.h"
+#include "common/KestrelUtf8.h"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
-#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <random>
 #include <sstream>
+#include <string_view>
 #include <thread>
 
 #ifdef _WIN32
@@ -21,8 +27,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <bcrypt.h>
-#pragma comment(lib, "bcrypt.lib")
 #else
 #include <fcntl.h>
 #include <sys/file.h>
@@ -36,311 +40,14 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// ============================================================================
-// Pure C++17 SHA-256 and MD5 fallbacks (used on non-Windows hosts / tests;
-// Win32 builds use native CNG BCrypt* APIs with zero external dependencies).
-// ============================================================================
-#ifndef _WIN32
+using gclient::common::endsWithAsciiCI;
+using gclient::common::equalsAsciiCI;
+using gclient::common::fnv1a64;
+using gclient::common::startsWithAsciiCI;
+using gclient::utf8::fsPathToUtf8;
+using gclient::utf8::utf8ToFsPath;
 
-class Sha256Context {
-public:
-    Sha256Context() { reset(); }
-
-    void reset() {
-        m_state = {
-            0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
-            0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
-        };
-        m_bitLen = 0;
-        m_bufLen = 0;
-    }
-
-    void update(const uint8_t* data, size_t len) {
-        for (size_t i = 0; i < len; ++i) {
-            m_buf[m_bufLen++] = data[i];
-            if (m_bufLen == 64) {
-                transform(m_buf.data());
-                m_bitLen += 512;
-                m_bufLen = 0;
-            }
-        }
-    }
-
-    std::array<uint8_t, 32> finalize() {
-        uint64_t totalBits = m_bitLen + static_cast<uint64_t>(m_bufLen) * 8u;
-        m_buf[m_bufLen++] = 0x80u;
-        if (m_bufLen > 56) {
-            while (m_bufLen < 64) m_buf[m_bufLen++] = 0x00u;
-            transform(m_buf.data());
-            m_bufLen = 0;
-        }
-        while (m_bufLen < 56) m_buf[m_bufLen++] = 0x00u;
-        for (int i = 7; i >= 0; --i) {
-            m_buf[m_bufLen++] = static_cast<uint8_t>((totalBits >> (i * 8)) & 0xFFu);
-        }
-        transform(m_buf.data());
-
-        std::array<uint8_t, 32> digest{};
-        for (size_t i = 0; i < 8; ++i) {
-            digest[i * 4 + 0] = static_cast<uint8_t>((m_state[i] >> 24) & 0xFFu);
-            digest[i * 4 + 1] = static_cast<uint8_t>((m_state[i] >> 16) & 0xFFu);
-            digest[i * 4 + 2] = static_cast<uint8_t>((m_state[i] >> 8) & 0xFFu);
-            digest[i * 4 + 3] = static_cast<uint8_t>(m_state[i] & 0xFFu);
-        }
-        return digest;
-    }
-
-private:
-    static inline uint32_t rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32u - n)); }
-
-    void transform(const uint8_t block[64]) {
-        static constexpr uint32_t k[64] = {
-            0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
-            0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
-            0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
-            0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
-            0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
-            0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
-            0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
-            0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
-            0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
-            0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
-            0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
-            0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
-            0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
-            0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
-            0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
-            0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
-        };
-
-        uint32_t w[64];
-        for (size_t i = 0; i < 16; ++i) {
-            w[i] = (static_cast<uint32_t>(block[i * 4 + 0]) << 24) |
-                   (static_cast<uint32_t>(block[i * 4 + 1]) << 16) |
-                   (static_cast<uint32_t>(block[i * 4 + 2]) << 8) |
-                   static_cast<uint32_t>(block[i * 4 + 3]);
-        }
-        for (size_t i = 16; i < 64; ++i) {
-            uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
-            uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-        }
-
-        uint32_t a = m_state[0], b = m_state[1], c = m_state[2], d = m_state[3];
-        uint32_t e = m_state[4], f = m_state[5], g = m_state[6], h = m_state[7];
-        for (size_t i = 0; i < 64; ++i) {
-            uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-            uint32_t ch = (e & f) ^ ((~e) & g);
-            uint32_t temp1 = h + S1 + ch + k[i] + w[i];
-            uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
-            uint32_t temp2 = S0 + maj;
-
-            h = g; g = f; f = e; e = d + temp1;
-            d = c; c = b; b = a; a = temp1 + temp2;
-        }
-
-        m_state[0] += a; m_state[1] += b; m_state[2] += c; m_state[3] += d;
-        m_state[4] += e; m_state[5] += f; m_state[6] += g; m_state[7] += h;
-    }
-
-    std::array<uint32_t, 8> m_state{};
-    std::array<uint8_t, 64> m_buf{};
-    uint64_t m_bitLen = 0;
-    size_t m_bufLen = 0;
-};
-
-class Md5Context {
-public:
-    Md5Context() { reset(); }
-
-    void reset() {
-        m_state = {0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u};
-        m_bitLen = 0;
-        m_bufLen = 0;
-    }
-
-    void update(const uint8_t* data, size_t len) {
-        for (size_t i = 0; i < len; ++i) {
-            m_buf[m_bufLen++] = data[i];
-            if (m_bufLen == 64) {
-                transform(m_buf.data());
-                m_bitLen += 512;
-                m_bufLen = 0;
-            }
-        }
-    }
-
-    std::array<uint8_t, 16> finalize() {
-        uint64_t totalBits = m_bitLen + static_cast<uint64_t>(m_bufLen) * 8u;
-        m_buf[m_bufLen++] = 0x80u;
-        if (m_bufLen > 56) {
-            while (m_bufLen < 64) m_buf[m_bufLen++] = 0x00u;
-            transform(m_buf.data());
-            m_bufLen = 0;
-        }
-        while (m_bufLen < 56) m_buf[m_bufLen++] = 0x00u;
-        for (int i = 0; i < 8; ++i) {
-            m_buf[m_bufLen++] = static_cast<uint8_t>((totalBits >> (i * 8)) & 0xFFu);
-        }
-        transform(m_buf.data());
-
-        std::array<uint8_t, 16> digest{};
-        for (size_t i = 0; i < 4; ++i) {
-            digest[i * 4 + 0] = static_cast<uint8_t>(m_state[i] & 0xFFu);
-            digest[i * 4 + 1] = static_cast<uint8_t>((m_state[i] >> 8) & 0xFFu);
-            digest[i * 4 + 2] = static_cast<uint8_t>((m_state[i] >> 16) & 0xFFu);
-            digest[i * 4 + 3] = static_cast<uint8_t>((m_state[i] >> 24) & 0xFFu);
-        }
-        return digest;
-    }
-
-private:
-    static inline uint32_t rotl(uint32_t x, uint32_t n) { return (x << n) | (x >> (32u - n)); }
-
-    void transform(const uint8_t block[64]) {
-        static constexpr uint32_t s[64] = {
-            7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
-            5, 9,14,20, 5, 9,14,20, 5, 9,14,20, 5, 9,14,20,
-            4,11,16,23, 4,11,16,23, 4,11,16,23, 4,11,16,23,
-            6,10,15,21, 6,10,15,21, 6,10,15,21, 6,10,15,21
-        };
-        static constexpr uint32_t k[64] = {
-            0xd76aa478u,0xe8c7b756u,0x242070dbu,0xc1bdceeeu,
-            0xf57c0fafu,0x4787c62au,0xa8304613u,0xfd469501u,
-            0x698098d8u,0x8b44f7afu,0xffff5bb1u,0x895cd7beu,
-            0x6b901122u,0xfd987193u,0xa679438eu,0x49b40821u,
-            0xf61e2562u,0xc040b340u,0x265e5a51u,0xe9b6c7aau,
-            0xd62f105du,0x02441453u,0xd8a1e681u,0xe7d3fbc8u,
-            0x21e1cde6u,0xc33707d6u,0xf4d50d87u,0x455a14edu,
-            0xa9e3e905u,0xfcefa3f8u,0x676f02d9u,0x8d2a4c8au,
-            0xfffa3942u,0x8771f681u,0x6d9d6122u,0xfde5380cu,
-            0xa4beea44u,0x4bdecfa9u,0xf6bb4b60u,0xbebfbc70u,
-            0x289b7ec6u,0xeaa127fau,0xd4ef3085u,0x04881d05u,
-            0xd9d4d039u,0xe6db99e5u,0x1fa27cf8u,0xc4ac5665u,
-            0xf4292244u,0x432aff97u,0xab9423a7u,0xfc93a039u,
-            0x655b59c3u,0x8f0ccc92u,0xffeff47du,0x85845dd1u,
-            0x6fa87e4fu,0xfe2ce6e0u,0xa3014314u,0x4e0811a1u,
-            0xf7537e82u,0xbd3af235u,0x2ad7d2bbu,0xeb86d391u
-        };
-
-        uint32_t m[16];
-        for (size_t i = 0; i < 16; ++i) {
-            m[i] = static_cast<uint32_t>(block[i * 4 + 0]) |
-                   (static_cast<uint32_t>(block[i * 4 + 1]) << 8) |
-                   (static_cast<uint32_t>(block[i * 4 + 2]) << 16) |
-                   (static_cast<uint32_t>(block[i * 4 + 3]) << 24);
-        }
-
-        uint32_t a = m_state[0], b = m_state[1], c = m_state[2], d = m_state[3];
-        for (size_t i = 0; i < 64; ++i) {
-            uint32_t f = 0;
-            size_t g = 0;
-            if (i < 16) {
-                f = (b & c) | ((~b) & d);
-                g = i;
-            } else if (i < 32) {
-                f = (d & b) | ((~d) & c);
-                g = (5 * i + 1) % 16;
-            } else if (i < 48) {
-                f = b ^ c ^ d;
-                g = (3 * i + 5) % 16;
-            } else {
-                f = c ^ (b | (~d));
-                g = (7 * i) % 16;
-            }
-            uint32_t temp = d;
-            d = c;
-            c = b;
-            b = b + rotl(a + f + k[i] + m[g], s[i]);
-            a = temp;
-        }
-        m_state[0] += a; m_state[1] += b; m_state[2] += c; m_state[3] += d;
-    }
-
-    std::array<uint32_t, 4> m_state{};
-    std::array<uint8_t, 64> m_buf{};
-    uint64_t m_bitLen = 0;
-    size_t m_bufLen = 0;
-};
-
-#endif // !_WIN32
-
-// ============================================================================
-// Minimal JSON helpers for active_manifest.json (zero third-party deps)
-// ============================================================================
-
-std::string jsonEscape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (char c : s) {
-        switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:   out.push_back(c); break;
-        }
-    }
-    return out;
-}
-
-bool extractJsonString(const std::string& json, const std::string& key, std::string& out) {
-    const std::string needle = "\"" + key + "\"";
-    size_t pos = json.find(needle);
-    if (pos == std::string::npos) return false;
-    pos = json.find(':', pos + needle.size());
-    if (pos == std::string::npos) return false;
-    pos = json.find('"', pos + 1);
-    if (pos == std::string::npos) return false;
-    ++pos;
-
-    std::string result;
-    while (pos < json.size()) {
-        char c = json[pos++];
-        if (c == '\\' && pos < json.size()) {
-            char next = json[pos++];
-            switch (next) {
-                case '"':  result.push_back('"'); break;
-                case '\\': result.push_back('\\'); break;
-                case 'n':  result.push_back('\n'); break;
-                case 'r':  result.push_back('\r'); break;
-                case 't':  result.push_back('\t'); break;
-                default:   result.push_back(next); break;
-            }
-        } else if (c == '"') {
-            out = std::move(result);
-            return true;
-        } else {
-            result.push_back(c);
-        }
-    }
-    return false;
-}
-
-bool extractJsonUint32(const std::string& json, const std::string& key, uint32_t& out) {
-    const std::string needle = "\"" + key + "\"";
-    size_t pos = json.find(needle);
-    if (pos == std::string::npos) return false;
-    pos = json.find(':', pos + needle.size());
-    if (pos == std::string::npos) return false;
-    ++pos;
-    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
-    if (pos >= json.size() || !std::isdigit(static_cast<unsigned char>(json[pos]))) return false;
-
-    uint64_t val = 0;
-    while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos]))) {
-        val = val * 10u + static_cast<uint64_t>(json[pos++] - '0');
-        if (val > 0xFFFFFFFFull) return false;
-    }
-    out = static_cast<uint32_t>(val);
-    return true;
-}
-
-std::string bootStateToString(BootState state) {
+std::string_view bootStateToString(BootState state) noexcept {
     switch (state) {
         case BootState::Confirmed:           return "confirmed";
         case BootState::PendingVerification: return "pending_verification";
@@ -349,43 +56,106 @@ std::string bootStateToString(BootState state) {
     return "confirmed";
 }
 
-BootState stringToBootState(const std::string& s) {
+BootState stringToBootState(std::string_view s) noexcept {
     if (s == "pending_verification") return BootState::PendingVerification;
     if (s == "rolled_back") return BootState::RolledBack;
     return BootState::Confirmed;
 }
 
-uint64_t fnv1a64(const std::string& input) {
-    uint64_t hash = 14695981039346656037ULL;
-    for (unsigned char c : input) {
-        hash ^= static_cast<uint64_t>(c);
-        hash *= 1099511628211ULL;
+std::string normalizeComparePath(const fs::path& rawPath) {
+    if (rawPath.empty()) return {};
+    std::error_code ec;
+    fs::path canon = fs::weakly_canonical(rawPath, ec);
+    if (ec || canon.empty()) {
+        ec.clear();
+        canon = fs::absolute(rawPath, ec).lexically_normal();
     }
-    return hash;
+    std::string s = fsPathToUtf8(canon.empty() ? rawPath.lexically_normal() : canon);
+    for (char& ch : s) {
+        if (ch == '\\') ch = '/';
+#ifdef _WIN32
+        else ch = static_cast<char>(gclient::common::asciiLower(static_cast<unsigned char>(ch)));
+#endif
+    }
+    while (s.size() > 1 && s.back() == '/') {
+        if (s.size() == 3 && s[1] == ':') break;
+        s.pop_back();
+    }
+    return s;
 }
 
-#ifdef _WIN32
-fs::path utf8ToFsPath(const std::string& utf8) {
-    if (utf8.empty()) return {};
-    int req = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
-    if (req <= 0) req = ::MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
-    if (req <= 0) return {};
-    std::wstring wide(static_cast<size_t>(req), L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), req);
-    return fs::path(wide);
+bool isSameOrSubpathNormalized(std::string_view childNorm, std::string_view parentNorm) noexcept {
+    if (childNorm.empty() || parentNorm.empty()) return false;
+    if (childNorm == parentNorm) return true;
+    if (childNorm.size() <= parentNorm.size() || !childNorm.starts_with(parentNorm)) return false;
+    return parentNorm.back() == '/' || childNorm[parentNorm.size()] == '/';
 }
-std::string fsPathToUtf8(const fs::path& p) {
-    const std::wstring wide = p.wstring();
-    if (wide.empty()) return {};
-    int req = ::WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
-    if (req <= 0) return {};
-    std::string out(static_cast<size_t>(req), '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), out.data(), req, nullptr, nullptr);
-    return out;
+
+bool isStrictSubpathNormalized(std::string_view childNorm, std::string_view parentNorm) noexcept {
+    return childNorm != parentNorm && isSameOrSubpathNormalized(childNorm, parentNorm);
 }
-#else
-fs::path utf8ToFsPath(const std::string& utf8) { return fs::path(utf8); }
-std::string fsPathToUtf8(const fs::path& p) { return p.string(); }
+
+bool containsProtectedConvertedDirComponent(const fs::path& p) {
+    for (const fs::path& part : p) {
+        if (equalsAsciiCI(fsPathToUtf8(part), "resources_axmol_converted")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool isReservedWindowsDeviceStem(std::string_view filename) noexcept {
+    const size_t dot = filename.find('.');
+    const std::string_view stem = (dot == std::string_view::npos) ? filename : filename.substr(0, dot);
+    if (stem.size() < 3 || stem.size() > 4) return false;
+    if (equalsAsciiCI(stem, "con") || equalsAsciiCI(stem, "prn") ||
+        equalsAsciiCI(stem, "aux") || equalsAsciiCI(stem, "nul")) {
+        return true;
+    }
+    return stem.size() == 4 &&
+           (startsWithAsciiCI(stem, "com") || startsWithAsciiCI(stem, "lpt")) &&
+           stem[3] >= '1' && stem[3] <= '9';
+}
+
+bool readBinaryTextFile(const fs::path& p, std::string& out) {
+    std::ifstream ifs(p, std::ios::in | std::ios::binary);
+    if (!ifs.is_open()) return false;
+    std::ostringstream oss;
+    oss << ifs.rdbuf();
+    out = oss.str();
+    return !ifs.bad();
+}
+
+#if GCLIENT_HTTP_HAS_CURL && !defined(GCLIENT_STANDALONE_BUILD)
+bool defaultCurlOrFileTransport(const std::string& rawUrl, const fs::path& destinationPath, std::string& errorOut) {
+    if (startsWithAsciiCI(rawUrl, "http://") || startsWithAsciiCI(rawUrl, "https://")) {
+        const std::string overrideBase = gclient::utf8::firstNonEmptyEnv(
+            {"KESTREL_UPDATE_URL", "GCLIENT_UPDATE_URL", "KESTREL_MAPI_URL"});
+        const std::string effectiveUrl = gclient::http::EndpointRewritePolicy::rewriteToBase(rawUrl, overrideBase);
+        const bool insecureTls = gclient::utf8::readEnvBool({"GCLIENT_INSECURE_TLS", "KESTREL_INSECURE_TLS"}, false);
+        const std::string caBundle = gclient::utf8::readEnvUtf8("CURL_CA_BUNDLE");
+        const auto resp = gclient::http::performCurlRequest(
+            effectiveUrl, nullptr, {}, 8000, 60000, !insecureTls, caBundle);
+        if (!resp.ok()) {
+            errorOut = !resp.error.empty()
+                ? resp.error
+                : ("HTTP status " + std::to_string(resp.statusCode));
+            return false;
+        }
+        std::ofstream ofs(destinationPath, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!ofs.is_open()) {
+            errorOut = "Failed to open staged destination file for write.";
+            return false;
+        }
+        ofs.write(resp.body.data(), static_cast<std::streamsize>(resp.body.size()));
+        if (!ofs.good()) {
+            errorOut = "Failed writing HTTP response body to staged file.";
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
 #endif
 
 } // namespace
@@ -404,13 +174,13 @@ AtomicHotUpdater::CrossProcessLock::~CrossProcessLock() {
 bool AtomicHotUpdater::CrossProcessLock::acquire(uint32_t timeoutMs, std::string& errorOut) {
     if (m_acquired) return true;
 #ifdef _WIN32
-    std::wstring wideName(m_mutexName.begin(), m_mutexName.end());
+    const std::wstring wideName = gclient::utf8::utf8ToWide(m_mutexName);
     HANDLE h = CreateMutexW(nullptr, FALSE, wideName.c_str());
     if (!h) {
         errorOut = "CreateMutexW failed with Win32 error " + std::to_string(GetLastError());
         return false;
     }
-    DWORD waitRes = WaitForSingleObject(h, timeoutMs);
+    const DWORD waitRes = WaitForSingleObject(h, timeoutMs);
     if (waitRes == WAIT_OBJECT_0 || waitRes == WAIT_ABANDONED) {
         m_mutexHandle = h;
         m_acquired = true;
@@ -422,7 +192,6 @@ bool AtomicHotUpdater::CrossProcessLock::acquire(uint32_t timeoutMs, std::string
         : "WaitForSingleObject failed with code " + std::to_string(waitRes);
     return false;
 #else
-    (void)timeoutMs;
     std::error_code ec;
     fs::create_directories(m_lockFilePath.parent_path(), ec);
     m_lockFd = ::open(m_lockFilePath.c_str(), O_CREAT | O_RDWR, 0644);
@@ -430,14 +199,19 @@ bool AtomicHotUpdater::CrossProcessLock::acquire(uint32_t timeoutMs, std::string
         errorOut = "Failed to open lock file: " + m_lockFilePath.string();
         return false;
     }
-    if (::flock(m_lockFd, LOCK_EX | LOCK_NB) != 0) {
-        ::close(m_lockFd);
-        m_lockFd = -1;
-        errorOut = "Another Game Client instance holds the hot-update lock";
-        return false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        if (::flock(m_lockFd, LOCK_EX | LOCK_NB) == 0) {
+            m_acquired = true;
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
     }
-    m_acquired = true;
-    return true;
+    ::close(m_lockFd);
+    m_lockFd = -1;
+    errorOut = "Another Game Client instance holds the hot-update lock";
+    return false;
 #endif
 }
 
@@ -459,12 +233,12 @@ void AtomicHotUpdater::CrossProcessLock::release() {
     m_acquired = false;
 }
 
-// ============================================================================
-// AtomicHotUpdater
-// ============================================================================
-
 AtomicHotUpdater::AtomicHotUpdater(HotUpdaterConfig config)
-    : m_config(std::move(config)) {}
+    : m_config(std::move(config)) {
+#if GCLIENT_HTTP_HAS_CURL && !defined(GCLIENT_STANDALONE_BUILD)
+    m_transport = &defaultCurlOrFileTransport;
+#endif
+}
 
 AtomicHotUpdater::~AtomicHotUpdater() = default;
 
@@ -478,42 +252,120 @@ void AtomicHotUpdater::setDownloadTransport(DownloadTransport transport) {
     m_transport = std::move(transport);
 }
 
-fs::path AtomicHotUpdater::stagingRoot() const {
-    return m_config.patchRootDir / "staging";
-}
-
-fs::path AtomicHotUpdater::releasesRoot() const {
-    return m_config.patchRootDir / "releases";
-}
-
-fs::path AtomicHotUpdater::activeManifestPath() const {
-    return m_config.patchRootDir / "active_manifest.json";
-}
-
-fs::path AtomicHotUpdater::previousManifestPath() const {
-    return m_config.patchRootDir / "previous_manifest.json";
-}
-
+fs::path AtomicHotUpdater::stagingRoot() const { return m_config.patchRootDir / "staging"; }
+fs::path AtomicHotUpdater::releasesRoot() const { return m_config.patchRootDir / "releases"; }
+fs::path AtomicHotUpdater::activeManifestPath() const { return m_config.patchRootDir / "active_manifest.json"; }
+fs::path AtomicHotUpdater::previousManifestPath() const { return m_config.patchRootDir / "previous_manifest.json"; }
 fs::path AtomicHotUpdater::releaseDirForVersion(const std::string& version) const {
     return releasesRoot() / utf8ToFsPath(version);
 }
 
-bool AtomicHotUpdater::ensureDirectoryLayout(std::string& errorOut) const {
+bool AtomicHotUpdater::validatePatchRootIsolation(std::string& errorOut) const {
+    if (m_config.patchRootDir.empty()) {
+        errorOut = "HotUpdaterConfig::patchRootDir is empty.";
+        return false;
+    }
+    if (containsProtectedConvertedDirComponent(m_config.patchRootDir)) {
+        errorOut = "Refusing to point AtomicHotUpdater::patchRootDir inside protected Resources_Axmol_Converted tree.";
+        return false;
+    }
+    const std::string patchNorm = normalizeComparePath(m_config.patchRootDir);
+    if (patchNorm.empty() || patchNorm == "/" || (patchNorm.size() == 3 && patchNorm[1] == ':' && patchNorm[2] == '/')) {
+        errorOut = "Refusing to use filesystem root as AtomicHotUpdater::patchRootDir.";
+        return false;
+    }
+    if (!m_config.baseResourcesDir.empty()) {
+        const std::string baseNorm = normalizeComparePath(m_config.baseResourcesDir);
+        if (!baseNorm.empty()) {
+            if (isSameOrSubpathNormalized(patchNorm, baseNorm)) {
+                errorOut = "AtomicHotUpdater::patchRootDir overlaps or resides inside read-only baseResourcesDir.";
+                return false;
+            }
+            if (isSameOrSubpathNormalized(baseNorm, patchNorm)) {
+                errorOut = "AtomicHotUpdater::patchRootDir encloses read-only baseResourcesDir.";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool AtomicHotUpdater::isOverlayDirContainedInReleases(const fs::path& candidateDir) const {
+    if (candidateDir.empty() || containsProtectedConvertedDirComponent(candidateDir)) {
+        return false;
+    }
+    const std::string candNorm = normalizeComparePath(candidateDir);
+    if (!isStrictSubpathNormalized(candNorm, normalizeComparePath(releasesRoot()))) {
+        return false;
+    }
+    if (!m_config.baseResourcesDir.empty()) {
+        const std::string baseNorm = normalizeComparePath(m_config.baseResourcesDir);
+        if (!baseNorm.empty() &&
+            (isSameOrSubpathNormalized(candNorm, baseNorm) || isSameOrSubpathNormalized(baseNorm, candNorm))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool AtomicHotUpdater::isDirectoryTreeUnlocked(const fs::path& dirPath) const {
+#ifdef _WIN32
     std::error_code ec;
-    fs::create_directories(m_config.patchRootDir, ec);
-    if (ec) {
-        errorOut = "Failed to create patch root dir: " + ec.message();
+    if (!fs::exists(dirPath, ec)) return true;
+    for (const auto& entry : fs::recursive_directory_iterator(dirPath, ec)) {
+        if (ec) return false;
+        if (!entry.is_regular_file(ec)) continue;
+        HANDLE h = ::CreateFileW(
+            entry.path().c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, 0, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            if (::GetLastError() != ERROR_FILE_NOT_FOUND) return false;
+        } else {
+            ::CloseHandle(h);
+        }
+    }
+    return true;
+#else
+    (void)dirPath;
+    return true;
+#endif
+}
+
+bool AtomicHotUpdater::validateDownloadedPayloadCompatibility(
+    const std::string& relativePath,
+    const fs::path& stagedFile,
+    std::string& errorOut) const {
+    if (!m_config.enforceAxmolConvertedAssetCompat) return true;
+    if (!isAxmolCompatibleRelativeAssetPath(relativePath)) {
+        errorOut = "Patch contains legacy un-converted texture format incompatible with Resources_Axmol_Converted: " + relativePath;
         return false;
     }
-    fs::create_directories(stagingRoot(), ec);
-    if (ec) {
-        errorOut = "Failed to create staging dir: " + ec.message();
-        return false;
+    if (endsWithAsciiCI(relativePath, ".lua")) {
+        std::ifstream ifs(stagedFile, std::ios::in | std::ios::binary);
+        if (ifs.is_open()) {
+            std::array<uint8_t, 5> hdr{};
+            ifs.read(reinterpret_cast<char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
+            if (ifs.gcount() >= 5 && hdr[0] == 0x1Bu && hdr[1] == 'L' && hdr[2] == 'J') {
+                if (hdr[3] < 0x02u || (hdr[4] & 0x08u) == 0u) {
+                    errorOut = "Rejected 32-bit (non-GC64) LuaJIT bytecode in x64 Axmol overlay: " + relativePath;
+                    return false;
+                }
+            }
+        }
     }
-    fs::create_directories(releasesRoot(), ec);
-    if (ec) {
-        errorOut = "Failed to create releases dir: " + ec.message();
-        return false;
+    return true;
+}
+
+bool AtomicHotUpdater::ensureDirectoryLayout(std::string& errorOut) const {
+    if (!validatePatchRootIsolation(errorOut)) return false;
+    std::error_code ec;
+    for (const auto& [dir, label] : std::array<std::pair<fs::path, const char*>, 3>{
+             {{m_config.patchRootDir, "patch root"}, {stagingRoot(), "staging"}, {releasesRoot(), "releases"}}}) {
+        fs::create_directories(dir, ec);
+        if (ec) {
+            errorOut = std::string("Failed to create ") + label + " dir: " + ec.message();
+            return false;
+        }
     }
     return true;
 }
@@ -522,36 +374,40 @@ StartupHealthResult AtomicHotUpdater::initializeAndCheckStartupHealth() {
     std::lock_guard<std::mutex> lock(m_mutex);
     StartupHealthResult result;
 
-    std::string err;
-    if (!ensureDirectoryLayout(err)) {
-        result.diagnosticMessage = err;
+    if (!ensureDirectoryLayout(result.diagnosticMessage)) {
         return result;
     }
+
+    CrossProcessLock procLock(m_config.patchRootDir);
+    std::string lockErr;
+    const bool haveLock = procLock.acquire(2000, lockErr);
 
     ActiveOverlayState state;
     if (!loadActiveStateLocked(state)) {
-        result.hasActiveOverlay = false;
-        result.diagnosticMessage = "No active hot-update overlay; booting from base Resources/.";
+        result.diagnosticMessage = "No active hot-update overlay; booting from base Resources_Axmol_Converted/.";
         return result;
     }
 
-    // Verify the active overlay directory still exists on disk.
     std::error_code ec;
-    const bool activeDirMissing = !state.activeOverlayDir.empty() &&
-                                  !fs::exists(utf8ToFsPath(state.activeOverlayDir), ec);
-
-    // Trigger automatic rollback if the previous launch failed to confirm or overlay vanished.
+    const fs::path activeFsPath = utf8ToFsPath(state.activeOverlayDir);
+    const bool activeOutsideReleases = !state.activeOverlayDir.empty() &&
+                                       !isOverlayDirContainedInReleases(activeFsPath);
+    const bool activeDirMissing = !state.activeOverlayDir.empty() && !fs::exists(activeFsPath, ec);
     const bool exceededBootFailures =
         state.bootState == BootState::PendingVerification &&
         state.consecutiveBootFailures >= state.maxBootFailuresBeforeRollback;
 
-    if (activeDirMissing || exceededBootFailures) {
+    if (activeOutsideReleases || activeDirMissing || exceededBootFailures) {
         result.rolledBack = true;
         result.rolledBackFromVersion = state.activeVersion;
 
         ActiveOverlayState reverted = state;
-        reverted.activeVersion = state.previousVersion;
-        reverted.activeOverlayDir = state.previousOverlayDir;
+        const fs::path prevFsPath = utf8ToFsPath(state.previousOverlayDir);
+        const bool prevValid = !state.previousOverlayDir.empty() &&
+                               isOverlayDirContainedInReleases(prevFsPath) &&
+                               fs::exists(prevFsPath, ec);
+        reverted.activeVersion = prevValid ? state.previousVersion : "";
+        reverted.activeOverlayDir = prevValid ? state.previousOverlayDir : "";
         reverted.previousVersion.clear();
         reverted.previousOverlayDir.clear();
         reverted.bootState = BootState::RolledBack;
@@ -559,24 +415,24 @@ StartupHealthResult AtomicHotUpdater::initializeAndCheckStartupHealth() {
         reverted.activatedUtc = currentUtcIso8601();
 
         std::string writeErr;
-        if (!writeFileAtomically(activeManifestPath(), serializeOverlayStateJson(reverted), writeErr)) {
+        if (haveLock && !writeFileAtomically(activeManifestPath(), serializeOverlayStateJson(reverted), writeErr)) {
             result.diagnosticMessage = "Auto-rollback write failed: " + writeErr;
         } else {
             result.hasActiveOverlay = !reverted.activeOverlayDir.empty();
             result.activeVersion = reverted.activeVersion;
             result.activeOverlayPath = utf8ToFsPath(reverted.activeOverlayDir);
-            result.diagnosticMessage = activeDirMissing
-                ? "Active overlay directory missing; rolled back from " + state.activeVersion
-                : "Startup verification failed " + std::to_string(state.consecutiveBootFailures) +
-                  " time(s); rolled back from " + state.activeVersion +
-                  " to " + (reverted.activeVersion.empty() ? "base Resources/" : reverted.activeVersion);
+            result.diagnosticMessage = activeOutsideReleases
+                ? "Quarantined unsafe activeOverlayDir outside releases/; reverted to clean base Resources_Axmol_Converted/."
+                : (activeDirMissing
+                    ? "Active overlay directory missing; rolled back from " + state.activeVersion
+                    : "Startup verification failed " + std::to_string(state.consecutiveBootFailures) +
+                      " time(s); rolled back from " + state.activeVersion +
+                      " to " + (reverted.activeVersion.empty() ? "base Resources_Axmol_Converted/" : reverted.activeVersion));
         }
         return result;
     }
 
-    // If this patch is still pending verification, increment consecutiveBootFailures
-    // BEFORE Lua boots so that a native crash is detected on the next launch.
-    if (state.bootState == BootState::PendingVerification) {
+    if (haveLock && state.bootState == BootState::PendingVerification) {
         state.consecutiveBootFailures += 1;
         std::string writeErr;
         writeFileAtomically(activeManifestPath(), serializeOverlayStateJson(state), writeErr);
@@ -584,15 +440,20 @@ StartupHealthResult AtomicHotUpdater::initializeAndCheckStartupHealth() {
 
     result.hasActiveOverlay = !state.activeOverlayDir.empty();
     result.activeVersion = state.activeVersion;
-    result.activeOverlayPath = utf8ToFsPath(state.activeOverlayDir);
+    result.activeOverlayPath = activeFsPath;
     result.diagnosticMessage = "Overlay " + state.activeVersion + " active (" +
-                               bootStateToString(state.bootState) + ").";
+                               std::string(bootStateToString(state.bootState)) + ").";
     return result;
 }
 
 UpdateResult AtomicHotUpdater::confirmStartupSuccess() {
     std::lock_guard<std::mutex> lock(m_mutex);
     UpdateResult res;
+
+    if (!validatePatchRootIsolation(res.message)) {
+        res.status = UpdateStatus::InvalidPathTraversal;
+        return res;
+    }
 
     ActiveOverlayState state;
     if (!loadActiveStateLocked(state)) {
@@ -606,6 +467,12 @@ UpdateResult AtomicHotUpdater::confirmStartupSuccess() {
         res.activeVersion = state.activeVersion;
         res.activeOverlayPath = utf8ToFsPath(state.activeOverlayDir);
         res.message = "Active overlay already confirmed.";
+        return res;
+    }
+
+    CrossProcessLock procLock(m_config.patchRootDir);
+    if (!procLock.acquire(3000, res.message)) {
+        res.status = UpdateStatus::LockAcquisitionFailed;
         return res;
     }
 
@@ -645,32 +512,35 @@ UpdateStatus AtomicHotUpdater::checkCompatibility(
                     ", " + std::to_string(req.maxNativeBindingApiVersion) + "].";
         return UpdateStatus::IncompatibleNativeBinding;
     }
-
     if (caps.protoSchemaVersion != req.requiredProtoSchemaVersion) {
         reasonOut = "Proto2 schema version mismatch: client=" +
                     std::to_string(caps.protoSchemaVersion) +
                     ", patch requires " + std::to_string(req.requiredProtoSchemaVersion) + ".";
         return UpdateStatus::IncompatibleProtoSchema;
     }
-
     if (caps.dbSchemaVersion != req.requiredDbSchemaVersion) {
         reasonOut = "SQLite DB schema version mismatch: client=" +
                     std::to_string(caps.dbSchemaVersion) +
                     ", patch requires " + std::to_string(req.requiredDbSchemaVersion) + ".";
         return UpdateStatus::IncompatibleDbSchema;
     }
-
-    if (!req.minClientVersion.empty() &&
-        compareSemver(caps.clientVersion, req.minClientVersion) < 0) {
+    if (!req.minClientVersion.empty() && compareSemver(caps.clientVersion, req.minClientVersion) < 0) {
         reasonOut = "Client version " + caps.clientVersion +
                     " is older than patch minimum " + req.minClientVersion + ".";
         return UpdateStatus::IncompatibleClientVersion;
     }
-
     for (const auto& symbol : req.requiredNativeBindings) {
         if (caps.exportedBindings.find(symbol) == caps.exportedBindings.end()) {
             reasonOut = "Patch requires missing native C++ binding: " + symbol;
             return UpdateStatus::MissingRequiredBinding;
+        }
+    }
+    if (m_config.enforceAxmolConvertedAssetCompat) {
+        for (const auto& entry : manifest.files) {
+            if (!entry.relativePath.empty() && !isAxmolCompatibleRelativeAssetPath(entry.relativePath)) {
+                reasonOut = "Rejected legacy un-converted texture format in manifest: " + entry.relativePath;
+                return UpdateStatus::InvalidManifest;
+            }
         }
     }
 
@@ -684,29 +554,26 @@ UpdateResult AtomicHotUpdater::stagePatch(
     std::lock_guard<std::mutex> lock(m_mutex);
     UpdateResult res;
 
-    std::string compatErr;
-    UpdateStatus compatStatus = checkCompatibility(manifest, compatErr);
-    if (compatStatus != UpdateStatus::Ok) {
-        res.status = compatStatus;
-        res.message = compatErr;
-        return res;
-    }
+    res.status = checkCompatibility(manifest, res.message);
+    if (res.status != UpdateStatus::Ok) return res;
 
     if (!m_transport) {
         res.status = UpdateStatus::DownloadFailed;
         res.message = "No DownloadTransport registered on AtomicHotUpdater.";
         return res;
     }
-
-    std::string layoutErr;
-    if (!ensureDirectoryLayout(layoutErr)) {
-        res.status = UpdateStatus::IoError;
-        res.message = layoutErr;
+    if (!ensureDirectoryLayout(res.message)) {
+        res.status = UpdateStatus::InvalidPathTraversal;
         return res;
     }
 
-    // If the exact release is already staged & committed, verify presence.
     const fs::path targetReleaseDir = releaseDirForVersion(manifest.patchVersion);
+    if (!isOverlayDirContainedInReleases(targetReleaseDir)) {
+        res.status = UpdateStatus::InvalidPathTraversal;
+        res.message = "Target release path escapes releases/ boundary.";
+        return res;
+    }
+
     std::error_code ec;
     if (fs::exists(targetReleaseDir, ec) && fs::is_directory(targetReleaseDir, ec)) {
         ActiveOverlayState cur;
@@ -719,11 +586,15 @@ UpdateResult AtomicHotUpdater::stagePatch(
         }
     }
 
-    // Validate all relative paths upfront before creating any files.
     for (const auto& entry : manifest.files) {
         if (!isSafeRelativePath(entry.relativePath)) {
             res.status = UpdateStatus::InvalidPathTraversal;
             res.message = "Rejected unsafe relative path in manifest: " + entry.relativePath;
+            return res;
+        }
+        if (m_config.enforceAxmolConvertedAssetCompat && !isAxmolCompatibleRelativeAssetPath(entry.relativePath)) {
+            res.status = UpdateStatus::InvalidManifest;
+            res.message = "Rejected legacy un-converted texture format in manifest: " + entry.relativePath;
             return res;
         }
         if (entry.sha256.empty() && entry.md5.empty()) {
@@ -733,8 +604,15 @@ UpdateResult AtomicHotUpdater::stagePatch(
         }
     }
 
-    // Create isolated versioned staging directory.
     const fs::path stagingDir = stagingRoot() / (manifest.patchVersion + "_" + generateStagingNonce());
+    const std::string stageNorm = normalizeComparePath(stagingDir);
+    const std::string stageRootNorm = normalizeComparePath(stagingRoot());
+    if (!isStrictSubpathNormalized(stageNorm, stageRootNorm)) {
+        res.status = UpdateStatus::InvalidPathTraversal;
+        res.message = "Staging path escaped staging/ root.";
+        return res;
+    }
+
     fs::create_directories(stagingDir, ec);
     if (ec) {
         res.status = UpdateStatus::IoError;
@@ -743,14 +621,23 @@ UpdateResult AtomicHotUpdater::stagePatch(
     }
 
     auto cleanupStaging = [&]() {
-        std::error_code rmEc;
-        fs::remove_all(stagingDir, rmEc);
+        if (isStrictSubpathNormalized(normalizeComparePath(stagingDir), normalizeComparePath(stagingRoot())) &&
+            !containsProtectedConvertedDirComponent(stagingDir)) {
+            std::error_code rmEc;
+            fs::remove_all(stagingDir, rmEc);
+        }
     };
 
     const size_t totalFiles = manifest.files.size();
     for (size_t i = 0; i < totalFiles; ++i) {
         const auto& entry = manifest.files[i];
         const fs::path destFile = stagingDir / utf8ToFsPath(entry.relativePath);
+        if (!isStrictSubpathNormalized(normalizeComparePath(destFile), stageNorm)) {
+            cleanupStaging();
+            res.status = UpdateStatus::InvalidPathTraversal;
+            res.message = "Resolved file escaped staging directory: " + entry.relativePath;
+            return res;
+        }
 
         fs::create_directories(destFile.parent_path(), ec);
         if (ec) {
@@ -769,7 +656,7 @@ UpdateResult AtomicHotUpdater::stagePatch(
         }
 
         if (entry.expectedSize > 0) {
-            uint64_t actualSize = fs::file_size(destFile, ec);
+            const uint64_t actualSize = fs::file_size(destFile, ec);
             if (ec || actualSize != entry.expectedSize) {
                 cleanupStaging();
                 res.status = UpdateStatus::SizeMismatch;
@@ -780,28 +667,27 @@ UpdateResult AtomicHotUpdater::stagePatch(
             }
         }
 
-        if (!entry.sha256.empty()) {
-            std::string actualSha256, hashErr;
-            if (!computeFileHash(destFile, HashAlgorithm::SHA256, actualSha256, hashErr) ||
-                toLowerAscii(actualSha256) != toLowerAscii(entry.sha256)) {
+        auto verifyDigest = [&](HashAlgorithm algo, const std::string& expected, const char* label) -> bool {
+            if (expected.empty()) return true;
+            std::string actual, hashErr;
+            if (!computeFileHash(destFile, algo, actual, hashErr) || !equalsAsciiCI(actual, expected)) {
                 cleanupStaging();
                 res.status = UpdateStatus::ChecksumMismatch;
-                res.message = "SHA-256 mismatch for " + entry.relativePath +
+                res.message = std::string(label) + " mismatch for " + entry.relativePath +
                               (hashErr.empty() ? "" : (" (" + hashErr + ")"));
-                return res;
+                return false;
             }
+            return true;
+        };
+        if (!verifyDigest(HashAlgorithm::SHA256, entry.sha256, "SHA-256") ||
+            !verifyDigest(HashAlgorithm::MD5, entry.md5, "MD5")) {
+            return res;
         }
 
-        if (!entry.md5.empty()) {
-            std::string actualMd5, hashErr;
-            if (!computeFileHash(destFile, HashAlgorithm::MD5, actualMd5, hashErr) ||
-                toLowerAscii(actualMd5) != toLowerAscii(entry.md5)) {
-                cleanupStaging();
-                res.status = UpdateStatus::ChecksumMismatch;
-                res.message = "MD5 mismatch for " + entry.relativePath +
-                              (hashErr.empty() ? "" : (" (" + hashErr + ")"));
-                return res;
-            }
+        if (!validateDownloadedPayloadCompatibility(entry.relativePath, destFile, res.message)) {
+            cleanupStaging();
+            res.status = UpdateStatus::IncompatibleNativeBinding;
+            return res;
         }
 
         if (progressCb) {
@@ -809,7 +695,13 @@ UpdateResult AtomicHotUpdater::stagePatch(
         }
     }
 
-    // Promote verified staging directory into immutable releases/<version>/.
+    CrossProcessLock procLock(m_config.patchRootDir);
+    if (!procLock.acquire(5000, res.message)) {
+        cleanupStaging();
+        res.status = UpdateStatus::LockAcquisitionFailed;
+        return res;
+    }
+
     std::string moveErr;
     if (!moveDirectoryAtomically(stagingDir, targetReleaseDir, moveErr)) {
         cleanupStaging();
@@ -830,6 +722,10 @@ UpdateResult AtomicHotUpdater::commitStagedPatch(const std::string& patchVersion
     std::lock_guard<std::mutex> lock(m_mutex);
     UpdateResult res;
 
+    if (!validatePatchRootIsolation(res.message)) {
+        res.status = UpdateStatus::InvalidPathTraversal;
+        return res;
+    }
     if (!isValidVersionToken(patchVersion)) {
         res.status = UpdateStatus::InvalidManifest;
         res.message = "Invalid patchVersion token: " + patchVersion;
@@ -837,6 +733,12 @@ UpdateResult AtomicHotUpdater::commitStagedPatch(const std::string& patchVersion
     }
 
     const fs::path releaseDir = releaseDirForVersion(patchVersion);
+    if (!isOverlayDirContainedInReleases(releaseDir)) {
+        res.status = UpdateStatus::InvalidPathTraversal;
+        res.message = "Release directory escapes releases/ boundary: " + patchVersion;
+        return res;
+    }
+
     std::error_code ec;
     if (!fs::exists(releaseDir, ec) || !fs::is_directory(releaseDir, ec)) {
         res.status = UpdateStatus::InvalidManifest;
@@ -845,61 +747,55 @@ UpdateResult AtomicHotUpdater::commitStagedPatch(const std::string& patchVersion
     }
 
     CrossProcessLock procLock(m_config.patchRootDir);
-    std::string lockErr;
-    if (!procLock.acquire(5000, lockErr)) {
+    if (!procLock.acquire(5000, res.message)) {
         res.status = UpdateStatus::LockAcquisitionFailed;
-        res.message = lockErr;
         return res;
     }
 
     ActiveOverlayState prevState;
     const bool hadPrevState = loadActiveStateLocked(prevState);
-    const fs::path oldOverlayDir = hadPrevState ? utf8ToFsPath(prevState.activeOverlayDir) : fs::path{};
+    const fs::path oldOverlayDir =
+        (hadPrevState && isOverlayDirContainedInReleases(utf8ToFsPath(prevState.activeOverlayDir)))
+            ? utf8ToFsPath(prevState.activeOverlayDir)
+            : fs::path{};
 
-    // Step 1: Coordinate releasing all open SQLite .db and asset handles.
+    auto failAbort = [&](UpdateStatus st, std::string msg) -> UpdateResult {
+        if (m_hooks.abortSwap) m_hooks.abortSwap(oldOverlayDir);
+        res.status = st;
+        res.message = std::move(msg);
+        return res;
+    };
+
     if (m_hooks.prepareForSwap) {
         std::string hookErr;
         if (!m_hooks.prepareForSwap(hookErr)) {
-            if (m_hooks.abortSwap) m_hooks.abortSwap(oldOverlayDir);
-            res.status = UpdateStatus::HandleReleaseFailed;
-            res.message = "Subsystem refused handle release: " + hookErr;
-            return res;
+            return failAbort(UpdateStatus::HandleReleaseFailed, "Subsystem refused handle release: " + hookErr);
         }
     }
-
     if (m_hooks.verifyHandlesReleased) {
         std::string verifyErr;
         if (!m_hooks.verifyHandlesReleased(verifyErr)) {
-            if (m_hooks.abortSwap) m_hooks.abortSwap(oldOverlayDir);
-            res.status = UpdateStatus::HandleReleaseFailed;
-            res.message = "Open handles still detected after prepareForSwap: " + verifyErr;
-            return res;
+            return failAbort(UpdateStatus::HandleReleaseFailed,
+                             "Open handles still detected after prepareForSwap: " + verifyErr);
         }
     }
-
-    // Step 2: Probe NTFS lock on active_manifest.json before swapping.
     if (fs::exists(activeManifestPath(), ec)) {
         std::string probeErr;
         if (!probePathUnlockedWithRetry(activeManifestPath(), probeErr)) {
-            if (m_hooks.abortSwap) m_hooks.abortSwap(oldOverlayDir);
-            res.status = UpdateStatus::NtfsLockTimeout;
-            res.message = "NTFS lock timeout on active_manifest.json: " + probeErr;
-            return res;
+            return failAbort(UpdateStatus::NtfsLockTimeout, "NTFS lock timeout on active_manifest.json: " + probeErr);
         }
     }
 
-    // Step 3: Backup current manifest pointer for rollback safety.
-    if (hadPrevState) {
+    if (hadPrevState && (prevState.activeOverlayDir.empty() || !oldOverlayDir.empty())) {
         std::string backupErr;
         writeFileAtomically(previousManifestPath(), serializeOverlayStateJson(prevState), backupErr);
     }
 
-    // Step 4: Build new PendingVerification overlay pointer and swap atomically.
     ActiveOverlayState nextState;
     nextState.activeVersion = patchVersion;
     nextState.activeOverlayDir = fsPathToUtf8(releaseDir);
-    nextState.previousVersion = hadPrevState ? prevState.activeVersion : "";
-    nextState.previousOverlayDir = hadPrevState ? prevState.activeOverlayDir : "";
+    nextState.previousVersion = !oldOverlayDir.empty() ? prevState.activeVersion : "";
+    nextState.previousOverlayDir = !oldOverlayDir.empty() ? prevState.activeOverlayDir : "";
     nextState.bootState = BootState::PendingVerification;
     nextState.consecutiveBootFailures = 0;
     nextState.maxBootFailuresBeforeRollback = m_config.maxBootFailuresBeforeRollback;
@@ -910,30 +806,23 @@ UpdateResult AtomicHotUpdater::commitStagedPatch(const std::string& patchVersion
 
     std::string swapErr;
     if (!writeFileAtomically(activeManifestPath(), serializeOverlayStateJson(nextState), swapErr)) {
-        if (m_hooks.abortSwap) m_hooks.abortSwap(oldOverlayDir);
-        res.status = UpdateStatus::SwapFailed;
-        res.message = "Atomic manifest swap failed: " + swapErr;
-        return res;
+        return failAbort(UpdateStatus::SwapFailed, "Atomic manifest swap failed: " + swapErr);
     }
 
-    // Step 5: Reload engine subsystems against the new overlay. If reload fails,
-    // immediately revert the manifest pointer back to the previous known-good state.
     if (m_hooks.reloadAfterSwap) {
         std::string reloadErr;
         if (!m_hooks.reloadAfterSwap(releaseDir, reloadErr)) {
-            ActiveOverlayState rollbackState = hadPrevState ? prevState : ActiveOverlayState{};
+            ActiveOverlayState rollbackState = (!oldOverlayDir.empty()) ? prevState : ActiveOverlayState{};
             rollbackState.bootState = BootState::RolledBack;
             rollbackState.consecutiveBootFailures = 0;
             std::string rbErr;
             writeFileAtomically(activeManifestPath(), serializeOverlayStateJson(rollbackState), rbErr);
-            if (m_hooks.abortSwap) {
-                m_hooks.abortSwap(oldOverlayDir);
-            }
+            if (m_hooks.abortSwap) m_hooks.abortSwap(oldOverlayDir);
             res.status = UpdateStatus::ReloadFailedRolledBack;
             res.activeVersion = rollbackState.activeVersion;
             res.activeOverlayPath = utf8ToFsPath(rollbackState.activeOverlayDir);
             res.message = "Subsystem reload failed (" + reloadErr + "); rolled back to " +
-                          (rollbackState.activeVersion.empty() ? "base Resources/" : rollbackState.activeVersion);
+                          (rollbackState.activeVersion.empty() ? "base Resources_Axmol_Converted/" : rollbackState.activeVersion);
             return res;
         }
     }
@@ -959,6 +848,11 @@ UpdateResult AtomicHotUpdater::rollbackToPrevious() {
     std::lock_guard<std::mutex> lock(m_mutex);
     UpdateResult res;
 
+    if (!validatePatchRootIsolation(res.message)) {
+        res.status = UpdateStatus::InvalidPathTraversal;
+        return res;
+    }
+
     ActiveOverlayState curState;
     if (!loadActiveStateLocked(curState)) {
         res.status = UpdateStatus::RollbackUnavailable;
@@ -967,10 +861,8 @@ UpdateResult AtomicHotUpdater::rollbackToPrevious() {
     }
 
     CrossProcessLock procLock(m_config.patchRootDir);
-    std::string lockErr;
-    if (!procLock.acquire(5000, lockErr)) {
+    if (!procLock.acquire(5000, res.message)) {
         res.status = UpdateStatus::LockAcquisitionFailed;
-        res.message = lockErr;
         return res;
     }
 
@@ -983,9 +875,15 @@ UpdateResult AtomicHotUpdater::rollbackToPrevious() {
         }
     }
 
+    std::error_code ec;
+    const fs::path prevFsPath = utf8ToFsPath(curState.previousOverlayDir);
+    const bool prevValid = !curState.previousOverlayDir.empty() &&
+                           isOverlayDirContainedInReleases(prevFsPath) &&
+                           fs::exists(prevFsPath, ec);
+
     ActiveOverlayState reverted = curState;
-    reverted.activeVersion = curState.previousVersion;
-    reverted.activeOverlayDir = curState.previousOverlayDir;
+    reverted.activeVersion = prevValid ? curState.previousVersion : "";
+    reverted.activeOverlayDir = prevValid ? curState.previousOverlayDir : "";
     reverted.previousVersion.clear();
     reverted.previousOverlayDir.clear();
     reverted.bootState = BootState::RolledBack;
@@ -1008,44 +906,52 @@ UpdateResult AtomicHotUpdater::rollbackToPrevious() {
     res.activeVersion = reverted.activeVersion;
     res.activeOverlayPath = utf8ToFsPath(reverted.activeOverlayDir);
     res.message = "Rolled back from " + curState.activeVersion + " to " +
-                  (reverted.activeVersion.empty() ? "base Resources/" : reverted.activeVersion) + ".";
+                  (reverted.activeVersion.empty() ? "base Resources_Axmol_Converted/" : reverted.activeVersion) + ".";
     return res;
 }
 
 size_t AtomicHotUpdater::pruneOldReleases(size_t keepCount) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    std::string err;
+    if (!validatePatchRootIsolation(err)) return 0;
+
+    CrossProcessLock procLock(m_config.patchRootDir);
+    if (!procLock.acquire(2000, err)) return 0;
+
     size_t removed = 0;
     std::error_code ec;
+    const std::string stageRootNorm = normalizeComparePath(stagingRoot());
 
-    // 1. Clean abandoned staging directories.
     if (fs::exists(stagingRoot(), ec)) {
         for (const auto& entry : fs::directory_iterator(stagingRoot(), ec)) {
+            if (!isStrictSubpathNormalized(normalizeComparePath(entry.path()), stageRootNorm) ||
+                containsProtectedConvertedDirComponent(entry.path()) ||
+                !isDirectoryTreeUnlocked(entry.path())) {
+                continue;
+            }
             std::error_code rmEc;
             fs::remove_all(entry.path(), rmEc);
             if (!rmEc) ++removed;
         }
     }
 
-    // 2. Collect candidate releases excluding activeVersion and previousVersion.
     ActiveOverlayState curState;
     const bool hasState = loadActiveStateLocked(curState);
 
     std::vector<std::pair<fs::file_time_type, fs::path>> candidates;
     if (fs::exists(releasesRoot(), ec)) {
         for (const auto& entry : fs::directory_iterator(releasesRoot(), ec)) {
-            if (!entry.is_directory(ec)) continue;
+            if (!entry.is_directory(ec) || !isOverlayDirContainedInReleases(entry.path())) continue;
             const std::string ver = fsPathToUtf8(entry.path().filename());
-            if (hasState && (ver == curState.activeVersion || ver == curState.previousVersion)) {
-                continue;
-            }
+            if (hasState && (ver == curState.activeVersion || ver == curState.previousVersion)) continue;
             candidates.emplace_back(entry.last_write_time(ec), entry.path());
         }
     }
 
-    // Keep newest `keepCount` extra releases; remove older ones if unlocked.
     std::sort(candidates.begin(), candidates.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
     for (size_t i = keepCount; i < candidates.size(); ++i) {
+        if (!isDirectoryTreeUnlocked(candidates[i].second)) continue;
         std::error_code rmEc;
         fs::remove_all(candidates[i].second, rmEc);
         if (!rmEc) ++removed;
@@ -1055,6 +961,8 @@ size_t AtomicHotUpdater::pruneOldReleases(size_t keepCount) {
 
 std::optional<ActiveOverlayState> AtomicHotUpdater::getActiveState() const {
     std::lock_guard<std::mutex> lock(m_mutex);
+    std::string isoErr;
+    if (!validatePatchRootIsolation(isoErr)) return std::nullopt;
     ActiveOverlayState state;
     if (!loadActiveStateLocked(state)) return std::nullopt;
     return state;
@@ -1063,26 +971,16 @@ std::optional<ActiveOverlayState> AtomicHotUpdater::getActiveState() const {
 std::optional<fs::path> AtomicHotUpdater::getActiveOverlayPath() const {
     auto state = getActiveState();
     if (!state || state->activeOverlayDir.empty()) return std::nullopt;
-    return utf8ToFsPath(state->activeOverlayDir);
+    const fs::path p = utf8ToFsPath(state->activeOverlayDir);
+    return isOverlayDirContainedInReleases(p) ? std::optional<fs::path>(p) : std::nullopt;
 }
 
 bool AtomicHotUpdater::loadActiveStateLocked(ActiveOverlayState& outState) const {
-    {
-        std::ifstream ifs(activeManifestPath(), std::ios::in | std::ios::binary);
-        if (ifs.is_open()) {
-            std::ostringstream oss;
-            oss << ifs.rdbuf();
-            if (parseOverlayStateJson(oss.str(), outState)) {
-                return true;
-            }
-        }
+    std::string raw;
+    if (readBinaryTextFile(activeManifestPath(), raw) && parseOverlayStateJson(raw, outState)) {
+        return true;
     }
-    // Torn/corrupt active_manifest.json recovery: fall back to previous_manifest.json backup!
-    std::ifstream prevIfs(previousManifestPath(), std::ios::in | std::ios::binary);
-    if (!prevIfs.is_open()) return false;
-    std::ostringstream prevOss;
-    prevOss << prevIfs.rdbuf();
-    if (!parseOverlayStateJson(prevOss.str(), outState)) {
+    if (!readBinaryTextFile(previousManifestPath(), raw) || !parseOverlayStateJson(raw, outState)) {
         return false;
     }
     std::string healErr;
@@ -1094,37 +992,30 @@ bool AtomicHotUpdater::writeFileAtomically(
     const fs::path& targetPath,
     const std::string& contents,
     std::string& errorOut) const {
+    if (!validatePatchRootIsolation(errorOut)) return false;
+    if (!isStrictSubpathNormalized(normalizeComparePath(targetPath), normalizeComparePath(m_config.patchRootDir)) ||
+        containsProtectedConvertedDirComponent(targetPath)) {
+        errorOut = "Refusing atomic write outside patchRootDir.";
+        return false;
+    }
+
     std::error_code ec;
     fs::create_directories(targetPath.parent_path(), ec);
-
-    // Temp file MUST reside on the same NTFS volume/directory as targetPath so
-    // MoveFileExW executes an atomic directory-entry rename.
     const fs::path tmpPath = targetPath.parent_path() /
                              (fsPathToUtf8(targetPath.filename()) + "." + generateStagingNonce() + ".tmp");
 
 #ifdef _WIN32
     HANDLE hFile = CreateFileW(
-        tmpPath.wstring().c_str(),
-        GENERIC_WRITE,
-        0,
-        nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
-        nullptr);
+        tmpPath.wstring().c_str(), GENERIC_WRITE, 0, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
         errorOut = "CreateFileW failed for temp manifest: Win32 error " + std::to_string(GetLastError());
         return false;
     }
-
     DWORD written = 0;
-    BOOL writeOk = WriteFile(
-        hFile,
-        contents.data(),
-        static_cast<DWORD>(contents.size()),
-        &written,
-        nullptr);
-    BOOL flushOk = writeOk ? FlushFileBuffers(hFile) : FALSE;
-    DWORD lastErr = GetLastError();
+    const BOOL writeOk = WriteFile(hFile, contents.data(), static_cast<DWORD>(contents.size()), &written, nullptr);
+    const BOOL flushOk = writeOk ? FlushFileBuffers(hFile) : FALSE;
+    const DWORD lastErr = GetLastError();
     CloseHandle(hFile);
 
     if (!writeOk || written != contents.size() || !flushOk) {
@@ -1133,36 +1024,32 @@ bool AtomicHotUpdater::writeFileAtomically(
         return false;
     }
 
-    // Retry MoveFileExW briefly in case Windows Defender or Explorer briefly locks targetPath.
     for (uint32_t attempt = 0; attempt <= m_config.lockProbeMaxRetries; ++attempt) {
-        if (MoveFileExW(
-                tmpPath.wstring().c_str(),
-                targetPath.wstring().c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (MoveFileExW(tmpPath.wstring().c_str(), targetPath.wstring().c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
             return true;
         }
-        DWORD moveErr = GetLastError();
+        const DWORD moveErr = GetLastError();
         if (moveErr != ERROR_SHARING_VIOLATION && moveErr != ERROR_ACCESS_DENIED &&
             moveErr != ERROR_LOCK_VIOLATION) {
             DeleteFileW(tmpPath.wstring().c_str());
             errorOut = "MoveFileExW failed: Win32 error " + std::to_string(moveErr);
             return false;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(
-            m_config.lockProbeBackoffMs * (attempt + 1)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(m_config.lockProbeBackoffMs * (attempt + 1)));
     }
     DeleteFileW(tmpPath.wstring().c_str());
     errorOut = "MoveFileExW timed out due to NTFS sharing/lock violation.";
     return false;
 #else
-    int fd = ::open(tmpPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    const int fd = ::open(tmpPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
         errorOut = "Failed to open temp file: " + tmpPath.string();
         return false;
     }
     size_t totalWritten = 0;
     while (totalWritten < contents.size()) {
-        ssize_t n = ::write(fd, contents.data() + totalWritten, contents.size() - totalWritten);
+        const ssize_t n = ::write(fd, contents.data() + totalWritten, contents.size() - totalWritten);
         if (n <= 0) {
             ::close(fd);
             ::unlink(tmpPath.c_str());
@@ -1189,28 +1076,19 @@ bool AtomicHotUpdater::probePathUnlockedWithRetry(
 #ifdef _WIN32
     for (uint32_t attempt = 0; attempt <= m_config.lockProbeMaxRetries; ++attempt) {
         HANDLE h = CreateFileW(
-            path.wstring().c_str(),
-            GENERIC_READ | GENERIC_WRITE,
-            0, // Exclusive share mode: fails with ERROR_SHARING_VIOLATION if any handle is open.
-            nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr);
+            path.wstring().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h != INVALID_HANDLE_VALUE) {
             CloseHandle(h);
             return true;
         }
-        DWORD err = GetLastError();
-        if (err == ERROR_FILE_NOT_FOUND) {
-            return true;
-        }
-        if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION &&
-            err != ERROR_ACCESS_DENIED) {
+        const DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND) return true;
+        if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION && err != ERROR_ACCESS_DENIED) {
             errorOut = "Unexpected Win32 error probing lock: " + std::to_string(err);
             return false;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(
-            m_config.lockProbeBackoffMs * (attempt + 1)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(m_config.lockProbeBackoffMs * (attempt + 1)));
     }
     errorOut = "File remains locked after " + std::to_string(m_config.lockProbeMaxRetries) + " retries.";
     return false;
@@ -1225,10 +1103,19 @@ bool AtomicHotUpdater::moveDirectoryAtomically(
     const fs::path& srcDir,
     const fs::path& dstDir,
     std::string& errorOut) const {
+    if (!validatePatchRootIsolation(errorOut)) return false;
+    if (!isOverlayDirContainedInReleases(dstDir)) {
+        errorOut = "Destination directory is outside releases/.";
+        return false;
+    }
+
     std::error_code ec;
     if (fs::exists(dstDir, ec)) {
-        // Move any stale pre-existing unactivated directory aside before replacing.
-        fs::path trashDir = stagingRoot() / ("replaced_" + generateStagingNonce());
+        if (!isDirectoryTreeUnlocked(dstDir)) {
+            errorOut = "Existing release directory has open handles in a running client.";
+            return false;
+        }
+        const fs::path trashDir = stagingRoot() / ("replaced_" + generateStagingNonce());
         fs::rename(dstDir, trashDir, ec);
         if (ec) {
             errorOut = "Existing release directory is locked or busy: " + ec.message();
@@ -1246,44 +1133,48 @@ bool AtomicHotUpdater::moveDirectoryAtomically(
     return true;
 }
 
-// ============================================================================
-// Static Utilities (JSON, Hashing, Path Safety, Semver)
-// ============================================================================
-
 std::string AtomicHotUpdater::serializeOverlayStateJson(const ActiveOverlayState& state) {
-    std::ostringstream oss;
-    oss << "{\n"
-        << "  \"activeVersion\": \"" << jsonEscape(state.activeVersion) << "\",\n"
-        << "  \"activeOverlayDir\": \"" << jsonEscape(state.activeOverlayDir) << "\",\n"
-        << "  \"previousVersion\": \"" << jsonEscape(state.previousVersion) << "\",\n"
-        << "  \"previousOverlayDir\": \"" << jsonEscape(state.previousOverlayDir) << "\",\n"
-        << "  \"bootState\": \"" << bootStateToString(state.bootState) << "\",\n"
-        << "  \"consecutiveBootFailures\": " << state.consecutiveBootFailures << ",\n"
-        << "  \"maxBootFailuresBeforeRollback\": " << state.maxBootFailuresBeforeRollback << ",\n"
-        << "  \"nativeBindingApiVersion\": " << state.nativeBindingApiVersion << ",\n"
-        << "  \"protoSchemaVersion\": " << state.protoSchemaVersion << ",\n"
-        << "  \"dbSchemaVersion\": " << state.dbSchemaVersion << ",\n"
-        << "  \"activatedUtc\": \"" << jsonEscape(state.activatedUtc) << "\"\n"
-        << "}\n";
-    return oss.str();
+    return gclient::json::JsonObjectBuilder()
+        .kv("activeVersion", state.activeVersion)
+        .kv("activeOverlayDir", state.activeOverlayDir)
+        .kv("previousVersion", state.previousVersion)
+        .kv("previousOverlayDir", state.previousOverlayDir)
+        .kv("bootState", bootStateToString(state.bootState))
+        .kvInt("consecutiveBootFailures", state.consecutiveBootFailures)
+        .kvInt("maxBootFailuresBeforeRollback", state.maxBootFailuresBeforeRollback)
+        .kvInt("nativeBindingApiVersion", state.nativeBindingApiVersion)
+        .kvInt("protoSchemaVersion", state.protoSchemaVersion)
+        .kvInt("dbSchemaVersion", state.dbSchemaVersion)
+        .kv("activatedUtc", state.activatedUtc)
+        .finish() + "\n";
 }
 
 bool AtomicHotUpdater::parseOverlayStateJson(const std::string& json, ActiveOverlayState& outState) {
+    gclient::json::JsonValue root;
+    if (!gclient::json::parse(json, root) || !root.isObject()) return false;
+    const auto* activeVer = root.find("activeVersion");
+    if (!activeVer || !activeVer->isString()) return false;
+
     ActiveOverlayState parsed;
-    std::string bootStr;
-    if (!extractJsonString(json, "activeVersion", parsed.activeVersion)) return false;
-    extractJsonString(json, "activeOverlayDir", parsed.activeOverlayDir);
-    extractJsonString(json, "previousVersion", parsed.previousVersion);
-    extractJsonString(json, "previousOverlayDir", parsed.previousOverlayDir);
-    if (extractJsonString(json, "bootState", bootStr)) {
-        parsed.bootState = stringToBootState(bootStr);
-    }
-    extractJsonUint32(json, "consecutiveBootFailures", parsed.consecutiveBootFailures);
-    extractJsonUint32(json, "maxBootFailuresBeforeRollback", parsed.maxBootFailuresBeforeRollback);
-    extractJsonUint32(json, "nativeBindingApiVersion", parsed.nativeBindingApiVersion);
-    extractJsonUint32(json, "protoSchemaVersion", parsed.protoSchemaVersion);
-    extractJsonUint32(json, "dbSchemaVersion", parsed.dbSchemaVersion);
-    extractJsonString(json, "activatedUtc", parsed.activatedUtc);
+    parsed.activeVersion = activeVer->strVal;
+    if (const auto* v = root.find("activeOverlayDir"); v && v->isString()) parsed.activeOverlayDir = v->strVal;
+    if (const auto* v = root.find("previousVersion"); v && v->isString()) parsed.previousVersion = v->strVal;
+    if (const auto* v = root.find("previousOverlayDir"); v && v->isString()) parsed.previousOverlayDir = v->strVal;
+    if (const auto* v = root.find("bootState"); v && v->isString()) parsed.bootState = stringToBootState(v->strVal);
+
+    auto readU32 = [&](std::string_view key, uint32_t& dst) {
+        if (const auto* v = root.find(key)) {
+            const int64_t n = v->asInt64(-1);
+            if (n >= 0 && n <= static_cast<int64_t>(UINT32_MAX)) dst = static_cast<uint32_t>(n);
+        }
+    };
+    readU32("consecutiveBootFailures", parsed.consecutiveBootFailures);
+    readU32("maxBootFailuresBeforeRollback", parsed.maxBootFailuresBeforeRollback);
+    readU32("nativeBindingApiVersion", parsed.nativeBindingApiVersion);
+    readU32("protoSchemaVersion", parsed.protoSchemaVersion);
+    readU32("dbSchemaVersion", parsed.dbSchemaVersion);
+    if (const auto* v = root.find("activatedUtc"); v && v->isString()) parsed.activatedUtc = v->strVal;
+
     outState = std::move(parsed);
     return true;
 }
@@ -1299,90 +1190,70 @@ bool AtomicHotUpdater::computeFileHash(
         return false;
     }
 
-#ifdef _WIN32
-    BCRYPT_ALG_HANDLE hAlg = nullptr;
-    BCRYPT_HASH_HANDLE hHash = nullptr;
-    const LPCWSTR algId = (algo == HashAlgorithm::SHA256) ? BCRYPT_SHA256_ALGORITHM : BCRYPT_MD5_ALGORITHM;
-
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, algId, nullptr, 0);
-    if (status < 0) {
-        errorOut = "BCryptOpenAlgorithmProvider failed.";
-        return false;
-    }
-
-    DWORD hashObjSize = 0, cbData = 0, hashLen = 0;
-    BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&hashObjSize), sizeof(DWORD), &cbData, 0);
-    BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashLen), sizeof(DWORD), &cbData, 0);
-
-    std::vector<uint8_t> hashObj(hashObjSize);
-    std::vector<uint8_t> digest(hashLen);
-
-    status = BCryptCreateHash(hAlg, &hHash, hashObj.data(), hashObjSize, nullptr, 0, 0);
-    if (status < 0) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        errorOut = "BCryptCreateHash failed.";
-        return false;
-    }
-
-    std::array<char, 65536> buf{};
-    while (ifs.good()) {
-        ifs.read(buf.data(), static_cast<std::streamsize>(buf.size()));
-        std::streamsize n = ifs.gcount();
-        if (n > 0) {
-            status = BCryptHashData(hHash, reinterpret_cast<PUCHAR>(buf.data()), static_cast<ULONG>(n), 0);
-            if (status < 0) break;
-        }
-    }
-
-    if (status >= 0) {
-        status = BCryptFinishHash(hHash, digest.data(), hashLen, 0);
-    }
-    BCryptDestroyHash(hHash);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-
-    if (status < 0) {
-        errorOut = "BCrypt hashing failed.";
-        return false;
-    }
-    hexDigestOut = toLowerHex(digest.data(), digest.size());
-    return true;
-#else
-    std::array<char, 65536> buf{};
+    char buf[32768];
     if (algo == HashAlgorithm::SHA256) {
-        Sha256Context ctx;
+        gclient::crypto::Sha256Stream sha;
         while (ifs.good()) {
-            ifs.read(buf.data(), static_cast<std::streamsize>(buf.size()));
-            std::streamsize n = ifs.gcount();
-            if (n > 0) ctx.update(reinterpret_cast<const uint8_t*>(buf.data()), static_cast<size_t>(n));
+            ifs.read(buf, sizeof(buf));
+            const auto n = ifs.gcount();
+            if (n > 0) sha.update(buf, static_cast<size_t>(n));
         }
-        auto digest = ctx.finalize();
-        hexDigestOut = toLowerHex(digest.data(), digest.size());
+        if (ifs.bad()) {
+            errorOut = "I/O error while hashing file: " + fsPathToUtf8(filePath);
+            return false;
+        }
+        hexDigestOut = gclient::crypto::hexEncode(sha.finish(), false);
     } else {
-        Md5Context ctx;
+        gclient::crypto::Md5Stream md5;
         while (ifs.good()) {
-            ifs.read(buf.data(), static_cast<std::streamsize>(buf.size()));
-            std::streamsize n = ifs.gcount();
-            if (n > 0) ctx.update(reinterpret_cast<const uint8_t*>(buf.data()), static_cast<size_t>(n));
+            ifs.read(buf, sizeof(buf));
+            const auto n = ifs.gcount();
+            if (n > 0) md5.update(buf, static_cast<size_t>(n));
         }
-        auto digest = ctx.finalize();
-        hexDigestOut = toLowerHex(digest.data(), digest.size());
+        if (ifs.bad()) {
+            errorOut = "I/O error while hashing file: " + fsPathToUtf8(filePath);
+            return false;
+        }
+        hexDigestOut = gclient::crypto::hexEncode(md5.finish(), false);
     }
     return true;
-#endif
 }
 
 bool AtomicHotUpdater::isSafeRelativePath(const std::string& relativePath) {
-    if (relativePath.empty()) return false;
-    if (relativePath.find('\0') != std::string::npos) return false;
-    if (relativePath[0] == '/' || relativePath[0] == '\\') return false;
-    if (relativePath.find(':') != std::string::npos) return false; // Block Win32 drive letters / ADS
-
-    fs::path p = utf8ToFsPath(relativePath);
-    if (p.is_absolute()) return false;
-    for (const auto& part : p) {
-        if (part == "..") return false;
+    if (relativePath.empty() || relativePath.find('\0') != std::string::npos ||
+        relativePath[0] == '/' || relativePath[0] == '\\' ||
+        relativePath.find(':') != std::string::npos) {
+        return false;
     }
-    return true;
+    if (equalsAsciiCI(relativePath, "active_manifest.json") ||
+        equalsAsciiCI(relativePath, "previous_manifest.json") ||
+        equalsAsciiCI(relativePath, "update.lock")) {
+        return false;
+    }
+
+    const fs::path p = utf8ToFsPath(relativePath);
+    if (p.is_absolute() || p.has_root_name() || p.has_root_directory() ||
+        containsProtectedConvertedDirComponent(p)) {
+        return false;
+    }
+
+    bool sawAnyPart = false;
+    for (const auto& part : p) {
+        const std::string seg = fsPathToUtf8(part);
+        if (seg.empty() || seg == "." || seg == ".." ||
+            seg.back() == '.' || seg.back() == ' ' ||
+            isReservedWindowsDeviceStem(seg)) {
+            return false;
+        }
+        sawAnyPart = true;
+    }
+    return sawAnyPart;
+}
+
+bool AtomicHotUpdater::isAxmolCompatibleRelativeAssetPath(const std::string& relativePath) {
+    return !endsWithAsciiCI(relativePath, ".pvr.ccz") &&
+           !endsWithAsciiCI(relativePath, ".pvr") &&
+           !endsWithAsciiCI(relativePath, ".pkm");
 }
 
 int AtomicHotUpdater::compareSemver(const std::string& lhs, const std::string& rhs) {
@@ -1390,11 +1261,13 @@ int AtomicHotUpdater::compareSemver(const std::string& lhs, const std::string& r
         std::array<uint32_t, 3> parts = {0, 0, 0};
         size_t idx = 0, start = 0;
         while (idx < 3 && start < v.size()) {
-            size_t dot = v.find('.', start);
-            std::string tok = (dot == std::string::npos) ? v.substr(start) : v.substr(start, dot - start);
+            const size_t dot = v.find('.', start);
+            const std::string_view tok = (dot == std::string::npos)
+                ? std::string_view(v).substr(start)
+                : std::string_view(v).substr(start, dot - start);
             uint32_t num = 0;
-            for (char c : tok) {
-                if (!std::isdigit(static_cast<unsigned char>(c))) break;
+            for (unsigned char c : tok) {
+                if (!std::isdigit(c)) break;
                 num = num * 10u + static_cast<uint32_t>(c - '0');
             }
             parts[idx++] = num;
@@ -1406,15 +1279,13 @@ int AtomicHotUpdater::compareSemver(const std::string& lhs, const std::string& r
     const auto a = parseParts(lhs);
     const auto b = parseParts(rhs);
     for (size_t i = 0; i < 3; ++i) {
-        if (a[i] < b[i]) return -1;
-        if (a[i] > b[i]) return 1;
+        if (a[i] != b[i]) return (a[i] < b[i]) ? -1 : 1;
     }
     return 0;
 }
 
 std::string AtomicHotUpdater::currentUtcIso8601() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t tt = std::chrono::system_clock::to_time_t(now);
+    const std::time_t tt = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm utcTm{};
 #ifdef _WIN32
     gmtime_s(&utcTm, &tt);
@@ -1435,29 +1306,18 @@ std::string AtomicHotUpdater::generateStagingNonce() {
 }
 
 std::string AtomicHotUpdater::toLowerHex(const uint8_t* data, size_t len) {
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string out;
-    out.resize(len * 2);
-    for (size_t i = 0; i < len; ++i) {
-        out[i * 2 + 0] = hex[(data[i] >> 4) & 0x0Fu];
-        out[i * 2 + 1] = hex[data[i] & 0x0Fu];
-    }
-    return out;
+    return gclient::crypto::hexEncode(data, len, false);
 }
 
 std::string AtomicHotUpdater::toLowerAscii(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return value;
+    return gclient::common::toLowerAscii(value);
 }
 
 bool AtomicHotUpdater::isValidVersionToken(const std::string& version) {
-    if (version.empty() || version.size() > 64) return false;
-    for (unsigned char c : version) {
-        if (!std::isalnum(c) && c != '.' && c != '-' && c != '_') return false;
-    }
-    return version != "." && version != "..";
+    if (version.empty() || version.size() > 64 || version == "." || version == "..") return false;
+    return std::all_of(version.begin(), version.end(), [](unsigned char c) {
+        return std::isalnum(c) != 0 || c == '.' || c == '-' || c == '_';
+    });
 }
 
 } // namespace update

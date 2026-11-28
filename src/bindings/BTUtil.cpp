@@ -1,33 +1,49 @@
 #include "BTUtil.h"
-#include "CCCrypto.h"
+#include "common/KestrelCrypto.h"
 
 #include "compat/Axmol226Compat.h"
 #include "cocos-ext.h"
 #include "ui/UIRichText.h"
 #include "spine/SkeletonRenderer.h"
-#define GCLIENT_BTUTIL_HAS_COCOS_EXT 1
-#define GCLIENT_BTUTIL_HAS_UIRICHTEXT 1
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <ctime>
+#include <initializer_list>
 #include <random>
-#include <sstream>
+#include <string_view>
 #include <typeinfo>
 #include <utility>
 
 USING_NS_CC;
 
 namespace {
-// IMPORTANT on Win32 MSVC: RAND_MAX is 32767, whereas Android libc rand() is 0..2147483647.
-// Using a 31-bit PRNG keeps BTUtil::random() in [0.0, 1.0) matching Android's / 2147483650.0.
+// 31-bit PRNG keeps BTUtil::random() in [0.0, 1.0) matching Android libc's / 2147483650.0.
 std::mt19937 s_rng(static_cast<uint32_t>(std::time(nullptr)));
 bool s_guideState = false;
 int64_t s_svrTimeOffset = 0;
 std::chrono::steady_clock::time_point s_timerStart = std::chrono::steady_clock::now();
 BTUtil::PostUnscheduleAllHook s_postUnscheduleAllHook;
+
+template <typename Target>
+bool matchesDynamicType(CCObject* obj, std::string_view typeName,
+                        std::initializer_list<std::string_view> names) {
+    for (std::string_view n : names) {
+        if (typeName == n) {
+            return dynamic_cast<Target*>(obj) != nullptr;
+        }
+    }
+    return false;
+}
+
+bool containsAnySubstring(std::string_view haystack, std::initializer_list<std::string_view> needles) {
+    for (std::string_view needle : needles) {
+        if (haystack.find(needle) != std::string_view::npos) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 void BTUtil::randomseed(unsigned int seed) {
@@ -40,18 +56,7 @@ double BTUtil::random() {
 }
 
 bool BTUtil::split(const std::string& str, char delim, std::vector<std::string>& out) {
-    if (str.empty()) return false;
-    size_t start = 0;
-    while (true) {
-        const size_t pos = str.find(delim, start);
-        if (pos == std::string::npos) break;
-        out.emplace_back(str.substr(start, pos - start));
-        start = pos + 1;
-    }
-    if (start < str.size()) {
-        out.emplace_back(str.substr(start));
-    }
-    return true;
+    return split(str, std::string(1, delim), out);
 }
 
 bool BTUtil::split(const std::string& str, const std::string& delim, std::vector<std::string>& out) {
@@ -84,18 +89,17 @@ CCArray* BTUtil::cutString(CCString* str, CCString* delim) {
     return arr;
 }
 
-// Matches 0x3418dc: splits UTF-8 string into individual codepoints.
 CCArray* BTUtil::splitString(const std::string& utf8Str) {
     CCArray* arr = CCArray::create();
     size_t i = 0;
     const size_t n = utf8Str.size();
     while (i < n) {
-        const unsigned char c = static_cast<unsigned char>(utf8Str[i]);
+        const auto c = static_cast<unsigned char>(utf8Str[i]);
         size_t step = 1;
-        if ((c & 0x80) == 0)       step = 1;
-        else if ((c >> 4) == 0x0F) step = 4;
-        else if ((c >> 5) == 0x07) step = 3;
-        else if ((c >> 6) == 0x03) step = 2;
+        if ((c & 0x80u) == 0)       step = 1;
+        else if ((c >> 4) == 0x0Fu) step = 4;
+        else if ((c >> 5) == 0x07u) step = 3;
+        else if ((c >> 6) == 0x03u) step = 2;
         if (i + step > n) step = n - i;
         arr->addObject(CCString::create(utf8Str.substr(i, step)));
         i += step;
@@ -105,113 +109,59 @@ CCArray* BTUtil::splitString(const std::string& utf8Str) {
 
 bool BTUtil::checkType(CCObject* obj, const std::string& typeName) {
     if (!obj || typeName.empty()) return false;
-
     if (typeName == "CCObject") return true;
-    if (typeName == "CCNode" && dynamic_cast<CCNode*>(obj) != nullptr) return true;
-    if (typeName == "CCScene" && dynamic_cast<CCScene*>(obj) != nullptr) return true;
-    if (typeName == "CCSprite" && dynamic_cast<CCSprite*>(obj) != nullptr) return true;
-    if (typeName == "CCLabelTTF" && dynamic_cast<CCLabelTTF*>(obj) != nullptr) return true;
-    if (typeName == "CCArray" && dynamic_cast<CCArray*>(obj) != nullptr) return true;
-    if (typeName == "CCDictionary" && dynamic_cast<CCDictionary*>(obj) != nullptr) return true;
-    if (typeName == "CCString" && dynamic_cast<CCString*>(obj) != nullptr) return true;
-    if (typeName == "CCInteger" && dynamic_cast<CCInteger*>(obj) != nullptr) return true;
 
-#if defined(GCLIENT_BTUTIL_HAS_COCOS_EXT)
-    if (typeName == "Layout" || typeName == "Panel" || typeName == "UIPanel" || typeName == "UILayout") {
-        if (dynamic_cast<cocos2d::ui::Layout*>(obj) != nullptr) return true;
+    if (matchesDynamicType<CCNode>(obj, typeName, {"CCNode"}) ||
+        matchesDynamicType<CCScene>(obj, typeName, {"CCScene"}) ||
+        matchesDynamicType<CCSprite>(obj, typeName, {"CCSprite"}) ||
+        matchesDynamicType<CCLabelTTF>(obj, typeName, {"CCLabelTTF"}) ||
+        matchesDynamicType<CCArray>(obj, typeName, {"CCArray"}) ||
+        matchesDynamicType<CCDictionary>(obj, typeName, {"CCDictionary"}) ||
+        matchesDynamicType<CCString>(obj, typeName, {"CCString"}) ||
+        matchesDynamicType<CCInteger>(obj, typeName, {"CCInteger"}) ||
+        matchesDynamicType<cocos2d::ui::Layout>(obj, typeName, {"Layout", "Panel", "UIPanel", "UILayout"}) ||
+        matchesDynamicType<cocos2d::ui::Widget>(obj, typeName, {"Widget", "UIWidget"}) ||
+        matchesDynamicType<cocos2d::ui::ScrollView>(obj, typeName, {"ScrollView", "UIScrollView"}) ||
+        matchesDynamicType<cocos2d::ui::ListView>(obj, typeName, {"ListView", "UIListView"}) ||
+        matchesDynamicType<cocos2d::ui::PageView>(obj, typeName, {"PageView", "UIPageView"}) ||
+        matchesDynamicType<cocos2d::ui::Button>(obj, typeName, {"Button", "UIButton"}) ||
+        matchesDynamicType<cocos2d::ui::ImageView>(obj, typeName, {"UIImageView", "ImageView"}) ||
+        matchesDynamicType<cocos2d::ui::Label>(obj, typeName, {"Label", "UILabel"}) ||
+        matchesDynamicType<cocos2d::ui::LabelAtlas>(obj, typeName, {"LabelAtlas", "UILabelAtlas"}) ||
+        matchesDynamicType<cocos2d::ui::LoadingBar>(obj, typeName, {"LoadingBar", "UILoadingBar"}) ||
+        matchesDynamicType<cocos2d::ui::Slider>(obj, typeName, {"Slider", "UISlider"}) ||
+        matchesDynamicType<cocos2d::ui::CheckBox>(obj, typeName, {"CheckBox", "UICheckBox"}) ||
+        matchesDynamicType<cocos2d::ui::TextField>(obj, typeName, {"TextField", "UITextField"}) ||
+        matchesDynamicType<spine::SkeletonRenderer>(obj, typeName,
+            {"SpineLuaAnimation", "SkeletonAnimation", "CCSkeletonAnimation", "CCSkeleton"}) ||
+        matchesDynamicType<cocos2d::extension::CCScale9Sprite>(obj, typeName, {"CCScale9Sprite", "Scale9Sprite"}) ||
+        matchesDynamicType<cocos2d::extension::CCArmature>(obj, typeName, {"CCArmature", "Armature"}) ||
+        matchesDynamicType<cocos2d::ui::RichText>(obj, typeName, {"RichText", "UIRichText"})) {
+        return true;
     }
-    if (typeName == "Widget" || typeName == "UIWidget") {
-        if (dynamic_cast<cocos2d::ui::Widget*>(obj) != nullptr) return true;
-    }
-    if (typeName == "ScrollView" || typeName == "UIScrollView") {
-        if (dynamic_cast<cocos2d::ui::ScrollView*>(obj) != nullptr) return true;
-    }
-    if (typeName == "ListView" || typeName == "UIListView") {
-        if (dynamic_cast<cocos2d::ui::ListView*>(obj) != nullptr) return true;
-    }
-    if (typeName == "PageView" || typeName == "UIPageView") {
-        if (dynamic_cast<cocos2d::ui::PageView*>(obj) != nullptr) return true;
-    }
-    if (typeName == "Button" || typeName == "UIButton") {
-        if (dynamic_cast<cocos2d::ui::Button*>(obj) != nullptr) return true;
-    }
-    if (typeName == "ImageView" || typeName == "UIImageView") {
-        if (dynamic_cast<cocos2d::ui::ImageView*>(obj) != nullptr) return true;
-    }
-    if (typeName == "Label" || typeName == "UILabel") {
-        if (dynamic_cast<cocos2d::ui::Label*>(obj) != nullptr) return true;
-    }
-    if (typeName == "LabelAtlas" || typeName == "UILabelAtlas") {
-        if (dynamic_cast<cocos2d::ui::LabelAtlas*>(obj) != nullptr) return true;
-    }
-    if (typeName == "LoadingBar" || typeName == "UILoadingBar") {
-        if (dynamic_cast<cocos2d::ui::LoadingBar*>(obj) != nullptr) return true;
-    }
-    if (typeName == "Slider" || typeName == "UISlider") {
-        if (dynamic_cast<cocos2d::ui::Slider*>(obj) != nullptr) return true;
-    }
-    if (typeName == "CheckBox" || typeName == "UICheckBox") {
-        if (dynamic_cast<cocos2d::ui::CheckBox*>(obj) != nullptr) return true;
-    }
-    if (typeName == "TextField" || typeName == "UITextField") {
-        if (dynamic_cast<cocos2d::ui::TextField*>(obj) != nullptr) return true;
-    }
-    if (typeName == "SpineLuaAnimation" ||
-        typeName == "SkeletonAnimation" ||
-        typeName == "CCSkeletonAnimation" ||
-        typeName == "CCSkeleton") {
-        if (dynamic_cast<spine::SkeletonRenderer*>(obj) != nullptr) return true;
-    }
-    if (typeName == "CCScale9Sprite" || typeName == "Scale9Sprite") {
-        if (dynamic_cast<cocos2d::extension::CCScale9Sprite*>(obj) != nullptr) return true;
-    }
-    if (typeName == "CCArmature" || typeName == "Armature") {
-        if (dynamic_cast<cocos2d::extension::CCArmature*>(obj) != nullptr) return true;
-    }
+
     if (auto* w = dynamic_cast<cocos2d::ui::Widget*>(obj)) {
         const std::string desc = w->getDescription();
-        if (desc == typeName) return true;
-        if ((desc == "Panel" && typeName == "Layout") ||
+        if (desc == typeName ||
+            (desc == "Panel" && typeName == "Layout") ||
             (desc == "Layout" && typeName == "Panel")) {
             return true;
         }
     }
-#endif
-
-#if defined(GCLIENT_BTUTIL_HAS_UIRICHTEXT)
-    if (typeName == "RichText" || typeName == "UIRichText") {
-        if (dynamic_cast<cocos2d::ui::RichText*>(obj) != nullptr) return true;
-    }
-#endif
 
     const std::string rttiName(typeid(*obj).name());
-    if (rttiName.find(typeName) != std::string::npos) {
+    if (rttiName.find(typeName) != std::string::npos) return true;
+    if ((typeName == "Layout" || typeName == "Panel") &&
+        containsAnySubstring(rttiName, {"Layout", "Panel", "ScrollView", "ListView", "PageView"})) {
         return true;
     }
-    if (typeName == "Layout" || typeName == "Panel") {
-        if (rttiName.find("Layout") != std::string::npos ||
-            rttiName.find("Panel") != std::string::npos ||
-            rttiName.find("ScrollView") != std::string::npos ||
-            rttiName.find("ListView") != std::string::npos ||
-            rttiName.find("PageView") != std::string::npos) {
-            return true;
-        }
+    if ((typeName == "SpineLuaAnimation" || typeName == "SkeletonAnimation") &&
+        containsAnySubstring(rttiName, {"GClientSkeletonAnimation", "CCSkeletonAnimation", "CCSkeleton", "SpineLuaAnimation"})) {
+        return true;
     }
-    if (typeName == "SpineLuaAnimation" || typeName == "SkeletonAnimation") {
-        if (rttiName.find("GClientSkeletonAnimation") != std::string::npos ||
-            rttiName.find("CCSkeletonAnimation") != std::string::npos ||
-            rttiName.find("CCSkeleton") != std::string::npos ||
-            rttiName.find("SpineLuaAnimation") != std::string::npos) {
-            return true;
-        }
+    if (typeName == "RichText" && containsAnySubstring(rttiName, {"GClientRichText", "RichText"})) {
+        return true;
     }
-    if (typeName == "RichText") {
-        if (rttiName.find("GClientRichText") != std::string::npos ||
-            rttiName.find("RichText") != std::string::npos) {
-            return true;
-        }
-    }
-
     return false;
 }
 
@@ -237,11 +187,6 @@ void BTUtil::setPostUnscheduleAllHook(PostUnscheduleAllHook hook) {
 }
 
 void BTUtil::unscheduleAll() {
-    // NEVER call CCScheduler::unscheduleAll(), which wipes CCDirector's CCActionManager
-    // (freezing all CCActions permanently), CCTextureCache async image loading,
-    // DeferredArmatureAsyncCallback, and WinHttpClient!
-    // Instead, delegate to s_postUnscheduleAllHook (wired by AppDelegate), which cleanly
-    // unschedules all tracked Lua CCScheduler script entries and re-verifies native loops.
     if (s_postUnscheduleAllHook) {
         PostUnscheduleAllHook hookCopy = s_postUnscheduleAllHook;
         hookCopy();
@@ -249,7 +194,7 @@ void BTUtil::unscheduleAll() {
 }
 
 std::string BTUtil::getMd5SumByString(const std::string& input) {
-    return CCCrypto::md5(input.data(), input.size(), false);
+    return gclient::crypto::md5Hex(input, false);
 }
 
 std::string BTUtil::getLuaOrigPackagePath() {
@@ -259,8 +204,7 @@ std::string BTUtil::getLuaOrigPackagePath() {
 std::string BTUtil::insertToSearchPathBegin(const std::string& path) {
     std::string norm = path;
     std::replace(norm.begin(), norm.end(), '\\', '/');
-    auto* fu = ax::FileUtils::getInstance();
-    if (fu) {
+    if (auto* fu = ax::FileUtils::getInstance()) {
         std::vector<std::string> paths = fu->getSearchPaths();
         paths.insert(paths.begin(), norm);
         fu->setSearchPaths(paths);
@@ -268,8 +212,6 @@ std::string BTUtil::insertToSearchPathBegin(const std::string& path) {
     return norm;
 }
 
-// Matches 0x346928: splits on '?', splits query on '&', sorts params lexicographically,
-// and concatenates them WITHOUT '&' separators for URL signing.
 std::string BTUtil::sortUrlString(const std::string& url) {
     if (url.empty()) return "";
     std::vector<std::string> halves;
@@ -286,8 +228,6 @@ std::string BTUtil::sortUrlString(const std::string& url) {
 }
 
 void BTUtil::exitNow() {
-    // Request clean Cocos2d-x / Win32 message-loop exit rather than std::exit(0),
-    // which would skip wWinMain stack unwinding, AppDelegate::shutdown(), and race worker threads!
     if (auto* director = ax::Director::getInstance()) {
         director->end();
     }
@@ -317,29 +257,19 @@ uint64_t BTUtil::TimeEnd() {
 // ============================================================================
 
 std::string ClassInfo::description(CCArray* arr) {
-    if (!arr) return "CCArray(null)";
-    std::ostringstream oss;
-    oss << "CCArray(count=" << arr->count() << ")";
-    return oss.str();
+    return arr ? ("CCArray(count=" + std::to_string(arr->count()) + ")") : "CCArray(null)";
 }
 
 std::string ClassInfo::description(CCDictionary* dict) {
-    if (!dict) return "CCDictionary(null)";
-    std::ostringstream oss;
-    oss << "CCDictionary(count=" << dict->count() << ")";
-    return oss.str();
+    return dict ? ("CCDictionary(count=" + std::to_string(dict->count()) + ")") : "CCDictionary(null)";
 }
 
 std::string ClassInfo::description(CCString* str) {
-    if (!str) return "CCString(null)";
-    return std::string("CCString(\"") + str->getCString() + "\")";
+    return str ? (std::string("CCString(\"") + str->getCString() + "\")") : "CCString(null)";
 }
 
 std::string ClassInfo::description(CCInteger* val) {
-    if (!val) return "CCInteger(null)";
-    std::ostringstream oss;
-    oss << "CCInteger(" << val->getValue() << ")";
-    return oss.str();
+    return val ? ("CCInteger(" + std::to_string(val->getValue()) + ")") : "CCInteger(null)";
 }
 
 std::string ClassInfo::description(const CCPoint& pt) {

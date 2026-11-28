@@ -1,5 +1,8 @@
 #include "GameUtil.h"
-#include "CCCrypto.h"
+#include "common/KestrelBinaryReader.h"
+#include "common/KestrelCrypto.h"
+#include "common/KestrelUtf8.h"
+
 #if defined(__has_include)
 #  if __has_include("net/LCPacket.h")
 #    include "net/LCPacket.h"
@@ -19,9 +22,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <span>
+#include <string_view>
 #include <vector>
 
 #ifdef _WIN32
@@ -43,55 +47,14 @@ namespace fs = std::filesystem;
 
 namespace {
 
-unsigned char fromHex(unsigned char c) {
-    if (c >= '0' && c <= '9') return static_cast<unsigned char>(c - '0');
-    if (c >= 'A' && c <= 'F') return static_cast<unsigned char>(c - 'A' + 10);
-    if (c >= 'a' && c <= 'f') return static_cast<unsigned char>(c - 'a' + 10);
-    return 0;
-}
+using gclient::common::readBE;
+using gclient::common::readLE;
+using gclient::common::writeBE;
+using gclient::utf8::fsPathToUtf8;
+using gclient::utf8::utf8ToFsPath;
 
-#ifdef _WIN32
-std::wstring utf8ToWide(const char* utf8) {
-    if (!utf8 || !*utf8) return {};
-    const int req = ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
-    if (req <= 0) return {};
-    std::wstring w(static_cast<size_t>(req), L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w.data(), req);
-    if (!w.empty() && w.back() == L'\0') {
-        w.pop_back();
-    }
-    return w;
-}
-
-std::string wideToUtf8(const std::wstring& w) {
-    if (w.empty()) return {};
-    const int req = ::WideCharToMultiByte(
-        CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-    if (req <= 0) return {};
-    std::string out(static_cast<size_t>(req), '\0');
-    ::WideCharToMultiByte(
-        CP_UTF8, 0, w.data(), static_cast<int>(w.size()), out.data(), req, nullptr, nullptr);
-    return out;
-}
-#endif
-
-fs::path utf8ToPath(const char* utf8) {
-    if (!utf8 || !*utf8) return {};
-#ifdef _WIN32
-    std::wstring w = utf8ToWide(utf8);
-    if (w.empty()) return {};
-    return fs::path(w);
-#else
-    return fs::path(utf8);
-#endif
-}
-
-std::string pathToUtf8(const fs::path& p) {
-#ifdef _WIN32
-    return wideToUtf8(p.wstring());
-#else
-    return p.string();
-#endif
+fs::path cstrToPath(const char* utf8) {
+    return (utf8 && *utf8) ? utf8ToFsPath(utf8) : fs::path{};
 }
 
 FILE* openFileRb(const fs::path& p) {
@@ -115,14 +78,10 @@ FILE* openFileWb(const fs::path& p) {
 bool normalizeZipEntryRelativePath(const char* rawEntryName, fs::path& outRel, bool& outIsDir) {
     outRel.clear();
     outIsDir = false;
-    if (!rawEntryName || !*rawEntryName) {
-        return false;
-    }
+    if (!rawEntryName || !*rawEntryName) return false;
 
     std::string normalized(rawEntryName);
-    for (char& ch : normalized) {
-        if (ch == '\\') ch = '/';
-    }
+    std::replace(normalized.begin(), normalized.end(), '\\', '/');
     if (!normalized.empty() && normalized.back() == '/') {
         outIsDir = true;
     }
@@ -136,41 +95,24 @@ bool normalizeZipEntryRelativePath(const char* rawEntryName, fs::path& outRel, b
         return outIsDir;
     }
 
-    const fs::path candidate = utf8ToPath(normalized.c_str());
+    const fs::path candidate = utf8ToFsPath(normalized);
     if (candidate.empty() || candidate.is_absolute() || candidate.has_root_name()) {
         return false;
     }
     for (const fs::path& part : candidate) {
-        if (part == "..") {
-            return false;
-        }
+        if (part == "..") return false;
     }
     outRel = candidate;
     return true;
 }
 
-inline uint16_t readZipLe16(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
-}
-
-inline uint32_t readZipLe32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-
-// Unicode-safe Central Directory ZIP extractor used when unzOpen cannot open UTF-8 paths on Win32
-// (or when minizip is unavailable in standalone harnesses).
+// Unicode-safe Central Directory ZIP extractor used when unzOpen cannot open UTF-8 paths on Win32.
 int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
-    if (std::fseek(zfp, 0, SEEK_END) != 0) {
-        return GameUtil::EUnzipBadFile;
-    }
+    if (std::fseek(zfp, 0, SEEK_END) != 0) return GameUtil::EUnzipBadFile;
     const long fileLenLong = std::ftell(zfp);
-    if (fileLenLong < 22) {
-        return GameUtil::EUnzipBadFile;
-    }
-    const size_t fileLen = static_cast<size_t>(fileLenLong);
+    if (fileLenLong < 22) return GameUtil::EUnzipBadFile;
+
+    const auto fileLen = static_cast<size_t>(fileLenLong);
     const size_t tailLen = std::min<size_t>(fileLen, 65557u);
     std::vector<uint8_t> tail(tailLen);
     if (std::fseek(zfp, static_cast<long>(fileLen - tailLen), SEEK_SET) != 0 ||
@@ -180,31 +122,28 @@ int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
 
     size_t eocdPos = tailLen;
     for (size_t i = tailLen - 22; ; --i) {
-        if (readZipLe32(tail.data() + i) == 0x06054b50u) {
+        if (readLE<uint32_t>(tail.data() + i) == 0x06054b50u) {
             eocdPos = i;
             break;
         }
         if (i == 0) break;
     }
-    if (eocdPos == tailLen) {
-        return GameUtil::EUnzipBadFile;
-    }
+    if (eocdPos == tailLen) return GameUtil::EUnzipBadFile;
 
     const uint8_t* eocd = tail.data() + eocdPos;
-    const uint16_t totalEntries = readZipLe16(eocd + 10);
-    const uint32_t cdSize = readZipLe32(eocd + 12);
-    const uint32_t cdOffset = readZipLe32(eocd + 16);
+    const auto totalEntries = readLE<uint16_t>(eocd + 10);
+    const auto cdSize = readLE<uint32_t>(eocd + 12);
+    const auto cdOffset = readLE<uint32_t>(eocd + 16);
     if (static_cast<size_t>(cdOffset) > fileLen ||
         static_cast<size_t>(cdSize) > fileLen - static_cast<size_t>(cdOffset)) {
         return GameUtil::EUnzipBadFile;
     }
 
     std::vector<uint8_t> cd(cdSize);
-    if (cdSize > 0) {
-        if (std::fseek(zfp, static_cast<long>(cdOffset), SEEK_SET) != 0 ||
-            std::fread(cd.data(), 1, cdSize, zfp) != cdSize) {
-            return GameUtil::EUnzipBadFile;
-        }
+    if (cdSize > 0 &&
+        (std::fseek(zfp, static_cast<long>(cdOffset), SEEK_SET) != 0 ||
+         std::fread(cd.data(), 1, cdSize, zfp) != cdSize)) {
+        return GameUtil::EUnzipBadFile;
     }
 
     size_t cdCursor = 0;
@@ -212,20 +151,16 @@ int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
     uint8_t outBuf[16384];
 
     for (uint16_t idx = 0; idx < totalEntries; ++idx) {
-        if (cdCursor + 46 > cd.size()) {
-            return GameUtil::EUnzipBadFile;
-        }
+        if (cdCursor + 46 > cd.size()) return GameUtil::EUnzipBadFile;
         const uint8_t* entry = cd.data() + cdCursor;
-        if (readZipLe32(entry) != 0x02014b50u) {
-            return GameUtil::EUnzipBadFile;
-        }
+        if (readLE<uint32_t>(entry) != 0x02014b50u) return GameUtil::EUnzipBadFile;
 
-        const uint16_t method = readZipLe16(entry + 10);
-        const uint32_t compSize = readZipLe32(entry + 20);
-        const uint16_t nameLen = readZipLe16(entry + 28);
-        const uint16_t extraLen = readZipLe16(entry + 30);
-        const uint16_t commentLen = readZipLe16(entry + 32);
-        const uint32_t localHeaderOff = readZipLe32(entry + 42);
+        const auto method = readLE<uint16_t>(entry + 10);
+        const auto compSize = readLE<uint32_t>(entry + 20);
+        const auto nameLen = readLE<uint16_t>(entry + 28);
+        const auto extraLen = readLE<uint16_t>(entry + 30);
+        const auto commentLen = readLE<uint16_t>(entry + 32);
+        const auto localHeaderOff = readLE<uint32_t>(entry + 42);
 
         const size_t varMetaLen =
             static_cast<size_t>(nameLen) + static_cast<size_t>(extraLen) + static_cast<size_t>(commentLen);
@@ -233,7 +168,7 @@ int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
             return GameUtil::EUnzipBadFile;
         }
         std::string entryName(reinterpret_cast<const char*>(entry + 46), nameLen);
-        cdCursor += 46 + nameLen + extraLen + commentLen;
+        cdCursor += 46 + varMetaLen;
 
         fs::path relPath;
         bool isDir = false;
@@ -241,9 +176,7 @@ int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
             return GameUtil::EUnzipBadFile;
         }
         const fs::path targetPath = baseDir.empty() ? relPath : (baseDir / relPath);
-        if (targetPath.empty()) {
-            continue;
-        }
+        if (targetPath.empty()) continue;
 
         if (isDir) {
             std::error_code ec;
@@ -260,12 +193,12 @@ int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
         uint8_t localHdr[30];
         if (std::fseek(zfp, static_cast<long>(localHeaderOff), SEEK_SET) != 0 ||
             std::fread(localHdr, 1, sizeof(localHdr), zfp) != sizeof(localHdr) ||
-            readZipLe32(localHdr) != 0x04034b50u) {
+            readLE<uint32_t>(localHdr) != 0x04034b50u) {
             return GameUtil::EUnzipBadFile;
         }
-        const uint16_t localNameLen = readZipLe16(localHdr + 26);
-        const uint16_t localExtraLen = readZipLe16(localHdr + 28);
-        const size_t localHdrTotal = 30u + static_cast<size_t>(localNameLen) + static_cast<size_t>(localExtraLen);
+        const size_t localHdrTotal =
+            30u + static_cast<size_t>(readLE<uint16_t>(localHdr + 26)) +
+            static_cast<size_t>(readLE<uint16_t>(localHdr + 28));
         if (fileLen - static_cast<size_t>(localHeaderOff) < localHdrTotal) {
             return GameUtil::EUnzipBadFile;
         }
@@ -276,14 +209,11 @@ int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
         }
 
         std::error_code ec;
-        const fs::path parent = targetPath.parent_path();
-        if (!parent.empty()) {
+        if (const fs::path parent = targetPath.parent_path(); !parent.empty()) {
             fs::create_directories(parent, ec);
         }
         FILE* fp = openFileWb(targetPath);
-        if (!fp) {
-            return GameUtil::EUnzipBadFile;
-        }
+        if (!fp) return GameUtil::EUnzipBadFile;
 
         if (method == 0) {
             size_t rem = compSize;
@@ -343,7 +273,6 @@ int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
             std::fclose(fp);
             return GameUtil::EUnzipBadFile;
         }
-
         std::fclose(fp);
     }
 
@@ -355,19 +284,17 @@ int extractZipViaFileStream(FILE* zfp, const fs::path& baseDir) {
 int GameUtil::rename(const char* oldPath, const char* newPath) {
     if (!oldPath || !newPath) return -1;
 #ifdef _WIN32
-    const std::wstring oldW = utf8ToWide(oldPath);
-    const std::wstring newW = utf8ToWide(newPath);
+    const std::wstring oldW = gclient::utf8::utf8ToWide(oldPath);
+    const std::wstring newW = gclient::utf8::utf8ToWide(newPath);
     if (oldW.empty() || newW.empty()) return -1;
     std::error_code ec;
-    const fs::path parent = fs::path(newW).parent_path();
-    if (!parent.empty()) {
+    if (const fs::path parent = fs::path(newW).parent_path(); !parent.empty()) {
         fs::create_directories(parent, ec);
     }
     return ::MoveFileExW(oldW.c_str(), newW.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) ? 0 : -1;
 #else
     std::error_code ec;
-    const fs::path parent = fs::path(newPath).parent_path();
-    if (!parent.empty()) {
+    if (const fs::path parent = fs::path(newPath).parent_path(); !parent.empty()) {
         fs::create_directories(parent, ec);
     }
     return std::rename(oldPath, newPath);
@@ -375,8 +302,7 @@ int GameUtil::rename(const char* oldPath, const char* newPath) {
 }
 
 int GameUtil::mkdir(const char* path) {
-    if (!path || !*path) return -1;
-    const fs::path p = utf8ToPath(path);
+    const fs::path p = cstrToPath(path);
     if (p.empty()) return -1;
     std::error_code ec;
     if (fs::is_directory(p, ec)) return 0;
@@ -385,8 +311,7 @@ int GameUtil::mkdir(const char* path) {
 }
 
 int GameUtil::rmdir(const char* path) {
-    if (!path || !*path) return -1;
-    const fs::path p = utf8ToPath(path);
+    const fs::path p = cstrToPath(path);
     if (p.empty()) return -1;
     std::error_code ec;
     return fs::remove(p, ec) ? 0 : -1;
@@ -395,9 +320,8 @@ int GameUtil::rmdir(const char* path) {
 int GameUtil::unlink(const char* path) {
     if (!path || !*path) return -1;
 #ifdef _WIN32
-    const std::wstring w = utf8ToWide(path);
-    if (w.empty()) return -1;
-    return ::_wunlink(w.c_str());
+    const std::wstring w = gclient::utf8::utf8ToWide(path);
+    return w.empty() ? -1 : ::_wunlink(w.c_str());
 #else
     return ::unlink(path);
 #endif
@@ -406,20 +330,16 @@ int GameUtil::unlink(const char* path) {
 int GameUtil::access(const char* path, int mode) {
     if (!path || !*path) return -1;
 #ifdef _WIN32
-    const std::wstring w = utf8ToWide(path);
-    if (w.empty()) return -1;
-    // MSVC _waccess only supports 00 (existence), 02 (write), 04 (read), and 06 (read/write);
-    // masking bit 1 avoids MSVC invalid-parameter assertions if EXOk (1) is passed.
-    const int winMode = mode & 0x06;
-    return ::_waccess(w.c_str(), winMode);
+    const std::wstring w = gclient::utf8::utf8ToWide(path);
+    // MSVC _waccess only supports 00, 02, 04, and 06; mask bit 1 to avoid assertions on EXOk.
+    return w.empty() ? -1 : ::_waccess(w.c_str(), mode & 0x06);
 #else
     return ::access(path, mode);
 #endif
 }
 
 bool GameUtil::isDir(const char* path) {
-    if (!path || !*path) return false;
-    const fs::path p = utf8ToPath(path);
+    const fs::path p = cstrToPath(path);
     if (p.empty()) return false;
     std::error_code ec;
     return fs::is_directory(p, ec);
@@ -427,19 +347,16 @@ bool GameUtil::isDir(const char* path) {
 
 CCArray* GameUtil::readdir(const char* path) {
     CCArray* arr = CCArray::create();
-    if (!path || path[0] == '\0') return arr;
-    const fs::path p = utf8ToPath(path);
+    const fs::path p = cstrToPath(path);
     if (p.empty()) return arr;
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(p, ec)) {
-        arr->addObject(CCString::create(pathToUtf8(entry.path().filename())));
+        arr->addObject(CCString::create(fsPathToUtf8(entry.path().filename())));
     }
     return arr;
 }
 
 int GameUtil::getDPI() {
-    // Fixed 160 baseline DPI (Android mdpi = 1.0x) so Windows 125%/150% desktop scaling
-    // never distorts Util:px2dp / px2pt UI layouts.
     return 160;
 }
 
@@ -447,48 +364,38 @@ std::string GameUtil::getExternalStorageLocation() {
     return ax::FileUtils::getInstance()->getWritablePath();
 }
 
-// Matches 0x2b4520: returns 0 (EUnzipOk), 1 (EUnzipFileNotExist), 2 (EUnzipBadFile), 3 (EUnzipOutOfStorage).
 int GameUtil::unzip(const char* zipPath, const char* dstDir) {
-    if (!zipPath || zipPath[0] == '\0') return EUnzipFileNotExist;
-
-    const fs::path zipFsPath = utf8ToPath(zipPath);
+    const fs::path zipFsPath = cstrToPath(zipPath);
     if (zipFsPath.empty()) return EUnzipFileNotExist;
     std::error_code existEc;
     if (!fs::exists(zipFsPath, existEc) || fs::is_directory(zipFsPath, existEc)) {
         return EUnzipFileNotExist;
     }
 
-    const fs::path baseDir = utf8ToPath(dstDir ? dstDir : "");
-
+    const fs::path baseDir = cstrToPath(dstDir);
     unzFile zf = nullptr;
 #ifdef _WIN32
-    // Only pass narrow path to unzOpen if zipPath is pure ASCII; non-ASCII UTF-8 paths
-    // (such as Vietnamese user profile directories) go directly through _wfopen below.
     bool isPureAscii = true;
-    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(zipPath); *p != '\0'; ++p) {
+    for (const auto* p = reinterpret_cast<const unsigned char*>(zipPath); *p != '\0'; ++p) {
         if (*p >= 0x80u) {
             isPureAscii = false;
             break;
         }
     }
-    if (isPureAscii) {
-        zf = unzOpen(zipPath);
-    }
+    if (isPureAscii) zf = unzOpen(zipPath);
 #else
     zf = unzOpen(zipPath);
 #endif
 
     if (!zf) {
         FILE* zfp = openFileRb(zipFsPath);
-        if (!zfp) {
-            return EUnzipFileNotExist;
-        }
+        if (!zfp) return EUnzipFileNotExist;
         const int streamRes = extractZipViaFileStream(zfp, baseDir);
         std::fclose(zfp);
         return streamRes;
     }
 
-    unz_global_info gi;
+    unz_global_info gi{};
     if (unzGetGlobalInfo(zf, &gi) != UNZ_OK) {
         unzClose(zf);
         return EUnzipBadFile;
@@ -503,7 +410,8 @@ int GameUtil::unzip(const char* zipPath, const char* dstDir) {
             return EUnzipBadFile;
         }
         std::string dynName(static_cast<size_t>(fi.size_filename) + 1u, '\0');
-        if (unzGetCurrentFileInfo(zf, &fi, dynName.data(), static_cast<uLong>(dynName.size()), nullptr, 0, nullptr, 0) != UNZ_OK) {
+        if (unzGetCurrentFileInfo(zf, &fi, dynName.data(), static_cast<uLong>(dynName.size()),
+                                  nullptr, 0, nullptr, 0) != UNZ_OK) {
             unzClose(zf);
             return EUnzipBadFile;
         }
@@ -530,8 +438,7 @@ int GameUtil::unzip(const char* zipPath, const char* dstDir) {
                 return EUnzipBadFile;
             }
             std::error_code ec;
-            const fs::path parent = targetPath.parent_path();
-            if (!parent.empty()) {
+            if (const fs::path parent = targetPath.parent_path(); !parent.empty()) {
                 fs::create_directories(parent, ec);
             }
             FILE* fp = openFileWb(targetPath);
@@ -573,7 +480,7 @@ std::string GameUtil::convertEncoding(const char* str, const char* /*encoding*/)
 }
 
 CCArray* GameUtil::getAssetFiles(const char* subDir) {
-    std::string base = ax::FileUtils::getInstance()->fullPathForFilename(subDir ? subDir : "");
+    const std::string base = ax::FileUtils::getInstance()->fullPathForFilename(subDir ? subDir : "");
     return readdir(base.c_str());
 }
 
@@ -582,95 +489,49 @@ void GameUtil::installApk(const char* /*path*/) {}
 void GameUtil::setTimeZone(int /*tz*/) {}
 
 uint64_t GameUtil::getMicroSeconds() {
-    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now).count());
 }
 
-// Matches GameUtil::makeLCPacket @ 0x2b4b04:
-// Delegates directly to gclient::net::LCPacket::makeLCPacket(data, true).
 std::string GameUtil::makeLCPacket(const std::string& data) {
     return gclient::net::LCPacket::makeLCPacket(data, true);
 }
 
-// Big-endian 32-bit helpers (matches 0x2B3680 and 0x2B2A48)
 uint32_t GameUtil::getU32(const std::string& data) {
-    if (data.size() < 4) return 0;
-    const auto* b = reinterpret_cast<const unsigned char*>(data.data());
-    return (uint32_t(b[0]) << 24) | (uint32_t(b[1]) << 16) | (uint32_t(b[2]) << 8) | uint32_t(b[3]);
+    return readBE<uint32_t>(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(data.data()), data.size()));
 }
 
 std::string GameUtil::writeU32(uint32_t val, char* optionalBuf) {
     std::string out(4, '\0');
-    char* dst = optionalBuf ? optionalBuf : &out[0];
-    dst[0] = static_cast<char>((val >> 24) & 0xFF);
-    dst[1] = static_cast<char>((val >> 16) & 0xFF);
-    dst[2] = static_cast<char>((val >> 8) & 0xFF);
-    dst[3] = static_cast<char>(val & 0xFF);
+    writeBE<uint32_t>(reinterpret_cast<uint8_t*>(out.data()), val);
     if (optionalBuf) {
-        std::memcpy(&out[0], optionalBuf, 4);
+        std::memcpy(optionalBuf, out.data(), 4);
     }
     return out;
 }
 
 std::string GameUtil::zipData(const std::string& data) {
     if (data.empty()) return "";
-    uLongf destLen = compressBound(static_cast<uLong>(data.size()));
-    std::string res(destLen, '\0');
-    if (compress2(reinterpret_cast<Bytef*>(&res[0]), &destLen,
-                  reinterpret_cast<const Bytef*>(data.data()),
-                  static_cast<uLong>(data.size()), Z_DEFAULT_COMPRESSION) != Z_OK) {
-        return "";
-    }
-    res.resize(destLen);
-    return res;
+    std::string out;
+    return gclient::crypto::zlibCompress(data.data(), data.size(), out) ? out : std::string{};
 }
 
 std::string GameUtil::unzipData(const std::string& data) {
     if (data.empty()) return "";
     std::string out;
-    if (!gclient::net::LCPacket::zlibDecompress(
-            reinterpret_cast<const uint8_t*>(data.data()),
-            data.size(),
-            out)) {
-        return "";
+    if (gclient::crypto::zlibDecompress(data.data(), data.size(), out) ||
+        gclient::net::LCPacket::zlibDecompress(
+            reinterpret_cast<const uint8_t*>(data.data()), data.size(), out)) {
+        return out;
     }
-    return out;
+    return "";
 }
 
-// Matches 0x2B3874
 std::string GameUtil::urlEncode(const std::string& str) {
-    static const char HEX[] = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(str.size());
-    for (unsigned char c : str) {
-        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                                (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
-        if (unreserved) {
-            out.push_back(static_cast<char>(c));
-        } else {
-            out.push_back('%');
-            out.push_back(HEX[c >> 4]);
-            out.push_back(HEX[c & 0x0F]);
-        }
-    }
-    return out;
+    return gclient::utf8::urlEncode(str);
 }
 
-// Matches 0x2B3D3C
 std::string GameUtil::urlDecode(const std::string& str) {
-    std::string out;
-    out.reserve(str.size());
-    for (size_t i = 0; i < str.size(); ++i) {
-        if (str[i] == '%' && i + 2 < str.size()) {
-            const unsigned char hi = fromHex(static_cast<unsigned char>(str[i + 1]));
-            const unsigned char lo = fromHex(static_cast<unsigned char>(str[i + 2]));
-            out.push_back(static_cast<char>((hi << 4) | lo));
-            i += 2;
-        } else if (str[i] == '+') {
-            out.push_back(' ');
-        } else {
-            out.push_back(str[i]);
-        }
-    }
-    return out;
+    return gclient::utf8::urlDecode(str);
 }

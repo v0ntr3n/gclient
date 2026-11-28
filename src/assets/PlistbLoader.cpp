@@ -1,11 +1,17 @@
 #include "PlistbLoader.h"
 
 #include "BtDecryptHook.h"
+#include "common/KestrelBinaryReader.h"
+#include "common/KestrelCrypto.h"
+#include "common/KestrelUtf8.h"
 
-#include <cctype>
+#include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <span>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -18,138 +24,70 @@ namespace assets {
 
 namespace {
 
-std::mutex                                               g_loadedPlistbMutex;
-std::unordered_set<std::string>                          g_loadedPlistbFiles;
+using gclient::common::endsWithAsciiCI;
+using gclient::common::readFixedCString;
+using gclient::common::readLE;
+using gclient::common::startsWithAsciiCI;
+using gclient::common::trimAscii;
+
+std::mutex                                                g_loadedPlistbMutex;
+std::unordered_set<std::string>                           g_loadedPlistbFiles;
 std::unordered_map<std::string, std::vector<std::string>> g_plistFrameNamesMap;
-
-uint16_t ReadLE16U(const uint8_t* ptr) {
-    return static_cast<uint16_t>(ptr[0]) |
-           (static_cast<uint16_t>(ptr[1]) << 8);
-}
-
-int16_t ReadLE16S(const uint8_t* ptr) {
-    return static_cast<int16_t>(ReadLE16U(ptr));
-}
-
-uint32_t ReadLE32U(const uint8_t* ptr) {
-    return static_cast<uint32_t>(ptr[0]) |
-           (static_cast<uint32_t>(ptr[1]) << 8) |
-           (static_cast<uint32_t>(ptr[2]) << 16) |
-           (static_cast<uint32_t>(ptr[3]) << 24);
-}
 
 bool ReadValidatedFixedCString(const uint8_t* ptr,
                                size_t maxLen,
                                bool requireNonEmpty,
                                std::string* outStr) {
-    const void* nulPos = std::memchr(ptr, '\0', maxLen);
-    if (nulPos == nullptr) {
+    if (std::memchr(ptr, '\0', maxLen) == nullptr) {
         return false;
     }
-    const size_t len = static_cast<size_t>(static_cast<const uint8_t*>(nulPos) - ptr);
-    if (requireNonEmpty && len == 0) {
+    std::string s = readFixedCString(std::span<const uint8_t>(ptr, maxLen), 0, maxLen);
+    if (requireNonEmpty && s.empty()) {
         return false;
     }
-    for (size_t i = 0; i < len; ++i) {
-        if (ptr[i] < 0x20u || ptr[i] == 0x7Fu) {
+    for (unsigned char ch : s) {
+        if (ch < 0x20u || ch == 0x7Fu) {
             return false;
         }
     }
-    if (outStr) {
-        outStr->assign(reinterpret_cast<const char*>(ptr), len);
-    }
-    return true;
-}
-
-bool StartsWithAsciiCI(const uint8_t* ptr, size_t rem, const char* prefix) {
-    const size_t pLen = std::strlen(prefix);
-    if (rem < pLen) {
-        return false;
-    }
-    for (size_t i = 0; i < pLen; ++i) {
-        const unsigned char a = ptr[i];
-        const unsigned char b = static_cast<unsigned char>(prefix[i]);
-        if (std::tolower(a) != std::tolower(b)) {
-            return false;
-        }
-    }
+    if (outStr) *outStr = std::move(s);
     return true;
 }
 
 bool LooksLikePlaintextXmlPlist(const uint8_t* data, size_t size) {
-    if (!data || size == 0) {
-        return false;
-    }
-    size_t off = 0;
-    if (size >= 3 && data[0] == 0xEFu && data[1] == 0xBBu && data[2] == 0xBFu) {
-        off = 3;
-    }
-    while (off < size && (data[off] == ' ' || data[off] == '\t' ||
-                          data[off] == '\r' || data[off] == '\n')) {
-        ++off;
-    }
-    const size_t rem = size - off;
-    return StartsWithAsciiCI(data + off, rem, "<?xml") ||
-           StartsWithAsciiCI(data + off, rem, "<plist") ||
-           StartsWithAsciiCI(data + off, rem, "<!doctype") ||
-           StartsWithAsciiCI(data + off, rem, "<!--");
-}
-
-bool EndsWithCaseInsensitive(const std::string& str, const char* suffix) {
-    const size_t sufLen = std::strlen(suffix);
-    if (str.size() < sufLen) {
-        return false;
-    }
-    const size_t offset = str.size() - sufLen;
-    for (size_t i = 0; i < sufLen; ++i) {
-        const unsigned char a = static_cast<unsigned char>(str[offset + i]);
-        const unsigned char b = static_cast<unsigned char>(suffix[i]);
-        if (std::tolower(a) != std::tolower(b)) {
-            return false;
-        }
-    }
-    return true;
+    if (!data || size == 0) return false;
+    size_t off = (size >= 3 && data[0] == 0xEFu && data[1] == 0xBBu && data[2] == 0xBFu) ? 3u : 0u;
+    const std::string_view sv = trimAscii(
+        std::string_view(reinterpret_cast<const char*>(data + off), size - off));
+    return startsWithAsciiCI(sv, "<?xml") || startsWithAsciiCI(sv, "<plist") ||
+           startsWithAsciiCI(sv, "<!doctype") || startsWithAsciiCI(sv, "<!--");
 }
 
 std::string StripTextureExtension(const std::string& normalizedPath) {
-    if (EndsWithCaseInsensitive(normalizedPath, ".pvr.ccz")) {
+    if (endsWithAsciiCI(normalizedPath, ".pvr.ccz")) {
         return normalizedPath.substr(0, normalizedPath.size() - 8);
     }
-    if (EndsWithCaseInsensitive(normalizedPath, ".pvr.gz")) {
+    if (endsWithAsciiCI(normalizedPath, ".pvr.gz")) {
         return normalizedPath.substr(0, normalizedPath.size() - 7);
     }
     const size_t slashPos = normalizedPath.find_last_of('/');
     const size_t dotPos   = normalizedPath.find_last_of('.');
-    if (dotPos == std::string::npos ||
-        (slashPos != std::string::npos && dotPos < slashPos)) {
+    if (dotPos == std::string::npos || (slashPos != std::string::npos && dotPos < slashPos)) {
         return normalizedPath;
     }
     return normalizedPath.substr(0, dotPos);
 }
 
 void AppendUniqueCandidate(std::vector<std::string>& out, const std::string& candidate) {
-    if (candidate.empty()) {
-        return;
+    if (!candidate.empty() && std::find(out.begin(), out.end(), candidate) == out.end()) {
+        out.push_back(candidate);
     }
-    for (const std::string& existing : out) {
-        if (existing == candidate) {
-            return;
-        }
-    }
-    out.push_back(candidate);
 }
 
 std::string BuildPlistbPath(const std::string& plistPath) {
     const std::string norm = NormalizeAssetPath(plistPath);
-    if (norm.empty()) {
-        return norm;
-    }
-    if (EndsWithCaseInsensitive(norm, ".plistb")) {
-        return norm;
-    }
-    if (EndsWithCaseInsensitive(norm, ".plist")) {
-        return norm + "b";
-    }
+    if (norm.empty() || endsWithAsciiCI(norm, ".plistb")) return norm;
+    if (endsWithAsciiCI(norm, ".plist")) return norm + "b";
     return ReplaceFileExtension(norm, ".plistb");
 }
 
@@ -157,15 +95,8 @@ std::string BuildPlistbPath(const std::string& plistPath) {
 
 std::string BuildXmlPlistPath(const std::string& plistPath) {
     const std::string norm = NormalizeAssetPath(plistPath);
-    if (norm.empty()) {
-        return norm;
-    }
-    if (EndsWithCaseInsensitive(norm, ".plistb")) {
-        return norm.substr(0, norm.size() - 1);
-    }
-    if (EndsWithCaseInsensitive(norm, ".plist")) {
-        return norm;
-    }
+    if (norm.empty() || endsWithAsciiCI(norm, ".plist")) return norm;
+    if (endsWithAsciiCI(norm, ".plistb")) return norm.substr(0, norm.size() - 1);
     return ReplaceFileExtension(norm, ".plist");
 }
 
@@ -175,36 +106,38 @@ void SetDictString(cocos2d::CCDictionary* dict, const std::string& key, const st
     strObj->release();
 }
 
+void SetDictFmt(cocos2d::CCDictionary* dict, const std::string& key, const char* fmt, ...) {
+    char    buf[128];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    SetDictString(dict, key, buf);
+}
+
 std::string UnescapeXmlText(const char* s, size_t len) {
+    struct EntitySpec {
+        std::string_view token;
+        char             ch;
+    };
+    static constexpr EntitySpec kEntities[] = {
+        {"&amp;", '&'}, {"&lt;", '<'}, {"&gt;", '>'}, {"&quot;", '"'}, {"&apos;", '\''}};
+
     std::string out;
     out.reserve(len);
+    const std::string_view sv(s, len);
     for (size_t i = 0; i < len; ++i) {
         if (s[i] == '&') {
-            if (i + 4 < len && std::memcmp(s + i, "&amp;", 5) == 0) {
-                out.push_back('&');
-                i += 4;
-                continue;
+            bool matched = false;
+            for (const auto& ent : kEntities) {
+                if (sv.substr(i).starts_with(ent.token)) {
+                    out.push_back(ent.ch);
+                    i += ent.token.size() - 1;
+                    matched = true;
+                    break;
+                }
             }
-            if (i + 3 < len && std::memcmp(s + i, "&lt;", 4) == 0) {
-                out.push_back('<');
-                i += 3;
-                continue;
-            }
-            if (i + 3 < len && std::memcmp(s + i, "&gt;", 4) == 0) {
-                out.push_back('>');
-                i += 3;
-                continue;
-            }
-            if (i + 5 < len && std::memcmp(s + i, "&quot;", 6) == 0) {
-                out.push_back('"');
-                i += 5;
-                continue;
-            }
-            if (i + 5 < len && std::memcmp(s + i, "&apos;", 6) == 0) {
-                out.push_back('\'');
-                i += 5;
-                continue;
-            }
+            if (matched) continue;
         }
         out.push_back(s[i]);
     }
@@ -223,23 +156,13 @@ struct XmlCursor {
             }
             if (end - p >= 4 && std::memcmp(p, "<!--", 4) == 0) {
                 p += 4;
-                while (end - p >= 3 && std::memcmp(p, "-->", 3) != 0) {
-                    ++p;
-                }
-                if (end - p >= 3) {
-                    p += 3;
-                } else {
-                    p = end;
-                }
+                while (end - p >= 3 && std::memcmp(p, "-->", 3) != 0) ++p;
+                p = (end - p >= 3) ? (p + 3) : end;
                 continue;
             }
             if (end - p >= 2 && (std::memcmp(p, "<?", 2) == 0 || std::memcmp(p, "<!", 2) == 0)) {
-                while (p < end && *p != '>') {
-                    ++p;
-                }
-                if (p < end) {
-                    ++p;
-                }
+                while (p < end && *p != '>') ++p;
+                if (p < end) ++p;
                 continue;
             }
             break;
@@ -248,9 +171,7 @@ struct XmlCursor {
 
     bool readNextTag(std::string* outName, bool* outIsClosing, bool* outSelfClosing) {
         skipWsAndComments();
-        if (p >= end || *p != '<') {
-            return false;
-        }
+        if (p >= end || *p != '<') return false;
         ++p;
         *outIsClosing   = false;
         *outSelfClosing = false;
@@ -259,31 +180,29 @@ struct XmlCursor {
             ++p;
         }
         const char* nameStart = p;
-        while (p < end && *p != '>' && *p != '/' &&
-               *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
+        while (p < end && *p != '>' && *p != '/' && *p != ' ' && *p != '\t' && *p != '\r' &&
+               *p != '\n') {
             ++p;
         }
         outName->assign(nameStart, static_cast<size_t>(p - nameStart));
         while (p < end && *p != '>') {
-            if (*p == '/' && (p + 1 < end && p[1] == '>')) {
-                *outSelfClosing = true;
-            }
+            if (*p == '/' && (p + 1 < end && p[1] == '>')) *outSelfClosing = true;
             ++p;
         }
-        if (p >= end || *p != '>') {
-            return false;
-        }
+        if (p >= end || *p != '>') return false;
         ++p;
         return !outName->empty();
     }
 
     bool readElementTextUntilClose(const std::string& tagName, std::string* outText) {
-        const char* textStart = p;
-        const std::string closeSeq = "</" + tagName + ">";
+        const char*       textStart = p;
+        const std::string closeSeq  = "</" + tagName + ">";
         while (p < end) {
             if (*p == '<' && static_cast<size_t>(end - p) >= closeSeq.size() &&
                 std::memcmp(p, closeSeq.data(), closeSeq.size()) == 0) {
-                *outText = UnescapeXmlText(textStart, static_cast<size_t>(p - textStart));
+                if (outText) {
+                    *outText = UnescapeXmlText(textStart, static_cast<size_t>(p - textStart));
+                }
                 p += closeSeq.size();
                 return true;
             }
@@ -299,80 +218,52 @@ cocos2d::CCObject* ParseXmlPlistValue(XmlCursor& cur,
                                       int depth);
 
 cocos2d::CCDictionary* ParseXmlDictBody(XmlCursor& cur, int depth) {
-    if (depth > 32) {
-        return nullptr;
-    }
+    if (depth > 32) return nullptr;
     auto* dict = new cocos2d::CCDictionary();
     while (true) {
         std::string tag;
-        bool        isClosing   = false;
-        bool        selfClosing = false;
-        if (!cur.readNextTag(&tag, &isClosing, &selfClosing)) {
-            dict->release();
-            return nullptr;
-        }
+        bool        isClosing = false, selfClosing = false;
+        if (!cur.readNextTag(&tag, &isClosing, &selfClosing)) break;
         if (isClosing) {
-            if (tag == "dict") {
-                return dict;
-            }
-            dict->release();
-            return nullptr;
+            if (tag == "dict") return dict;
+            break;
         }
-        if (tag != "key") {
-            dict->release();
-            return nullptr;
-        }
+        if (tag != "key") break;
+
         std::string keyName;
-        if (!selfClosing && !cur.readElementTextUntilClose("key", &keyName)) {
-            dict->release();
-            return nullptr;
-        }
+        if (!selfClosing && !cur.readElementTextUntilClose("key", &keyName)) break;
 
         std::string valTag;
-        bool        valClosing     = false;
-        bool        valSelfClosing = false;
-        if (!cur.readNextTag(&valTag, &valClosing, &valSelfClosing) || valClosing) {
-            dict->release();
-            return nullptr;
-        }
+        bool        valClosing = false, valSelfClosing = false;
+        if (!cur.readNextTag(&valTag, &valClosing, &valSelfClosing) || valClosing) break;
+
         cocos2d::CCObject* valObj = ParseXmlPlistValue(cur, valTag, valSelfClosing, depth + 1);
-        if (!valObj) {
-            dict->release();
-            return nullptr;
-        }
+        if (!valObj) break;
         dict->setObject(valObj, keyName);
         valObj->release();
     }
+    dict->release();
+    return nullptr;
 }
 
 cocos2d::CCArray* ParseXmlArrayBody(XmlCursor& cur, int depth) {
-    if (depth > 32) {
-        return nullptr;
-    }
+    if (depth > 32) return nullptr;
     auto* arr = new cocos2d::CCArray();
     while (true) {
         std::string tag;
-        bool        isClosing   = false;
-        bool        selfClosing = false;
-        if (!cur.readNextTag(&tag, &isClosing, &selfClosing)) {
-            arr->release();
-            return nullptr;
-        }
+        bool        isClosing = false, selfClosing = false;
+        if (!cur.readNextTag(&tag, &isClosing, &selfClosing)) break;
         if (isClosing) {
-            if (tag == "array") {
-                return arr;
-            }
-            arr->release();
-            return nullptr;
+            if (tag == "array") return arr;
+            break;
         }
         cocos2d::CCObject* item = ParseXmlPlistValue(cur, tag, selfClosing, depth + 1);
-        if (!item) {
-            arr->release();
-            return nullptr;
-        }
+        if (!item) break;
         arr->addObject(item);
         item->release();
     }
+    arr->release();
+    return nullptr;
 }
 
 cocos2d::CCObject* ParseXmlPlistValue(XmlCursor& cur,
@@ -380,84 +271,49 @@ cocos2d::CCObject* ParseXmlPlistValue(XmlCursor& cur,
                                       bool selfClosing,
                                       int depth) {
     if (openTag == "dict") {
-        if (selfClosing) {
-            return new cocos2d::CCDictionary();
-        }
-        return ParseXmlDictBody(cur, depth);
+        return selfClosing ? new cocos2d::CCDictionary() : ParseXmlDictBody(cur, depth);
     }
     if (openTag == "array") {
-        if (selfClosing) {
-            return new cocos2d::CCArray();
-        }
-        return ParseXmlArrayBody(cur, depth);
+        return selfClosing ? new cocos2d::CCArray() : ParseXmlArrayBody(cur, depth);
     }
-    if (openTag == "true") {
-        if (!selfClosing) {
-            std::string dummy;
-            (void)cur.readElementTextUntilClose("true", &dummy);
-        }
-        return new cocos2d::CCString("1");
-    }
-    if (openTag == "false") {
-        if (!selfClosing) {
-            std::string dummy;
-            (void)cur.readElementTextUntilClose("false", &dummy);
-        }
-        return new cocos2d::CCString("0");
+    if (openTag == "true" || openTag == "false") {
+        if (!selfClosing) (void)cur.readElementTextUntilClose(openTag, nullptr);
+        return new cocos2d::CCString(openTag == "true" ? "1" : "0");
     }
     if (openTag == "string" || openTag == "integer" || openTag == "real" || openTag == "data") {
-        if (selfClosing) {
-            return new cocos2d::CCString("");
-        }
+        if (selfClosing) return new cocos2d::CCString("");
         std::string text;
-        if (!cur.readElementTextUntilClose(openTag, &text)) {
-            return nullptr;
-        }
-        return new cocos2d::CCString(text);
+        return cur.readElementTextUntilClose(openTag, &text) ? new cocos2d::CCString(text)
+                                                             : nullptr;
     }
     return nullptr;
 }
 
 cocos2d::CCDictionary* ParseXmlPlistToDictionary(const uint8_t* data, size_t size) {
-    size_t off = 0;
-    if (size >= 3 && data[0] == 0xEFu && data[1] == 0xBBu && data[2] == 0xBFu) {
-        off = 3;
-    }
-    XmlCursor cur;
-    cur.p   = reinterpret_cast<const char*>(data + off);
-    cur.end = reinterpret_cast<const char*>(data + size);
+    const size_t off =
+        (size >= 3 && data[0] == 0xEFu && data[1] == 0xBBu && data[2] == 0xBFu) ? 3u : 0u;
+    XmlCursor cur{reinterpret_cast<const char*>(data + off),
+                  reinterpret_cast<const char*>(data + size)};
 
     std::string tag;
-    bool        isClosing   = false;
-    bool        selfClosing = false;
-    if (!cur.readNextTag(&tag, &isClosing, &selfClosing) || isClosing) {
-        return nullptr;
-    }
+    bool        isClosing = false, selfClosing = false;
+    if (!cur.readNextTag(&tag, &isClosing, &selfClosing) || isClosing) return nullptr;
     if (tag == "plist") {
-        if (selfClosing) {
-            return nullptr;
-        }
-        if (!cur.readNextTag(&tag, &isClosing, &selfClosing) || isClosing) {
+        if (selfClosing || !cur.readNextTag(&tag, &isClosing, &selfClosing) || isClosing) {
             return nullptr;
         }
     }
-    if (tag != "dict") {
-        return nullptr;
-    }
-    cocos2d::CCDictionary* dict = selfClosing ? new cocos2d::CCDictionary()
-                                              : ParseXmlDictBody(cur, 0);
-    if (!dict) {
-        return nullptr;
-    }
-    dict->autorelease();
+    if (tag != "dict") return nullptr;
+
+    cocos2d::CCDictionary* dict =
+        selfClosing ? new cocos2d::CCDictionary() : ParseXmlDictBody(cur, 0);
+    if (dict) dict->autorelease();
     return dict;
 }
 
 cocos2d::CCDictionary* BuildSpriteSheetDictionary(const PlistbFileData& parsed) {
     auto* root = cocos2d::CCDictionary::create();
-    if (!root) {
-        return nullptr;
-    }
+    if (!root) return nullptr;
 
     auto* metadata = new cocos2d::CCDictionary();
     SetDictString(metadata, "format", "2");
@@ -467,43 +323,50 @@ cocos2d::CCDictionary* BuildSpriteSheetDictionary(const PlistbFileData& parsed) 
     metadata->release();
 
     auto* frames = new cocos2d::CCDictionary();
-    char  buf[128];
     for (const auto& rec : parsed.frames) {
-        if (rec.frameName.empty()) {
-            continue;
-        }
+        if (rec.frameName.empty()) continue;
         auto* entry = new cocos2d::CCDictionary();
-        std::snprintf(buf,
-                      sizeof(buf),
-                      "{{%d,%d},{%d,%d}}",
-                      static_cast<int>(rec.rectX),
-                      static_cast<int>(rec.rectY),
-                      static_cast<int>(rec.rectWidth),
-                      static_cast<int>(rec.rectHeight));
-        SetDictString(entry, "frame", buf);
-
-        std::snprintf(buf,
-                      sizeof(buf),
-                      "{%d,%d}",
-                      static_cast<int>(rec.offsetX),
-                      static_cast<int>(rec.offsetY));
-        SetDictString(entry, "offset", buf);
-
+        SetDictFmt(entry,
+                   "frame",
+                   "{{%d,%d},{%d,%d}}",
+                   static_cast<int>(rec.rectX),
+                   static_cast<int>(rec.rectY),
+                   static_cast<int>(rec.rectWidth),
+                   static_cast<int>(rec.rectHeight));
+        SetDictFmt(entry,
+                   "offset",
+                   "{%d,%d}",
+                   static_cast<int>(rec.offsetX),
+                   static_cast<int>(rec.offsetY));
         SetDictString(entry, "rotated", rec.rotated ? "true" : "false");
-
-        std::snprintf(buf,
-                      sizeof(buf),
-                      "{%d,%d}",
-                      static_cast<int>(rec.originalWidth),
-                      static_cast<int>(rec.originalHeight));
-        SetDictString(entry, "sourceSize", buf);
-
+        SetDictFmt(entry,
+                   "sourceSize",
+                   "{%d,%d}",
+                   static_cast<int>(rec.originalWidth),
+                   static_cast<int>(rec.originalHeight));
         frames->setObject(entry, rec.frameName);
         entry->release();
     }
     root->setObject(frames, "frames");
     frames->release();
     return root;
+}
+
+cocos2d::CCTexture2D* LoadFirstMatchingTexture(const std::vector<std::string>& candidateList) {
+    auto* texCache = ax::Director::getInstance()->getTextureCache();
+    if (!texCache) return nullptr;
+    if (auto* fu = ax::FileUtils::getInstance()) {
+        for (const std::string& cand : candidateList) {
+            const std::string full = fu->fullPathForFilename(cand.c_str());
+            if (!full.empty() && fu->isFileExist(full)) {
+                if (auto* tex = texCache->addImage(full.c_str())) return tex;
+            }
+        }
+    }
+    for (const std::string& cand : candidateList) {
+        if (auto* tex = texCache->addImage(cand.c_str())) return tex;
+    }
+    return nullptr;
 }
 
 #endif // GCLIENT_ENABLE_COCOS2DX
@@ -514,54 +377,45 @@ bool PlistbLoader::ParseBuffer(const uint8_t* data,
                                size_t size,
                                PlistbFileData* outData,
                                std::string* outError) {
+    auto fail = [&](std::string msg) -> bool {
+        if (outError) *outError = std::move(msg);
+        return false;
+    };
+
     if (data == nullptr || outData == nullptr) {
-        if (outError) *outError = "Null buffer or output pointer";
-        return false;
+        return fail("Null buffer or output pointer");
     }
-
-    if (size >= 4 && ReadLE32U(data) == kBtDecryptMagic) {
-        if (outError) *outError = "Undecrypted 0xFEFEFEFE buffer passed to PlistbLoader::ParseBuffer";
-        return false;
+    if (size >= 4 && readLE<uint32_t>(data) == kBtDecryptMagic) {
+        return fail("Undecrypted 0xFEFEFEFE buffer passed to PlistbLoader::ParseBuffer");
     }
-
     if (LooksLikePlaintextXmlPlist(data, size)) {
-        if (outError) *outError = "Plaintext XML plist passed to binary PlistbLoader::ParseBuffer";
-        return false;
+        return fail("Plaintext XML plist passed to binary PlistbLoader::ParseBuffer");
     }
-
     if (size < kPlistbHeaderSize) {
-        if (outError) *outError = "Buffer smaller than 66-byte .plistb header";
-        return false;
+        return fail("Buffer smaller than 66-byte .plistb header");
     }
 
     std::string texName;
     if (!ReadValidatedFixedCString(data, kPlistbNameMaxLen, /*requireNonEmpty=*/true, &texName)) {
-        if (outError) {
-            *outError = "Invalid or non-NUL-terminated textureFileName in .plistb header";
-        }
-        return false;
+        return fail("Invalid or non-NUL-terminated textureFileName in .plistb header");
     }
 
-    const int16_t frameCount = ReadLE16S(data + 64);
+    const int16_t frameCount = readLE<int16_t>(data + 64);
     if (frameCount < 0) {
-        if (outError) *outError = "Negative frame count in .plistb header";
-        return false;
+        return fail("Negative frame count in .plistb header");
     }
 
     const size_t requiredBytes =
         kPlistbHeaderSize + static_cast<size_t>(frameCount) * kPlistbRecordSize;
     if (size < requiredBytes) {
-        if (outError) {
-            char msg[160];
-            std::snprintf(msg,
-                          sizeof(msg),
-                          "Truncated .plistb buffer: need %zu bytes for %d frames, got %zu",
-                          requiredBytes,
-                          static_cast<int>(frameCount),
-                          size);
-            *outError = msg;
-        }
-        return false;
+        char msg[160];
+        std::snprintf(msg,
+                      sizeof(msg),
+                      "Truncated .plistb buffer: need %zu bytes for %d frames, got %zu",
+                      requiredBytes,
+                      static_cast<int>(frameCount),
+                      size);
+        return fail(msg);
     }
 
     std::vector<PlistbFrameRecord> parsedFrames;
@@ -570,21 +424,19 @@ bool PlistbLoader::ParseBuffer(const uint8_t* data,
     const uint8_t* cursor = data + kPlistbHeaderSize;
     for (int16_t i = 0; i < frameCount; ++i, cursor += kPlistbRecordSize) {
         PlistbFrameRecord rec;
-        if (!ReadValidatedFixedCString(cursor, kPlistbNameMaxLen, /*requireNonEmpty=*/false, &rec.frameName)) {
-            if (outError) {
-                *outError = "Invalid or non-NUL-terminated frameName in .plistb record";
-            }
-            return false;
+        if (!ReadValidatedFixedCString(
+                cursor, kPlistbNameMaxLen, /*requireNonEmpty=*/false, &rec.frameName)) {
+            return fail("Invalid or non-NUL-terminated frameName in .plistb record");
         }
-        rec.rectX          = static_cast<float>(ReadLE16U(cursor + 64));
-        rec.rectY          = static_cast<float>(ReadLE16U(cursor + 66));
-        rec.rectWidth      = static_cast<float>(ReadLE16U(cursor + 68));
-        rec.rectHeight     = static_cast<float>(ReadLE16U(cursor + 70));
+        rec.rectX          = static_cast<float>(readLE<uint16_t>(cursor + 64));
+        rec.rectY          = static_cast<float>(readLE<uint16_t>(cursor + 66));
+        rec.rectWidth      = static_cast<float>(readLE<uint16_t>(cursor + 68));
+        rec.rectHeight     = static_cast<float>(readLE<uint16_t>(cursor + 70));
         rec.rotated        = (cursor[72] != 0);
-        rec.offsetX        = static_cast<float>(ReadLE16S(cursor + 74));
-        rec.offsetY        = static_cast<float>(ReadLE16S(cursor + 76));
-        rec.originalWidth  = static_cast<float>(ReadLE16U(cursor + 78));
-        rec.originalHeight = static_cast<float>(ReadLE16U(cursor + 80));
+        rec.offsetX        = static_cast<float>(readLE<int16_t>(cursor + 74));
+        rec.offsetY        = static_cast<float>(readLE<int16_t>(cursor + 76));
+        rec.originalWidth  = static_cast<float>(readLE<uint16_t>(cursor + 78));
+        rec.originalHeight = static_cast<float>(readLE<uint16_t>(cursor + 80));
         parsedFrames.push_back(std::move(rec));
     }
 
@@ -595,18 +447,18 @@ bool PlistbLoader::ParseBuffer(const uint8_t* data,
 
 std::vector<std::string> PlistbLoader::BuildTextureCandidatePaths(const std::string& texturePath) {
     std::vector<std::string> candidates;
-    const std::string norm = NormalizeAssetPath(texturePath);
-    if (norm.empty()) {
-        return candidates;
-    }
+    const std::string        norm = NormalizeAssetPath(texturePath);
+    if (norm.empty()) return candidates;
 
     const std::string stem = StripTextureExtension(norm);
-    AppendUniqueCandidate(candidates, stem + ".png");
-    AppendUniqueCandidate(candidates, norm);
-    AppendUniqueCandidate(candidates, stem + ".pvr.ccz");
-    AppendUniqueCandidate(candidates, stem + ".pkm");
-    AppendUniqueCandidate(candidates, stem + ".webp");
-    AppendUniqueCandidate(candidates, stem + ".jpg");
+    for (const std::string& cand : {stem + ".png",
+                                    norm,
+                                    stem + ".pvr.ccz",
+                                    stem + ".pkm",
+                                    stem + ".webp",
+                                    stem + ".jpg"}) {
+        AppendUniqueCandidate(candidates, cand);
+    }
     return candidates;
 }
 
@@ -623,9 +475,7 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
     const std::string normBasePath = NormalizeAssetPath(plistPath);
     const std::string plistbPath   = BuildPlistbPath(normBasePath);
     const std::string xmlPlistPath = BuildXmlPlistPath(normBasePath);
-    if (plistbPath.empty()) {
-        return false;
-    }
+    if (plistbPath.empty()) return false;
 
     unsigned long  fileSize = 0;
     DecryptResult  diag;
@@ -640,7 +490,6 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
     std::string    parseErr;
     const bool     ok = ParseBuffer(rawData, static_cast<size_t>(fileSize), &parsed, &parseErr);
     delete[] rawData;
-
     if (!ok) {
         cocos2d::CCLog("[PlistbLoader] Parse failed for %s: %s",
                        plistbPath.c_str(),
@@ -650,17 +499,10 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
 
     cocos2d::CCTexture2D* targetTexture = texture;
     if (!targetTexture) {
-        auto* texCache = ax::Director::getInstance()->getTextureCache();
-        if (!texCache) {
-            return false;
-        }
-
-        const std::string texRelPath  = NormalizeAssetPath(parsed.textureFileName);
-        const std::string relBaseTex  = ResolveRelativeAssetPath(texRelPath, plistbPath);
-        auto*             fu          = ax::FileUtils::getInstance();
-
+        const std::string        texRelPath    = NormalizeAssetPath(parsed.textureFileName);
+        const std::string        relBaseTex    = ResolveRelativeAssetPath(texRelPath, plistbPath);
         std::vector<std::string> candidateList = BuildTextureCandidatePaths(relBaseTex);
-        if (fu) {
+        if (auto* fu = ax::FileUtils::getInstance()) {
             const std::string fromFu = NormalizeAssetPath(
                 fu->fullPathFromRelativeFile(texRelPath.c_str(), plistbPath.c_str()));
             if (!fromFu.empty() && fromFu != relBaseTex) {
@@ -669,28 +511,7 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
                 }
             }
         }
-
-        if (fu) {
-            for (const std::string& cand : candidateList) {
-                const std::string full = fu->fullPathForFilename(cand.c_str());
-                if (!full.empty() && fu->isFileExist(full)) {
-                    targetTexture = texCache->addImage(full.c_str());
-                    if (targetTexture) {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (!targetTexture) {
-            for (const std::string& cand : candidateList) {
-                targetTexture = texCache->addImage(cand.c_str());
-                if (targetTexture) {
-                    break;
-                }
-            }
-        }
-
+        targetTexture = LoadFirstMatchingTexture(candidateList);
         if (!targetTexture) {
             cocos2d::CCLog("cocos2d: CCSpriteFrameCache: Couldn't load texture: %s (from %s)",
                            relBaseTex.c_str(),
@@ -701,31 +522,22 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
 
     cocos2d::CCSpriteFrameCache* targetCache =
         cache ? cache : ax::SpriteFrameCache::getInstance();
-    if (!targetCache) {
-        return false;
-    }
+    if (!targetCache) return false;
 
     std::vector<std::string> registeredNames;
     registeredNames.reserve(parsed.frames.size());
 
     for (const auto& rec : parsed.frames) {
-        if (rec.frameName.empty()) {
-            continue;
-        }
-
-        // Match stock CCSpriteFrameCache::addSpriteFramesWithDictionary (setObject
-        // overwrites existing entries) so reloading an unloaded texture or loading
-        // sibling effect atlases with shared sub-texture names always binds the live
-        // targetTexture instead of keeping a stale/wrong-atlas CCSpriteFrame.
-        const cocos2d::CCRect  rect(rec.rectX, rec.rectY, rec.rectWidth, rec.rectHeight);
-        const cocos2d::CCPoint offset(rec.offsetX, rec.offsetY);
-        const cocos2d::CCSize  originalSize(rec.originalWidth, rec.originalHeight);
-
+        if (rec.frameName.empty()) continue;
         auto* frame = new cocos2d::CCSpriteFrame();
-        frame->initWithTexture(targetTexture, rect, rec.rotated, offset, originalSize);
+        frame->initWithTexture(
+            targetTexture,
+            cocos2d::CCRect(rec.rectX, rec.rectY, rec.rectWidth, rec.rectHeight),
+            rec.rotated,
+            cocos2d::CCPoint(rec.offsetX, rec.offsetY),
+            cocos2d::CCSize(rec.originalWidth, rec.originalHeight));
         targetCache->addSpriteFrame(frame, rec.frameName.c_str());
         frame->release();
-
         registeredNames.push_back(rec.frameName);
     }
 
@@ -733,9 +545,7 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
         std::lock_guard<std::mutex> lock(g_loadedPlistbMutex);
         g_loadedPlistbFiles.insert(normBasePath);
         g_loadedPlistbFiles.insert(plistbPath);
-        if (!xmlPlistPath.empty()) {
-            g_loadedPlistbFiles.insert(xmlPlistPath);
-        }
+        if (!xmlPlistPath.empty()) g_loadedPlistbFiles.insert(xmlPlistPath);
         g_plistFrameNamesMap[plistbPath] = std::move(registeredNames);
     }
     return true;
@@ -753,39 +563,27 @@ bool PlistbLoader::RemoveSpriteFramesWithBinary(const std::string& plistPath,
     const std::string normBasePath = NormalizeAssetPath(plistPath);
     const std::string plistbPath   = BuildPlistbPath(normBasePath);
     const std::string xmlPlistPath = BuildXmlPlistPath(normBasePath);
-    if (plistbPath.empty()) {
-        return false;
-    }
+    if (plistbPath.empty()) return false;
 
     std::vector<std::string> namesToRemove;
     {
         std::lock_guard<std::mutex> lock(g_loadedPlistbMutex);
-        auto it = g_plistFrameNamesMap.find(plistbPath);
-        if (it != g_plistFrameNamesMap.end()) {
+        if (auto it = g_plistFrameNamesMap.find(plistbPath); it != g_plistFrameNamesMap.end()) {
             namesToRemove = std::move(it->second);
             g_plistFrameNamesMap.erase(it);
         }
         g_loadedPlistbFiles.erase(normBasePath);
         g_loadedPlistbFiles.erase(plistbPath);
-        if (!xmlPlistPath.empty()) {
-            g_loadedPlistbFiles.erase(xmlPlistPath);
-        }
+        if (!xmlPlistPath.empty()) g_loadedPlistbFiles.erase(xmlPlistPath);
     }
-
-    if (namesToRemove.empty()) {
-        return false;
-    }
+    if (namesToRemove.empty()) return false;
 
     cocos2d::CCSpriteFrameCache* targetCache =
         cache ? cache : ax::SpriteFrameCache::getInstance();
-    if (!targetCache) {
-        return false;
-    }
+    if (!targetCache) return false;
 
     for (const std::string& frameName : namesToRemove) {
-        if (!frameName.empty()) {
-            targetCache->removeSpriteFrameByName(frameName.c_str());
-        }
+        if (!frameName.empty()) targetCache->removeSpriteFrameByName(frameName.c_str());
     }
     return true;
 #else
@@ -803,24 +601,18 @@ cocos2d::CCDictionary* PlistbLoader::LoadDictionaryFromBinaryBuffer(const uint8_
         if (outError) *outError = "Null or empty plist buffer";
         return nullptr;
     }
-    if (size >= 4 && ReadLE32U(data) == kBtDecryptMagic) {
+    if (size >= 4 && readLE<uint32_t>(data) == kBtDecryptMagic) {
         if (outError) *outError = "Undecrypted 0xFEFEFEFE buffer in LoadDictionaryFromBinaryBuffer";
         return nullptr;
     }
-
     if (LooksLikePlaintextXmlPlist(data, size)) {
         cocos2d::CCDictionary* xmlDict = ParseXmlPlistToDictionary(data, size);
-        if (!xmlDict && outError) {
-            *outError = "Failed to parse XML plist dictionary";
-        }
+        if (!xmlDict && outError) *outError = "Failed to parse XML plist dictionary";
         return xmlDict;
     }
-
     PlistbFileData parsed;
-    if (ParseBuffer(data, size, &parsed, outError)) {
-        return BuildSpriteSheetDictionary(parsed);
-    }
-    return nullptr;
+    return ParseBuffer(data, size, &parsed, outError) ? BuildSpriteSheetDictionary(parsed)
+                                                      : nullptr;
 #else
     (void)data;
     (void)size;
@@ -854,9 +646,7 @@ cocos2d::CCDictionary* PlistbLoader::LoadDictionaryFromBinaryFile(const std::str
         cocos2d::CCDictionary* dict =
             LoadDictionaryFromBinaryBuffer(rawData, static_cast<size_t>(fileSize), outError);
         delete[] rawData;
-        if (dict) {
-            return dict;
-        }
+        if (dict) return dict;
     }
 
     if (outError && outError->empty()) {
@@ -874,8 +664,7 @@ bool PlistbLoader::IsPlistbLoaded(const std::string& plistPath) {
     const std::string norm   = NormalizeAssetPath(plistPath);
     const std::string plistb = BuildPlistbPath(norm);
     std::lock_guard<std::mutex> lock(g_loadedPlistbMutex);
-    return g_loadedPlistbFiles.find(norm) != g_loadedPlistbFiles.end() ||
-           g_loadedPlistbFiles.find(plistb) != g_loadedPlistbFiles.end();
+    return g_loadedPlistbFiles.contains(norm) || g_loadedPlistbFiles.contains(plistb);
 }
 
 void PlistbLoader::ClearLoadedTracking() {

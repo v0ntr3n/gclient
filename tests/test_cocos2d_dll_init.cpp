@@ -23,9 +23,12 @@
 #include "SimpleAudioEngine.h"
 #include "textures/CCTextureETC.h"
 
+#include "TestHarness.h"
 #include "assets/BtDecryptHook.h"
 #include "assets/PlistbLoader.h"
 #include "assets/XmlbArmatureLoader.h"
+#include "common/KestrelJson.h"
+#include "common/KestrelUtf8.h"
 #include "diagnostics/CrashAndTelemetry.h"
 
 #include "zlib.h"
@@ -50,13 +53,17 @@ namespace fs = std::filesystem;
 
 namespace {
 
+using gclient::json::escapeString;
+using gclient::test::PhaseRecord;
+using gclient::test::makeScopeExit;
+
 inline DWORD64 uptrToAddr64(uintptr_t v) noexcept {
     return static_cast<DWORD64>(v);
 }
 
 std::wstring utf8ToWide(const std::string& s) {
     if (s.empty()) return {};
-    int needed = ::MultiByteToWideChar(
+    const int needed = ::MultiByteToWideChar(
         CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
     if (needed <= 0) return {};
     std::wstring w(static_cast<size_t>(needed), L'\0');
@@ -67,38 +74,12 @@ std::wstring utf8ToWide(const std::string& s) {
 
 std::string wideToUtf8(const std::wstring& w) {
     if (w.empty()) return {};
-    int needed = ::WideCharToMultiByte(
+    const int needed = ::WideCharToMultiByte(
         CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
     if (needed <= 0) return {};
     std::string out(static_cast<size_t>(needed), '\0');
     ::WideCharToMultiByte(
         CP_UTF8, 0, w.data(), static_cast<int>(w.size()), out.data(), needed, nullptr, nullptr);
-    return out;
-}
-
-std::string jsonEscape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 16);
-    for (unsigned char c : s) {
-        switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b";  break;
-            case '\f': out += "\\f";  break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if (c < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(c));
-                    out += buf;
-                } else {
-                    out.push_back(static_cast<char>(c));
-                }
-                break;
-        }
-    }
     return out;
 }
 
@@ -111,13 +92,6 @@ struct RvaSymbolInfo {
     std::string sourceFile;
     uint32_t sourceLine = 0;
     std::string bytesHex;
-};
-
-struct PhaseResult {
-    std::string name;
-    bool passed = false;
-    uint64_t durationMs = 0;
-    std::string detail;
 };
 
 struct ExportEntry {
@@ -140,7 +114,8 @@ void parsePeExportsInMemory(uintptr_t moduleBase, uint32_t moduleSize, std::vect
         static_cast<uint32_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS32) > moduleSize) {
         return;
     }
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(moduleBase + static_cast<uintptr_t>(dos->e_lfanew));
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(
+        moduleBase + static_cast<uintptr_t>(dos->e_lfanew));
     if (nt->Signature != IMAGE_NT_SIGNATURE) return;
     const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     if (dir.VirtualAddress == 0 || dir.Size < sizeof(IMAGE_EXPORT_DIRECTORY) ||
@@ -152,7 +127,7 @@ void parsePeExportsInMemory(uintptr_t moduleBase, uint32_t moduleSize, std::vect
         return;
     }
     const auto* names = reinterpret_cast<const uint32_t*>(moduleBase + exp->AddressOfNames);
-    const auto* ords = reinterpret_cast<const uint16_t*>(moduleBase + exp->AddressOfNameOrdinals);
+    const auto* ords  = reinterpret_cast<const uint16_t*>(moduleBase + exp->AddressOfNameOrdinals);
     const auto* funcs = reinterpret_cast<const uint32_t*>(moduleBase + exp->AddressOfFunctions);
 
     out.reserve(exp->NumberOfNames);
@@ -161,7 +136,6 @@ void parsePeExportsInMemory(uintptr_t moduleBase, uint32_t moduleSize, std::vect
         const uint16_t ord = ords[i];
         if (nameRva == 0 || nameRva >= moduleSize || ord >= exp->NumberOfFunctions) continue;
         const uint32_t fnRva = funcs[ord];
-        // Skip export forwarders pointing inside export directory
         if (fnRva >= dir.VirtualAddress && fnRva < dir.VirtualAddress + dir.Size) continue;
         const char* rawName = reinterpret_cast<const char*>(moduleBase + nameRva);
         char undec[512] = {};
@@ -171,9 +145,8 @@ void parsePeExportsInMemory(uintptr_t moduleBase, uint32_t moduleSize, std::vect
         }
         out.push_back(ExportEntry{fnRva, std::move(pretty)});
     }
-    std::sort(out.begin(), out.end(), [](const ExportEntry& a, const ExportEntry& b) {
-        return a.rva < b.rva;
-    });
+    std::sort(out.begin(), out.end(),
+              [](const ExportEntry& a, const ExportEntry& b) { return a.rva < b.rva; });
 }
 
 void initDbgHelpForProcess(const std::string& extraSearchDir) {
@@ -182,9 +155,7 @@ void initDbgHelpForProcess(const std::string& extraSearchDir) {
 
     wchar_t exePathW[MAX_PATH] = {};
     ::GetModuleFileNameW(nullptr, exePathW, MAX_PATH);
-    fs::path exeDir = fs::path(exePathW).parent_path();
-
-    std::string searchPath = wideToUtf8(exeDir.wstring());
+    std::string searchPath = gclient::utf8::fsPathToUtf8(fs::path(exePathW).parent_path());
     if (!extraSearchDir.empty()) {
         searchPath += ";" + extraSearchDir;
     }
@@ -204,19 +175,11 @@ void initDbgHelpForProcess(const std::string& extraSearchDir) {
         wchar_t modPathW[MAX_PATH] = {};
         ::GetModuleFileNameW(hCocos, modPathW, MAX_PATH);
         g_cocosPath = wideToUtf8(modPathW);
-
         parsePeExportsInMemory(g_cocosBase, g_cocosSize, g_cocosExports);
 
         if (g_symReady) {
-            ::SymLoadModuleEx(
-                ::GetCurrentProcess(),
-                nullptr,
-                g_cocosPath.c_str(),
-                "libcocos2d.dll",
-                uptrToAddr64(g_cocosBase),
-                g_cocosSize,
-                nullptr,
-                0);
+            ::SymLoadModuleEx(::GetCurrentProcess(), nullptr, g_cocosPath.c_str(),
+                              "libcocos2d.dll", uptrToAddr64(g_cocosBase), g_cocosSize, nullptr, 0);
         }
     }
 }
@@ -232,9 +195,7 @@ RvaSymbolInfo resolveCocosRva(uint32_t rva, size_t dumpByteCount = 64) {
 
     if (!g_cocosExports.empty()) {
         auto it = std::upper_bound(
-            g_cocosExports.begin(),
-            g_cocosExports.end(),
-            rva,
+            g_cocosExports.begin(), g_cocosExports.end(), rva,
             [](uint32_t target, const ExportEntry& e) { return target < e.rva; });
         if (it != g_cocosExports.begin()) {
             --it;
@@ -260,7 +221,8 @@ RvaSymbolInfo resolveCocosRva(uint32_t rva, size_t dumpByteCount = 64) {
         info.symbolDisplacement = rva - info.nearestExportRva;
     } else {
         char errBuf[64];
-        std::snprintf(errBuf, sizeof(errBuf), "<SymFromAddr-err-%lu>", static_cast<unsigned long>(::GetLastError()));
+        std::snprintf(errBuf, sizeof(errBuf), "<SymFromAddr-err-%lu>",
+                      static_cast<unsigned long>(::GetLastError()));
         info.symbolName = errBuf;
     }
 
@@ -296,8 +258,7 @@ std::string formatAddrWithModuleAndSym(uintptr_t addr) {
     uintptr_t modBase = 0;
     if (::GetModuleHandleExA(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCSTR>(addr),
-            &hMod) &&
+            reinterpret_cast<LPCSTR>(addr), &hMod) &&
         hMod != nullptr) {
         modBase = reinterpret_cast<uintptr_t>(hMod);
         char fullMod[MAX_PATH] = {};
@@ -321,7 +282,6 @@ std::string formatAddrWithModuleAndSym(uintptr_t addr) {
     } else {
         oss << "0x" << std::hex << addr << std::dec;
     }
-
     if (g_symReady && ::SymFromAddr(::GetCurrentProcess(), addr64, &disp64, sym)) {
         oss << " (" << sym->Name << "+0x" << std::hex << disp64 << std::dec << ")";
     }
@@ -339,7 +299,7 @@ std::atomic<bool> g_watchdogStop{false};
 std::atomic<uint64_t> g_phaseStartTick{0};
 std::mutex g_phaseMutex;
 std::string g_activePhaseName = "startup";
-std::vector<PhaseResult> g_phaseResults;
+std::vector<PhaseRecord> g_phaseResults;
 
 void writeJsonReport(const std::string& jsonPath,
                      const std::string& verdict,
@@ -347,45 +307,43 @@ void writeJsonReport(const std::string& jsonPath,
                      const std::vector<RvaSymbolInfo>& nearbySyms,
                      const std::string& hangDiagnostic) {
     if (jsonPath.empty()) return;
-    std::ofstream ofs(fs::path(utf8ToWide(jsonPath)), std::ios::binary | std::ios::trunc);
+    std::ofstream ofs(gclient::utf8::utf8ToFsPath(jsonPath), std::ios::binary | std::ios::trunc);
     if (!ofs) return;
 
-    ofs << "{\n";
-    ofs << "  \"verdict\": \"" << jsonEscape(verdict) << "\",\n";
-    ofs << "  \"libcocos2d_base_hex\": \"0x" << std::hex << g_cocosBase << std::dec << "\",\n";
-    ofs << "  \"libcocos2d_size_hex\": \"0x" << std::hex << g_cocosSize << std::dec << "\",\n";
-    ofs << "  \"libcocos2d_exports_parsed\": " << g_cocosExports.size() << ",\n";
-    ofs << "  \"target_rva_hex\": \"0x" << std::hex << primaryRva.rva << std::dec << "\",\n";
-    ofs << "  \"target_symbol\": \"" << jsonEscape(primaryRva.symbolName) << "\",\n";
-    ofs << "  \"target_symbol_disp_hex\": \"0x" << std::hex << primaryRva.symbolDisplacement << std::dec << "\",\n";
-    ofs << "  \"nearest_export\": \"" << jsonEscape(primaryRva.nearestExportName) << "\",\n";
-    ofs << "  \"nearest_export_rva_hex\": \"0x" << std::hex << primaryRva.nearestExportRva << std::dec << "\",\n";
-    ofs << "  \"target_source_file\": \"" << jsonEscape(primaryRva.sourceFile) << "\",\n";
-    ofs << "  \"target_source_line\": " << primaryRva.sourceLine << ",\n";
-    ofs << "  \"target_bytes_hex\": \"" << jsonEscape(primaryRva.bytesHex) << "\",\n";
-    ofs << "  \"hang_diagnostic\": \"" << jsonEscape(hangDiagnostic) << "\",\n";
-    ofs << "  \"nearby_rvas\": [\n";
+    ofs << "{\n"
+        << "  \"verdict\": \"" << escapeString(verdict) << "\",\n"
+        << "  \"libcocos2d_base_hex\": \"0x" << std::hex << g_cocosBase << std::dec << "\",\n"
+        << "  \"libcocos2d_size_hex\": \"0x" << std::hex << g_cocosSize << std::dec << "\",\n"
+        << "  \"libcocos2d_exports_parsed\": " << g_cocosExports.size() << ",\n"
+        << "  \"target_rva_hex\": \"0x" << std::hex << primaryRva.rva << std::dec << "\",\n"
+        << "  \"target_symbol\": \"" << escapeString(primaryRva.symbolName) << "\",\n"
+        << "  \"target_symbol_disp_hex\": \"0x" << std::hex << primaryRva.symbolDisplacement << std::dec << "\",\n"
+        << "  \"nearest_export\": \"" << escapeString(primaryRva.nearestExportName) << "\",\n"
+        << "  \"nearest_export_rva_hex\": \"0x" << std::hex << primaryRva.nearestExportRva << std::dec << "\",\n"
+        << "  \"target_source_file\": \"" << escapeString(primaryRva.sourceFile) << "\",\n"
+        << "  \"target_source_line\": " << primaryRva.sourceLine << ",\n"
+        << "  \"target_bytes_hex\": \"" << escapeString(primaryRva.bytesHex) << "\",\n"
+        << "  \"hang_diagnostic\": \"" << escapeString(hangDiagnostic) << "\",\n"
+        << "  \"nearby_rvas\": [\n";
     for (size_t i = 0; i < nearbySyms.size(); ++i) {
         const auto& ns = nearbySyms[i];
         ofs << "    {\"rva\": \"0x" << std::hex << ns.rva << std::dec
-            << "\", \"symbol\": \"" << jsonEscape(ns.symbolName)
+            << "\", \"symbol\": \"" << escapeString(ns.symbolName)
             << "+0x" << std::hex << ns.symbolDisplacement << std::dec
-            << "\", \"file\": \"" << jsonEscape(ns.sourceFile)
+            << "\", \"file\": \"" << escapeString(ns.sourceFile)
             << "\", \"line\": " << ns.sourceLine << "}"
             << (i + 1 < nearbySyms.size() ? "," : "") << "\n";
     }
-    ofs << "  ],\n";
-    ofs << "  \"phases\": [\n";
+    ofs << "  ],\n  \"phases\": [\n";
     for (size_t i = 0; i < g_phaseResults.size(); ++i) {
         const auto& pr = g_phaseResults[i];
-        ofs << "    {\"name\": \"" << jsonEscape(pr.name)
+        ofs << "    {\"name\": \"" << escapeString(pr.name)
             << "\", \"passed\": " << (pr.passed ? "true" : "false")
             << ", \"duration_ms\": " << pr.durationMs
-            << ", \"detail\": \"" << jsonEscape(pr.detail) << "\"}"
+            << ", \"detail\": \"" << escapeString(pr.detail) << "\"}"
             << (i + 1 < g_phaseResults.size() ? "," : "") << "\n";
     }
-    ofs << "  ]\n";
-    ofs << "}\n";
+    ofs << "  ]\n}\n";
     ofs.flush();
 }
 
@@ -400,31 +358,23 @@ std::vector<uint8_t> buildValidRgbaPng(uint32_t width, uint32_t height) {
         appendBE32(out, len);
         const size_t typeOffset = out.size();
         out.insert(out.end(), reinterpret_cast<const uint8_t*>(type), reinterpret_cast<const uint8_t*>(type) + 4);
-        if (len > 0 && data != nullptr) {
-            out.insert(out.end(), data, data + len);
-        }
+        if (len > 0 && data != nullptr) out.insert(out.end(), data, data + len);
         uLong crc = ::crc32(0L, Z_NULL, 0);
         crc = ::crc32(crc, out.data() + typeOffset, 4u + len);
         appendBE32(out, static_cast<uint32_t>(crc));
     };
 
     std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
-
     std::vector<uint8_t> ihdr;
     appendBE32(ihdr, width);
     appendBE32(ihdr, height);
-    ihdr.push_back(8);
-    ihdr.push_back(6);
-    ihdr.push_back(0);
-    ihdr.push_back(0);
-    ihdr.push_back(0);
+    ihdr.insert(ihdr.end(), {8, 6, 0, 0, 0});
     appendChunk(png, "IHDR", ihdr.data(), static_cast<uint32_t>(ihdr.size()));
 
     const size_t rowStride = 1u + static_cast<size_t>(width) * 4u;
     std::vector<uint8_t> rawScanlines(rowStride * static_cast<size_t>(height), 0u);
     for (uint32_t y = 0; y < height; ++y) {
         uint8_t* row = rawScanlines.data() + static_cast<size_t>(y) * rowStride;
-        row[0] = 0;
         for (uint32_t x = 0; x < width; ++x) {
             row[1 + x * 4 + 0] = static_cast<uint8_t>((x * 7u + y) & 0xFFu);
             row[1 + x * 4 + 1] = static_cast<uint8_t>((y * 13u) & 0xFFu);
@@ -435,7 +385,8 @@ std::vector<uint8_t> buildValidRgbaPng(uint32_t width, uint32_t height) {
 
     uLongf compCap = ::compressBound(static_cast<uLong>(rawScanlines.size()));
     std::vector<uint8_t> idat(static_cast<size_t>(compCap));
-    if (::compress2(idat.data(), &compCap, rawScanlines.data(), static_cast<uLong>(rawScanlines.size()), Z_BEST_SPEED) == Z_OK) {
+    if (::compress2(idat.data(), &compCap, rawScanlines.data(),
+                    static_cast<uLong>(rawScanlines.size()), Z_BEST_SPEED) == Z_OK) {
         idat.resize(static_cast<size_t>(compCap));
         appendChunk(png, "IDAT", idat.data(), static_cast<uint32_t>(idat.size()));
     }
@@ -483,7 +434,7 @@ struct ScopedDummyWglContext {
         pfd.cStencilBits = 8;
         pfd.iLayerType = PFD_MAIN_PLANE;
 
-        int pf = ::ChoosePixelFormat(hdc, &pfd);
+        const int pf = ::ChoosePixelFormat(hdc, &pfd);
         if (pf == 0 || !::SetPixelFormat(hdc, pf, &pfd)) return;
 
         hglrc = ::wglCreateContext(hdc);
@@ -492,12 +443,9 @@ struct ScopedDummyWglContext {
 
         glewExperimental = GL_TRUE;
         const GLenum glewRc = ::glewInit();
-        const GLubyte* ver = ::glGetString(GL_VERSION);
-        if (ver) {
+        if (const GLubyte* ver = ::glGetString(GL_VERSION)) {
             glVersion = reinterpret_cast<const char*>(ver);
         }
-        // Headless Windows Hyper-V GDI Generic only exposes OpenGL 1.1.0 (`glCreateProgram == nullptr`);
-        // Cocos2d-x 2.2.6 CCShaderCache / CCSprite / VBOs strictly require OpenGL 2.0 entry points.
         ready = (glewRc == GLEW_OK) && GLEW_VERSION_2_0 &&
                 (glCreateProgram != nullptr) && (glGenBuffers != nullptr);
     }
@@ -507,15 +455,10 @@ struct ScopedDummyWglContext {
             ::wglMakeCurrent(nullptr, nullptr);
             ::wglDeleteContext(hglrc);
         }
-        if (hwnd && hdc) {
-            ::ReleaseDC(hwnd, hdc);
-        }
-        if (hwnd) {
-            ::DestroyWindow(hwnd);
-        }
+        if (hwnd && hdc) ::ReleaseDC(hwnd, hdc);
+        if (hwnd) ::DestroyWindow(hwnd);
     }
 };
-
 
 struct DirectorViewTestAccessor : public cocos2d::CCDirector {
     static cocos2d::CCEGLView* currentView(cocos2d::CCDirector* dir) {
@@ -573,8 +516,10 @@ public:
             m_fScaleY = m_fScaleX;
             m_obDesignResolutionSize.height = std::ceil(m_obScreenSize.height / m_fScaleY);
         }
-        const float vpW = m_obDesignResolutionSize.width * m_fScaleX, vpH = m_obDesignResolutionSize.height * m_fScaleY;
-        m_obViewPortRect.setRect((m_obScreenSize.width - vpW) * 0.5f, (m_obScreenSize.height - vpH) * 0.5f, vpW, vpH);
+        const float vpW = m_obDesignResolutionSize.width * m_fScaleX;
+        const float vpH = m_obDesignResolutionSize.height * m_fScaleY;
+        m_obViewPortRect.setRect((m_obScreenSize.width - vpW) * 0.5f,
+                                 (m_obScreenSize.height - vpH) * 0.5f, vpW, vpH);
         m_eResolutionPolicy = policy;
         DirectorViewTestAccessor::syncWinSizeAndOrtho(cocos2d::CCDirector::sharedDirector(), m_obDesignResolutionSize);
     }
@@ -602,10 +547,14 @@ public:
     explicit NonSwallowingProbeLayer(int prio) : m_prio(prio) {}
     void onEnter() override {
         cocos2d::CCLayer::onEnter();
-        if (auto* td = cocos2d::CCDirector::sharedDirector()->getTouchDispatcher()) td->addTargetedDelegate(this, m_prio, false);
+        if (auto* td = cocos2d::CCDirector::sharedDirector()->getTouchDispatcher()) {
+            td->addTargetedDelegate(this, m_prio, false);
+        }
     }
     void onExit() override {
-        if (auto* td = cocos2d::CCDirector::sharedDirector()->getTouchDispatcher()) td->removeDelegate(this);
+        if (auto* td = cocos2d::CCDirector::sharedDirector()->getTouchDispatcher()) {
+            td->removeDelegate(this);
+        }
         cocos2d::CCLayer::onExit();
     }
     bool ccTouchBegan(cocos2d::CCTouch*, cocos2d::CCEvent*) override { ++beganCount; return true; }
@@ -617,8 +566,63 @@ private:
 class WidgetCallbackTarget final : public cocos2d::CCObject {
 public:
     std::function<void(cocos2d::CCObject*, cocos2d::ui::TouchEventType)> onEvent;
-    void handleTouch(cocos2d::CCObject* s, cocos2d::ui::TouchEventType t) { if (onEvent) onEvent(s, t); }
+    void handleTouch(cocos2d::CCObject* s, cocos2d::ui::TouchEventType t) {
+        if (onEvent) onEvent(s, t);
+    }
 };
+
+cocos2d::ui::Widget* createConfiguredTouchWidget(bool hasGl20, float w, float h, float scale,
+                                                 cocos2d::CCPoint anchor) {
+    cocos2d::ui::Widget* btn = hasGl20
+        ? static_cast<cocos2d::ui::Widget*>(cocos2d::ui::Button::create())
+        : static_cast<cocos2d::ui::Widget*>(cocos2d::ui::Layout::create());
+    btn->ignoreContentAdaptWithSize(false);
+    btn->setSize(cocos2d::CCSizeMake(w, h));
+    btn->setScale(scale);
+    btn->setAnchorPoint(anchor);
+    btn->setTouchEnabled(true);
+    return btn;
+}
+
+cocos2d::ui::Layout* createTouchMaskLayout(float w, float h, float x, float y) {
+    auto* mask = cocos2d::ui::Layout::create();
+    mask->setSize(cocos2d::CCSizeMake(w, h));
+    mask->setPosition(cocos2d::CCPointMake(x, y));
+    mask->setTouchEnabled(true);
+    return mask;
+}
+
+cocos2d::ui::ImageView* createSizedLocalImage(cocos2d::ui::Widget* parent, const char* texPath, float sz) {
+    auto* img = cocos2d::ui::ImageView::create();
+    img->ignoreContentAdaptWithSize(false);
+    parent->addChild(img);
+    img->loadTexture(texPath, cocos2d::ui::UI_TEX_TYPE_LOCAL);
+    img->setSize(cocos2d::CCSize(sz, sz));
+    return img;
+}
+
+cocos2d::CCTexture2D* decodePngIntoTextureCache(const std::vector<uint8_t>& pngBytes,
+                                                int expectedW, int expectedH,
+                                                const char* cacheKey,
+                                                std::string& errOut) {
+    auto* img = new cocos2d::CCImage();
+    auto rel = makeScopeExit([img]() noexcept { img->release(); });
+    if (!img->initWithImageData(const_cast<uint8_t*>(pngBytes.data()),
+                                static_cast<int>(pngBytes.size()),
+                                cocos2d::CCImage::kFmtPng)) {
+        errOut = std::string("CCImage::initWithImageData failed for ") + cacheKey;
+        return nullptr;
+    }
+    if (img->getWidth() != expectedW || img->getHeight() != expectedH || img->getData() == nullptr) {
+        errOut = std::string("Unexpected decoded PNG dimensions for ") + cacheKey;
+        return nullptr;
+    }
+    if (cacheKey == nullptr) return nullptr;
+    cocos2d::CCTextureCache* cache = cocos2d::CCTextureCache::sharedTextureCache();
+    cocos2d::CCTexture2D* tex = cache ? cache->addUIImage(img, cacheKey) : nullptr;
+    if (!tex) errOut = std::string("CCTextureCache::addUIImage failed for ") + cacheKey;
+    return tex;
+}
 
 struct SendInputProbeStatus { bool available = false; std::string reason; };
 
@@ -630,15 +634,15 @@ SendInputProbeStatus probeInteractiveSendInput(HWND targetHwnd) {
     if (HWINSTA hWinSta = ::GetProcessWindowStation()) {
         USEROBJECTFLAGS uof{};
         DWORD len = 0;
-        if (::GetUserObjectInformationW(hWinSta, UOI_FLAGS, &uof, sizeof(uof), &len) && (uof.dwFlags & WSF_VISIBLE) == 0) {
+        if (::GetUserObjectInformationW(hWinSta, UOI_FLAGS, &uof, sizeof(uof), &len) &&
+            (uof.dwFlags & WSF_VISIBLE) == 0) {
             return {false, "WindowStation lacks WSF_VISIBLE (headless/non-interactive)"};
         }
     }
     HDESK hDesk = ::OpenInputDesktop(0, FALSE, DESKTOP_WRITEOBJECTS | DESKTOP_JOURNALPLAYBACK);
     if (!hDesk) return {false, "OpenInputDesktop denied/locked (err=" + std::to_string(::GetLastError()) + ")"};
     ::CloseDesktop(hDesk);
-    wchar_t ciBuf[16] = {};
-    if (::GetEnvironmentVariableW(L"GITHUB_ACTIONS", ciBuf, 16) > 0 && std::wcscmp(ciBuf, L"true") == 0) {
+    if (gclient::utf8::readEnvUtf8("GITHUB_ACTIONS") == "true") {
         return {false, "GITHUB_ACTIONS headless runner desktop"};
     }
     ::ShowWindow(targetHwnd, SW_SHOWNOACTIVATE);
@@ -681,7 +685,10 @@ bool dispatchWin32ClickViaSendInput(HWND hwnd, int clientX, int clientY, std::st
     MSG msg{};
     const ULONGLONG deadline = ::GetTickCount64() + 250;
     while (::GetTickCount64() < deadline) {
-        while (::PeekMessageW(&msg, hwnd, 0, 0, PM_REMOVE)) { ::TranslateMessage(&msg); ::DispatchMessageW(&msg); }
+        while (::PeekMessageW(&msg, hwnd, 0, 0, PM_REMOVE)) {
+            ::TranslateMessage(&msg);
+            ::DispatchMessageW(&msg);
+        }
         ::Sleep(5);
     }
     return true;
@@ -717,40 +724,25 @@ int main(int argc, char** argv) {
     initDbgHelpForProcess(pdbDir);
 
     const RvaSymbolInfo primaryRva = resolveCocosRva(targetRva, 64);
-    std::printf(
-        "[CocosInitTest] libcocos2d.dll base=0x%08zX size=0x%08X exports=%zu\n",
-        static_cast<size_t>(g_cocosBase),
-        g_cocosSize,
-        g_cocosExports.size());
-    std::printf(
-        "[CocosInitTest] RVA +0x%X -> %s + 0x%llX [%s:%u] (nearestExport=%s @ +0x%X)\n",
-        primaryRva.rva,
-        primaryRva.symbolName.c_str(),
-        static_cast<unsigned long long>(primaryRva.symbolDisplacement),
-        primaryRva.sourceFile.c_str(),
-        primaryRva.sourceLine,
-        primaryRva.nearestExportName.c_str(),
-        primaryRva.nearestExportRva);
+    std::printf("[CocosInitTest] libcocos2d.dll base=0x%08zX size=0x%08X exports=%zu\n",
+                static_cast<size_t>(g_cocosBase), g_cocosSize, g_cocosExports.size());
+    std::printf("[CocosInitTest] RVA +0x%X -> %s + 0x%llX [%s:%u] (nearestExport=%s @ +0x%X)\n",
+                primaryRva.rva, primaryRva.symbolName.c_str(),
+                static_cast<unsigned long long>(primaryRva.symbolDisplacement),
+                primaryRva.sourceFile.c_str(), primaryRva.sourceLine,
+                primaryRva.nearestExportName.c_str(), primaryRva.nearestExportRva);
     std::printf("[CocosInitTest] Bytes @ +0x%X: %s\n", primaryRva.rva, primaryRva.bytesHex.c_str());
     std::fflush(stdout);
 
     std::vector<RvaSymbolInfo> nearbySyms;
-    const int32_t offsets[] = {-0x200, -0x100, -0x80, -0x40, -0x20, -0x10, 0, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200};
-    for (int32_t off : offsets) {
+    for (int32_t off : {-0x200, -0x100, -0x80, -0x40, -0x20, -0x10, 0, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200}) {
         if (off < 0 && static_cast<uint32_t>(-off) > targetRva) continue;
-        const uint32_t probe = static_cast<uint32_t>(static_cast<int64_t>(targetRva) + off);
-        nearbySyms.push_back(resolveCocosRva(probe, 0));
+        nearbySyms.push_back(resolveCocosRva(static_cast<uint32_t>(static_cast<int64_t>(targetRva) + off), 0));
     }
 
     HANDLE hMainThread = nullptr;
-    ::DuplicateHandle(
-        ::GetCurrentProcess(),
-        ::GetCurrentThread(),
-        ::GetCurrentProcess(),
-        &hMainThread,
-        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-        FALSE,
-        0);
+    ::DuplicateHandle(::GetCurrentProcess(), ::GetCurrentThread(), ::GetCurrentProcess(), &hMainThread,
+                      THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0);
 
     g_phaseStartTick.store(::GetTickCount64(), std::memory_order_release);
 
@@ -766,7 +758,6 @@ int main(int argc, char** argv) {
                     std::lock_guard<std::mutex> lk(g_phaseMutex);
                     phaseCopy = g_activePhaseName;
                 }
-
                 std::ostringstream diag;
                 diag << "WATCHDOG TIMEOUT (" << (now - start) << " ms) in phase '" << phaseCopy << "'. ";
 
@@ -791,19 +782,12 @@ int main(int argc, char** argv) {
 
                         CONTEXT walkCtx = ctx;
                         for (int frame = 0; frame < 14; ++frame) {
-                            if (!::StackWalk64(
-                                    IMAGE_FILE_MACHINE_I386,
-                                    ::GetCurrentProcess(),
-                                    hMainThread,
-                                    &sf,
-                                    &walkCtx,
-                                    nullptr,
-                                    ::SymFunctionTableAccess64,
-                                    ::SymGetModuleBase64,
-                                    nullptr)) {
+                            if (!::StackWalk64(IMAGE_FILE_MACHINE_I386, ::GetCurrentProcess(), hMainThread,
+                                               &sf, &walkCtx, nullptr, ::SymFunctionTableAccess64,
+                                               ::SymGetModuleBase64, nullptr) ||
+                                sf.AddrPC.Offset == 0) {
                                 break;
                             }
-                            if (sf.AddrPC.Offset == 0) break;
                             if (frame > 0) diag << " <- ";
                             diag << "#" << frame << " "
                                  << formatAddrWithModuleAndSym(static_cast<uintptr_t>(sf.AddrPC.Offset));
@@ -823,43 +807,23 @@ int main(int argc, char** argv) {
 
     bool anyFailed = false;
     auto runPhase = [&](const char* phaseName, const std::function<bool(std::string&)>& fn) {
-        {
-            std::lock_guard<std::mutex> lk(g_phaseMutex);
-            g_activePhaseName = phaseName;
-        }
-        const uint64_t t0 = ::GetTickCount64();
-        g_phaseStartTick.store(t0, std::memory_order_release);
-        std::printf("[PHASE] %s ...\n", phaseName);
-        std::fflush(stdout);
-
-        std::string detail;
-        bool ok = false;
-        try {
-            ok = fn(detail);
-        } catch (const std::exception& ex) {
-            detail = std::string("std::exception: ") + ex.what();
-            ok = false;
-        } catch (...) {
-            detail = "unknown C++ exception";
-            ok = false;
-        }
-        const uint64_t dt = ::GetTickCount64() - t0;
-        g_phaseResults.push_back(PhaseResult{phaseName, ok, dt, detail});
-        std::printf("[%s] %s (%llu ms) %s\n",
-                    ok ? " OK  " : "FAIL ",
-                    phaseName,
-                    static_cast<unsigned long long>(dt),
-                    detail.c_str());
-        std::fflush(stdout);
-        if (!ok) {
-            anyFailed = true;
-        }
+        const bool ok = gclient::test::runTimedPhase(
+            phaseName, g_phaseResults, fn,
+            [&](const char* active) {
+                {
+                    std::lock_guard<std::mutex> lk(g_phaseMutex);
+                    g_activePhaseName = active;
+                }
+                g_phaseStartTick.store(::GetTickCount64(), std::memory_order_release);
+            });
+        if (!ok) anyFailed = true;
     };
 
-    const fs::path tempFixture = fs::temp_directory_path() /
-        fs::path(utf8ToWide("kestrel_cocos_init_Tiếng_Việt_" + std::to_string(::GetCurrentProcessId())));
+    gclient::test::ScopedTempDir tempDir(
+        fs::temp_directory_path() /
+        gclient::utf8::utf8ToFsPath("kestrel_cocos_init_Tiếng_Việt_" + std::to_string(::GetCurrentProcessId())));
+    const fs::path& tempFixture = tempDir.path;
     fs::create_directories(tempFixture / L"scripts");
-
     {
         std::ofstream luaOut(tempFixture / L"scripts" / L"boot_probe.lua", std::ios::binary);
         luaOut << "return 1337\n";
@@ -871,104 +835,66 @@ int main(int argc, char** argv) {
     // Phase 1: CCFileUtils + setSearchPaths + bt_decrypt + UTF-8 path resolution
     runPhase("phase1_fileutils_and_bt_decrypt", [&](std::string& detail) -> bool {
         cocos2d::CCFileUtils* fu = cocos2d::CCFileUtils::sharedFileUtils();
-        if (!fu) {
-            detail = "CCFileUtils::sharedFileUtils() returned null";
-            return false;
-        }
+        PHASE_REQUIRE(fu != nullptr, detail, "CCFileUtils::sharedFileUtils() returned null");
         fu->setPopupNotify(false);
 
-        std::vector<std::string> paths;
-        std::string rootUtf8 = wideToUtf8(tempFixture.wstring());
-        for (char& ch : rootUtf8) {
-            if (ch == '\\') ch = '/';
-        }
-        paths.push_back(rootUtf8);
-        paths.push_back("Resources");
-        fu->setSearchPaths(paths);
+        std::string rootUtf8 = gclient::utf8::fsPathToUtf8(tempFixture);
+        std::replace(rootUtf8.begin(), rootUtf8.end(), '\\', '/');
+        fu->setSearchPaths({rootUtf8, "Resources"});
         fu->setDecrypt(&bt_decrypt);
         gclient::assets::InstallBtDecryptHook(fu);
 
         const auto searchCopy = fu->getSearchPaths();
-        // Regression guard for Issue #8: verify non-existent ASCII & UTF-8 paths do not tail-recurse.
-        if (fu->isFileExist("cc_fps_images") || fu->isFileExist("nonexistent_Tửu_Quán_probe.png")) {
-            detail = "isFileExist unexpectedly returned true for non-existent probe path";
-            return false;
-        }
+        PHASE_REQUIRE(!fu->isFileExist("cc_fps_images") &&
+                          !fu->isFileExist("nonexistent_Tửu_Quán_probe.png"),
+                      detail, "isFileExist unexpectedly returned true for non-existent probe path");
+
         const std::string resolved = fu->fullPathForFilename("scripts/boot_probe.lua");
-        if (resolved.empty() || !fu->isFileExist(resolved)) {
-            detail = "Failed to resolve UTF-8 path scripts/boot_probe.lua -> " + resolved;
-            return false;
-        }
+        PHASE_REQUIRE(!resolved.empty() && fu->isFileExist(resolved),
+                      detail, "Failed to resolve UTF-8 path scripts/boot_probe.lua -> " + resolved);
+
         unsigned long sz = 0;
         unsigned char* buf = fu->getFileData(resolved.c_str(), "rb", &sz);
         const bool ok = (buf != nullptr && sz > 0 && !searchCopy.empty());
         delete[] buf;
-        detail = "resolved=" + resolved + " bytes=" + std::to_string(sz) + " searchPaths=" + std::to_string(searchCopy.size());
+        detail = "resolved=" + resolved + " bytes=" + std::to_string(sz) +
+                 " searchPaths=" + std::to_string(searchCopy.size());
         return ok;
     });
 
     // Phase 2: CCImage PNG decode (libpng.lib + vcpkg libz.dll) + CCTextureCache + CCLabelAtlas
     runPhase("phase2_ccimage_png_and_label_atlas", [&](std::string& detail) -> bool {
         const std::vector<uint8_t> pngData = buildValidRgbaPng(256, 32);
-        auto* img = new cocos2d::CCImage();
-        if (!img->initWithImageData(
-                const_cast<uint8_t*>(pngData.data()),
-                static_cast<int>(pngData.size()),
-                cocos2d::CCImage::kFmtPng)) {
-            img->release();
-            detail = "CCImage::initWithImageData(kFmtPng, 256x32) returned false";
-            return false;
-        }
-        if (img->getWidth() != 256 || img->getHeight() != 32 || img->getData() == nullptr) {
-            img->release();
-            detail = "Unexpected decoded PNG dimensions";
-            return false;
-        }
-
+        std::string texErr;
         if (wglCtx.ready) {
-            cocos2d::CCTextureCache* cache = cocos2d::CCTextureCache::sharedTextureCache();
-            cocos2d::CCTexture2D* tex = cache ? cache->addUIImage(img, "cc_fps_images_probe") : nullptr;
-            img->release();
-            if (!tex) {
-                detail = "CCTextureCache::addUIImage failed under WGL (" + wglCtx.glVersion + ")";
-                return false;
-            }
+            cocos2d::CCTexture2D* tex =
+                decodePngIntoTextureCache(pngData, 256, 32, "cc_fps_images_probe", texErr);
+            PHASE_REQUIRE(tex != nullptr, detail, texErr + " (" + wglCtx.glVersion + ")");
             auto* label = new cocos2d::CCLabelAtlas();
-            const bool lblOk = label->initWithString("00.0", tex, 12, 32, '.');
-            if (lblOk) {
-                label->setString("59.9");
-                label->setTexture(tex);
-                label->updateAtlasValues();
-            }
-            label->release();
-            if (!lblOk) {
-                detail = "CCLabelAtlas::initWithString('00.0', tex, 12, 32, '.') returned false";
-                return false;
-            }
+            auto relLbl = makeScopeExit([label]() noexcept { label->release(); });
+            PHASE_REQUIRE(label->initWithString("00.0", tex, 12, 32, '.'),
+                          detail, "CCLabelAtlas::initWithString('00.0', tex, 12, 32, '.') returned false");
+            label->setString("59.9");
+            label->setTexture(tex);
+            label->updateAtlasValues();
         } else {
-            img->release();
+            (void)decodePngIntoTextureCache(pngData, 256, 32, nullptr, texErr);
+            PHASE_REQUIRE(texErr.empty(), detail, texErr);
         }
-        detail = "PNG 256x32 decoded cleanly; WGL20=" + (wglCtx.ready ? wglCtx.glVersion : ("unavailable(gl=" + wglCtx.glVersion + ")"));
+        detail = "PNG 256x32 decoded cleanly; WGL20=" +
+                 (wglCtx.ready ? wglCtx.glVersion : ("unavailable(gl=" + wglCtx.glVersion + ")"));
         return true;
     });
 
     // Phase 3: CCConfiguration + gatherGPUInfo + dumpInfo + CCDirector + CCScheduler + SimpleAudioEngine
     runPhase("phase3_configuration_director_scheduler", [&](std::string& detail) -> bool {
         cocos2d::CCDirector* dir = cocos2d::CCDirector::sharedDirector();
-        if (!dir) {
-            detail = "CCDirector::sharedDirector() returned null";
-            return false;
-        }
+        PHASE_REQUIRE(dir != nullptr, detail, "CCDirector::sharedDirector() returned null");
         cocos2d::CCConfiguration* conf = cocos2d::CCConfiguration::sharedConfiguration();
-        if (!conf) {
-            detail = "CCConfiguration::sharedConfiguration() returned null";
-            return false;
-        }
-        if (wglCtx.ready) {
-            conf->gatherGPUInfo();
-        }
-        conf->dumpInfo();
+        PHASE_REQUIRE(conf != nullptr, detail, "CCConfiguration::sharedConfiguration() returned null");
 
+        if (wglCtx.ready) conf->gatherGPUInfo();
+        conf->dumpInfo();
         dir->setAnimationInterval(1.0 / 30.0);
         dir->setDisplayStats(true);
 
@@ -978,32 +904,28 @@ int main(int argc, char** argv) {
         }
 
         cocos2d::CCScheduler* sched = dir->getScheduler();
-        if (!sched) {
-            detail = "CCDirector::getScheduler() returned null";
-            return false;
-        }
+        PHASE_REQUIRE(sched != nullptr, detail, "CCDirector::getScheduler() returned null");
+
         using cocos2d::SEL_SCHEDULE;
         auto* dummy = new DummyTickTarget();
+        auto relDummy = makeScopeExit([dummy]() noexcept { dummy->release(); });
         sched->unscheduleSelector(schedule_selector(DummyTickTarget::onTick), dummy);
         sched->scheduleSelector(schedule_selector(DummyTickTarget::onTick), dummy, 0.0f, false);
         sched->unscheduleAllForTarget(dummy);
         sched->scheduleUpdateForTarget(dummy, 0, false);
         sched->update(0.016f);
         sched->unscheduleAllForTarget(dummy);
-        const int ticks = dummy->ticks;
-        dummy->release();
 
-        detail = "ticks=" + std::to_string(ticks) + " maxTex=" + std::to_string(conf->getMaxTextureSize());
-        return ticks >= 1;
+        detail = "ticks=" + std::to_string(dummy->ticks) +
+                 " maxTex=" + std::to_string(conf->getMaxTextureSize());
+        return dummy->ticks >= 1;
     });
 
     // Phase 4: CCLuaEngine::defaultEngine + tolua++ bindings + Lua CCFileUtils call
     runPhase("phase4_ccluaengine_and_bindings", [&](std::string& detail) -> bool {
         cocos2d::CCLuaEngine* engine = cocos2d::CCLuaEngine::defaultEngine();
-        if (!engine || !engine->getLuaStack() || !engine->getLuaStack()->getLuaState()) {
-            detail = "CCLuaEngine::defaultEngine() failed";
-            return false;
-        }
+        PHASE_REQUIRE(engine && engine->getLuaStack() && engine->getLuaStack()->getLuaState(),
+                      detail, "CCLuaEngine::defaultEngine() failed");
         cocos2d::CCScriptEngineManager::sharedManager()->setScriptEngine(engine);
         lua_State* L = engine->getLuaStack()->getLuaState();
         const int rc = engine->executeString(
@@ -1021,15 +943,9 @@ int main(int argc, char** argv) {
 
     // Phase 5: Real Win32 HWND + CCEGLView + TouchGroup + FuncMenu (Tửu Quán) Mouse Routing (>= 24 cycles)
     runPhase("phase5_win32_funcmenu_mouse_routing", [&](std::string& detail) -> bool {
-        auto makeTouchBtn = [&]() -> cocos2d::ui::Widget* {
-            if (wglCtx.ready) return cocos2d::ui::Button::create();
-            auto* l = cocos2d::ui::Layout::create();
-            l->setAnchorPoint(cocos2d::CCPointMake(0.5f, 0.5f));
-            return l;
-        };
         using cocos2d::ui::SEL_TouchEvent;
         cocos2d::CCDirector* dir = cocos2d::CCDirector::sharedDirector();
-        if (!dir || !dir->getTouchDispatcher()) { detail = "CCDirector/CCTouchDispatcher null"; return false; }
+        PHASE_REQUIRE(dir && dir->getTouchDispatcher(), detail, "CCDirector/CCTouchDispatcher null");
 
         static const wchar_t* kTestWndClass = L"KestrelFuncMenuMouseProbeWnd";
         WNDCLASSEXW wc{};
@@ -1043,18 +959,28 @@ int main(int argc, char** argv) {
         auto* testView = new TestableWin32EGLView(false);
         HWND testHwnd = ::CreateWindowExW(0, kTestWndClass, L"Kestrel Issue #8 FuncMenu Mouse Probe",
                                           WS_POPUP, 0, 0, 1136, 640, nullptr, nullptr, wc.hInstance, testView);
-        if (!testHwnd) { delete testView; detail = "CreateWindowExW failed"; return false; }
+        if (!testHwnd) {
+            delete testView;
+            detail = "CreateWindowExW failed";
+            return false;
+        }
         testView->setHWnd(testHwnd);
 
         cocos2d::CCEGLView* prevView = DirectorViewTestAccessor::currentView(dir);
         DirectorViewTestAccessor::bindHeadlessView(dir, testView);
+        auto cleanupView = makeScopeExit([&]() noexcept {
+            DirectorViewTestAccessor::bindHeadlessView(dir, prevView);
+            testView->setHWnd(nullptr);
+            ::DestroyWindow(testHwnd);
+            delete testView;
+        });
 
         struct ResCase { int baseW, baseH, dpiPct; };
         const ResCase kCases[12] = {
-            {960, 640, 100},  {960, 640, 125},  {960, 640, 150},
-            {1136, 640, 100}, {1136, 640, 125}, {1136, 640, 150},
-            {1280, 720, 100}, {1280, 720, 125}, {1280, 720, 150},
-            {1920, 1080, 100},{1920, 1080, 125},{1920, 1080, 150},
+            {960, 640, 100},   {960, 640, 125},   {960, 640, 150},
+            {1136, 640, 100},  {1136, 640, 125},  {1136, 640, 150},
+            {1280, 720, 100},  {1280, 720, 125},  {1280, 720, 150},
+            {1920, 1080, 100}, {1920, 1080, 125}, {1920, 1080, 150},
         };
 
         int completedCycles = 0, directOpens = 0, secOpens = 0, jgOpens = 0, panelCloses = 0;
@@ -1076,7 +1002,9 @@ int main(int argc, char** argv) {
             const float luaW = cppDesign.width, luaH = (std::max)(cppDesign.height, 640.0f);
             const float yShift = (luaH - 640.0f) * 0.5f;
             const float stScale = (cppDesign.height < 640.0f) ? (cppDesign.height / 640.0f) : 1.0f;
-            const float stX = (cppDesign.height < 640.0f) ? ((cppDesign.width - 1136.0f * stScale) * 0.5f) : ((cppDesign.width - 1136.0f) * 0.5f);
+            const float stX = (cppDesign.height < 640.0f)
+                ? ((cppDesign.width - 1136.0f * stScale) * 0.5f)
+                : ((cppDesign.width - 1136.0f) * 0.5f);
             const float stY = (cppDesign.height < 640.0f) ? 0.0f : ((cppDesign.height - 640.0f) * 0.5f);
 
             auto* stage = cocos2d::CCScene::create();
@@ -1110,21 +1038,13 @@ int main(int argc, char** argv) {
             choukaWrap->setPosition(cocos2d::CCPointMake(50.0f, 400.0f));
             funcMenu->addChild(choukaWrap);
 
-            auto* choukaBtn = makeTouchBtn();
-            choukaBtn->ignoreContentAdaptWithSize(false);
-            choukaBtn->setSize(cocos2d::CCSizeMake(119.0f, 112.0f));
-            choukaBtn->setScale(0.8f);
-            choukaBtn->setAnchorPoint(cocos2d::CCPointMake(0.5f, 0.0f));
-            choukaBtn->setTouchEnabled(true);
+            auto* choukaBtn = createConfiguredTouchWidget(
+                wglCtx.ready, 119.0f, 112.0f, 0.8f, cocos2d::CCPointMake(0.5f, 0.0f));
             choukaWrap->addChild(choukaBtn);
 
             auto* tipsMore = cocos2d::ui::Layout::create();
             tipsMore->setPosition(cocos2d::CCPointMake(0.0f, -yShift));
-            auto* panelMask = cocos2d::ui::Layout::create();
-            panelMask->setSize(cocos2d::CCSizeMake(1.0f, 1.0f));
-            panelMask->setPosition(cocos2d::CCPointMake(0.0f, 20.0f));
-            panelMask->setTouchEnabled(true);
-            tipsMore->addChild(panelMask);
+            tipsMore->addChild(createTouchMaskLayout(1.0f, 1.0f, 0.0f, 20.0f));
             mainScene->addWidget(tipsMore);
 
             bool raffleOpen = false, secondaryOpen = false;
@@ -1133,27 +1053,31 @@ int main(int argc, char** argv) {
             cocos2d::ui::Widget* secBg = nullptr;
 
             auto* choukaCb = new WidgetCallbackTarget();
-            auto* closeCb = new WidgetCallbackTarget();
-            auto* maskCb = new WidgetCallbackTarget();
-            auto* jgCb = new WidgetCallbackTarget();
+            auto* closeCb  = new WidgetCallbackTarget();
+            auto* maskCb   = new WidgetCallbackTarget();
+            auto* jgCb     = new WidgetCallbackTarget();
+            auto cleanupCycle = makeScopeExit([&]() noexcept {
+                stage->onExit();
+                stage->cleanup();
+                stage->release();
+                choukaCb->release();
+                closeCb->release();
+                maskCb->release();
+                jgCb->release();
+            });
 
             auto spawnRaffle = [&]() {
                 if (raffleOpen) return;
                 raffleOpen = true;
                 activeRaffle = cocos2d::ui::TouchGroup::create();
                 activeRaffle->setTouchPriority(-26);
-                auto* modalBg = cocos2d::ui::Layout::create();
-                modalBg->setSize(cocos2d::CCSizeMake(luaW, luaH));
-                modalBg->setPosition(cocos2d::CCPointMake(0.0f, -yShift));
-                modalBg->setTouchEnabled(true);
+                auto* modalBg = createTouchMaskLayout(luaW, luaH, 0.0f, -yShift);
                 activeRaffle->addWidget(modalBg);
                 modalBg->setZOrder(-2);
 
-                auto* closeBtn = makeTouchBtn();
-                closeBtn->ignoreContentAdaptWithSize(false);
-                closeBtn->setSize(cocos2d::CCSizeMake(80.0f, 80.0f));
+                auto* closeBtn = createConfiguredTouchWidget(
+                    wglCtx.ready, 80.0f, 80.0f, 1.0f, cocos2d::CCPointMake(0.5f, 0.5f));
                 closeBtn->setPosition(cocos2d::CCPointMake(1060.0f, 580.0f + yShift));
-                closeBtn->setTouchEnabled(true);
                 closeBtn->addTouchEventListener(closeCb, toucheventselector(WidgetCallbackTarget::handleTouch));
                 activeRaffle->addWidget(closeBtn);
                 panelHost->addChild(activeRaffle);
@@ -1187,14 +1111,13 @@ int main(int argc, char** argv) {
                     if (secondaryOpen) { closeSec(); return; }
                     secondaryOpen = true;
                     ++secOpens;
-                    secMask = cocos2d::ui::Layout::create();
-                    secMask->setSize(cocos2d::CCSizeMake(luaW, luaH));
-                    secMask->setPosition(cocos2d::CCPointMake(0.0f, -yShift));
-                    secMask->setTouchEnabled(true);
+                    secMask = createTouchMaskLayout(luaW, luaH, 0.0f, -yShift);
                     secMask->addTouchEventListener(maskCb, toucheventselector(WidgetCallbackTarget::handleTouch));
                     funcMenu->addChild(secMask);
 
-                    secBg = wglCtx.ready ? static_cast<cocos2d::ui::Widget*>(cocos2d::ui::ImageView::create()) : static_cast<cocos2d::ui::Widget*>(cocos2d::ui::Layout::create());
+                    secBg = wglCtx.ready
+                        ? static_cast<cocos2d::ui::Widget*>(cocos2d::ui::ImageView::create())
+                        : static_cast<cocos2d::ui::Widget*>(cocos2d::ui::Layout::create());
                     secBg->ignoreContentAdaptWithSize(false);
                     secBg->setAnchorPoint(cocos2d::CCPointMake(0.0f, 0.0f));
                     secBg->setPosition(cocos2d::CCPointMake(100.0f, 370.0f));
@@ -1204,12 +1127,8 @@ int main(int argc, char** argv) {
                     auto* jgWrap = cocos2d::ui::Layout::create();
                     jgWrap->setPosition(cocos2d::CCPointMake(68.0f, 10.0f));
                     secBg->addChild(jgWrap);
-                    auto* jgBtn = makeTouchBtn();
-                    jgBtn->ignoreContentAdaptWithSize(false);
-                    jgBtn->setSize(cocos2d::CCSizeMake(119.0f, 112.0f));
-                    jgBtn->setScale(0.8f);
-                    jgBtn->setAnchorPoint(cocos2d::CCPointMake(0.5f, 0.0f));
-                    jgBtn->setTouchEnabled(true);
+                    auto* jgBtn = createConfiguredTouchWidget(
+                        wglCtx.ready, 119.0f, 112.0f, 0.8f, cocos2d::CCPointMake(0.5f, 0.0f));
                     jgBtn->addTouchEventListener(jgCb, toucheventselector(WidgetCallbackTarget::handleTouch));
                     jgWrap->addChild(jgBtn);
                 }
@@ -1227,56 +1146,45 @@ int main(int argc, char** argv) {
                 };
             };
 
-            bool ok = true;
             const POINT choukaPt = sceneToClient(50.0f, yShift + ((cycleIdx % 2 == 0) ? 444.8f : 435.0f));
             const WPARAM clickWParam = (cycleIdx % 3 == 1) ? (MK_LBUTTON | MK_CONTROL)
-                                     : (cycleIdx % 3 == 2) ? static_cast<WPARAM>(0) : static_cast<WPARAM>(MK_LBUTTON);
+                                     : (cycleIdx % 3 == 2) ? static_cast<WPARAM>(0)
+                                                           : static_cast<WPARAM>(MK_LBUTTON);
 
             if (cycleIdx == 0) {
                 const POINT missPt = sceneToClient(50.0f, yShift + 392.0f);
                 dispatchWin32ClickViaWindowProc(testHwnd, missPt.x, missPt.y, MK_LBUTTON);
-                if (raffleOpen || secondaryOpen) { failReason = "Hit below bottom-center anchor y=400"; ok = false; }
+                PHASE_REQUIRE(!raffleOpen && !secondaryOpen, failReason, "Hit below bottom-center anchor y=400");
                 ::SendMessageW(testHwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(choukaPt.x, choukaPt.y));
                 ::SendMessageW(testHwnd, WM_CAPTURECHANGED, 0, reinterpret_cast<LPARAM>(wglCtx.hwnd));
-                if (raffleOpen || secondaryOpen) { failReason = "WM_CAPTURECHANGED did not cancel touch"; ok = false; }
+                PHASE_REQUIRE(!raffleOpen && !secondaryOpen, failReason, "WM_CAPTURECHANGED did not cancel touch");
             }
 
-            if (ok) {
-                std::printf("[InputRoute] cycle=%02d mode=%s res=%dx%d@%d%% client=%ldx%ld cppDesign=%.0fx%.0f clickClient=(%ld,%ld) wParam=0x%llX\n",
-                            cycleIdx + 1, secMode ? "Lv50_Secondary" : "Direct_Raffle",
-                            rc.baseW, rc.baseH, rc.dpiPct, clientRc.right - clientRc.left, clientRc.bottom - clientRc.top,
-                            cppDesign.width, cppDesign.height, choukaPt.x, choukaPt.y, static_cast<unsigned long long>(clickWParam));
-                dispatchWin32ClickViaWindowProc(testHwnd, choukaPt.x, choukaPt.y, clickWParam);
-                const POINT closePt = sceneToClient(1060.0f, 580.0f + yShift);
-                if (!secMode) {
-                    const int prevOpens = directOpens;
-                    if (!raffleOpen) { failReason = "Direct Tửu Quán open failed"; ok = false; }
-                    else {
-                        dispatchWin32ClickViaWindowProc(testHwnd, choukaPt.x, choukaPt.y, MK_LBUTTON);
-                        if (directOpens != prevOpens) { failReason = "Modal RaffleMainPanel did not swallow click"; ok = false; }
-                        dispatchWin32ClickViaWindowProc(testHwnd, closePt.x, closePt.y, MK_LBUTTON);
-                        if (raffleOpen) { failReason = "RaffleMainPanel close failed"; ok = false; }
-                    }
-                } else {
-                    if (!secondaryOpen) { failReason = "Secondary simg_bg open failed"; ok = false; }
-                    else {
-                        const POINT jgPt = sceneToClient(168.0f, yShift + 424.8f);
-                        dispatchWin32ClickViaWindowProc(testHwnd, jgPt.x, jgPt.y, MK_LBUTTON);
-                        if (secondaryOpen || !raffleOpen) { failReason = "Secondary jiuguan open failed"; ok = false; }
-                        else {
-                            dispatchWin32ClickViaWindowProc(testHwnd, closePt.x, closePt.y, MK_LBUTTON);
-                            if (raffleOpen) { failReason = "RaffleMainPanel close failed after jiuguan"; ok = false; }
-                        }
-                    }
-                }
+            std::printf("[InputRoute] cycle=%02d mode=%s res=%dx%d@%d%% client=%ldx%ld cppDesign=%.0fx%.0f clickClient=(%ld,%ld) wParam=0x%llX\n",
+                        cycleIdx + 1, secMode ? "Lv50_Secondary" : "Direct_Raffle",
+                        rc.baseW, rc.baseH, rc.dpiPct,
+                        clientRc.right - clientRc.left, clientRc.bottom - clientRc.top,
+                        cppDesign.width, cppDesign.height, choukaPt.x, choukaPt.y,
+                        static_cast<unsigned long long>(clickWParam));
+            dispatchWin32ClickViaWindowProc(testHwnd, choukaPt.x, choukaPt.y, clickWParam);
+            const POINT closePt = sceneToClient(1060.0f, 580.0f + yShift);
+            if (!secMode) {
+                const int prevOpens = directOpens;
+                PHASE_REQUIRE(raffleOpen, failReason, "Direct Tửu Quán open failed");
+                dispatchWin32ClickViaWindowProc(testHwnd, choukaPt.x, choukaPt.y, MK_LBUTTON);
+                PHASE_REQUIRE(directOpens == prevOpens, failReason, "Modal RaffleMainPanel did not swallow click");
+                dispatchWin32ClickViaWindowProc(testHwnd, closePt.x, closePt.y, MK_LBUTTON);
+                PHASE_REQUIRE(!raffleOpen, failReason, "RaffleMainPanel close failed");
+            } else {
+                PHASE_REQUIRE(secondaryOpen, failReason, "Secondary simg_bg open failed");
+                const POINT jgPt = sceneToClient(168.0f, yShift + 424.8f);
+                dispatchWin32ClickViaWindowProc(testHwnd, jgPt.x, jgPt.y, MK_LBUTTON);
+                PHASE_REQUIRE(!secondaryOpen && raffleOpen, failReason, "Secondary jiuguan open failed");
+                dispatchWin32ClickViaWindowProc(testHwnd, closePt.x, closePt.y, MK_LBUTTON);
+                PHASE_REQUIRE(!raffleOpen, failReason, "RaffleMainPanel close failed after jiuguan");
             }
-            if (ok && touchFxProbe->beganCount < 2) { failReason = "TouchEffectManager (-123) missed touches"; ok = false; }
-
-            stage->onExit();
-            stage->cleanup();
-            stage->release();
-            choukaCb->release(); closeCb->release(); maskCb->release(); jgCb->release();
-            return ok;
+            PHASE_REQUIRE(touchFxProbe->beganCount >= 2, failReason, "TouchEffectManager (-123) missed touches");
+            return true;
         };
 
         for (int i = 0; i < 12 && failReason.empty(); ++i) { if (!runCycle(i, kCases[i], false)) break; ++completedCycles; }
@@ -1293,18 +1201,18 @@ int main(int argc, char** argv) {
                 testView->setDesignResolutionSize(1136.0f, 640.0f, kResolutionFixedWidth);
                 auto* siScene = cocos2d::CCScene::create(); siScene->retain();
                 auto* siGroup = cocos2d::ui::TouchGroup::create(); siGroup->setTouchPriority(-2);
-                auto* siBtn = makeTouchBtn();
-                siBtn->ignoreContentAdaptWithSize(false);
-                siBtn->setSize(cocos2d::CCSizeMake(119.0f, 112.0f));
-                siBtn->setScale(0.8f);
-                siBtn->setAnchorPoint(cocos2d::CCPointMake(0.5f, 0.0f));
+                auto* siBtn = createConfiguredTouchWidget(
+                    wglCtx.ready, 119.0f, 112.0f, 0.8f, cocos2d::CCPointMake(0.5f, 0.0f));
                 siBtn->setPosition(cocos2d::CCPointMake(50.0f, 400.0f));
-                siBtn->setTouchEnabled(true);
                 bool siHit = false;
                 auto* siCb = new WidgetCallbackTarget();
-                siCb->onEvent = [&](cocos2d::CCObject*, cocos2d::ui::TouchEventType t) { if (t == cocos2d::ui::TOUCH_EVENT_ENDED) siHit = true; };
+                siCb->onEvent = [&](cocos2d::CCObject*, cocos2d::ui::TouchEventType t) {
+                    if (t == cocos2d::ui::TOUCH_EVENT_ENDED) siHit = true;
+                };
                 siBtn->addTouchEventListener(siCb, toucheventselector(WidgetCallbackTarget::handleTouch));
-                siGroup->addWidget(siBtn); siScene->addChild(siGroup); siScene->onEnter();
+                siGroup->addWidget(siBtn);
+                siScene->addChild(siGroup);
+                siScene->onEnter();
 
                 std::string siErr;
                 const bool sentOk = dispatchWin32ClickViaSendInput(testHwnd, 50, 195, siErr);
@@ -1317,22 +1225,15 @@ int main(int argc, char** argv) {
         }
 
         std::fflush(stdout);
-        DirectorViewTestAccessor::bindHeadlessView(dir, prevView);
-        testView->setHWnd(nullptr);
-        ::DestroyWindow(testHwnd);
-        delete testView;
-
-        if (!failReason.empty()) { detail = failReason; return false; }
+        PHASE_REQUIRE(failReason.empty(), detail, failReason);
         detail = "cycles=" + std::to_string(completedCycles) + " direct=" + std::to_string(directOpens) +
                  " sec=" + std::to_string(secOpens) + " jiuguan=" + std::to_string(jgOpens) +
                  " closes=" + std::to_string(panelCloses) + " sendInput=" + sendInputVerdict;
-        return completedCycles == 24 && directOpens == 12 && secOpens == 12 && jgOpens == 12 && panelCloses == 24;
+        return completedCycles == 24 && directOpens == 12 && secOpens == 12 &&
+               jgOpens == 12 && panelCloses == 24;
     });
 
-    // Phase 6 (Issue #8): >= 50 iterations of GainItemListInfoPanel / GainItemCell widget lifecycle,
-    // addNode + removeFromParentAndCleanup(true) -> Widget::getNodes() synchronization,
-    // removeAllChildrenWithCleanup(true) internal renderer preservation, and ImageView
-    // ignoreContentAdaptWithSize(false) -> loadTexture (plist frame & local) -> setSize(100,100)/(98,98) + CCFadeIn
+    // Phase 6 (Issue #8): >= 50 iterations of GainItemListInfoPanel / GainItemCell widget lifecycle
     runPhase("phase5_issue8_widget_lifecycle_and_imageview_icons", [&](std::string& detail) -> bool {
         cocos2d::CCSpriteFrame* frame5 = nullptr;
         if (wglCtx.ready) {
@@ -1340,125 +1241,85 @@ int main(int argc, char** argv) {
             const std::vector<uint8_t> iconPng = buildValidRgbaPng(98, 98);
             {
                 std::ofstream iconOut(tempFixture / L"gameImage" / L"item" / L"jinjiedan.png", std::ios::binary);
-                iconOut.write(reinterpret_cast<const char*>(iconPng.data()), static_cast<std::streamsize>(iconPng.size()));
+                iconOut.write(reinterpret_cast<const char*>(iconPng.data()),
+                              static_cast<std::streamsize>(iconPng.size()));
             }
-            const std::vector<uint8_t> framePng = buildValidRgbaPng(100, 100);
-            auto* frameImg = new cocos2d::CCImage();
-            if (!frameImg->initWithImageData(
-                    const_cast<uint8_t*>(framePng.data()),
-                    static_cast<int>(framePng.size()),
-                    cocos2d::CCImage::kFmtPng)) {
-                frameImg->release();
-                detail = "Failed to decode 100x100 frame PNG";
-                return false;
-            }
-            cocos2d::CCTexture2D* frameTex =
-                cocos2d::CCTextureCache::sharedTextureCache()->addUIImage(frameImg, "issue8_frame_5_atlas");
-            frameImg->release();
-            if (!frameTex) {
-                detail = "addUIImage failed for issue8_frame_5_atlas";
-                return false;
-            }
-            frame5 = cocos2d::CCSpriteFrame::createWithTexture(frameTex, cocos2d::CCRect(0.0f, 0.0f, 100.0f, 100.0f));
+            std::string texErr;
+            cocos2d::CCTexture2D* frameTex = decodePngIntoTextureCache(
+                buildValidRgbaPng(100, 100), 100, 100, "issue8_frame_5_atlas", texErr);
+            PHASE_REQUIRE(frameTex != nullptr, detail, texErr);
+            frame5 = cocos2d::CCSpriteFrame::createWithTexture(
+                frameTex, cocos2d::CCRect(0.0f, 0.0f, 100.0f, 100.0f));
             cocos2d::CCSpriteFrameCache::sharedSpriteFrameCache()->addSpriteFrame(frame5, "frame_5.png");
         }
+
+        auto makeFrameOrNode = [&]() -> cocos2d::CCNode* {
+            return frame5 ? static_cast<cocos2d::CCNode*>(cocos2d::CCSprite::createWithSpriteFrame(frame5))
+                          : cocos2d::CCNode::create();
+        };
 
         constexpr int kLoops = 60;
         for (int iter = 0; iter < kLoops; ++iter) {
             auto* itemContainer = cocos2d::ui::Layout::create();
             itemContainer->retain();
+            auto relContainer = makeScopeExit([itemContainer]() noexcept { itemContainer->release(); });
 
             for (int c = 0; c < 5; ++c) {
                 auto* cell = cocos2d::ui::Layout::create();
                 itemContainer->addChild(cell);
 
-                // GainItemCell.lua:61: glow node at z = -1
-                cocos2d::CCNode* glow = frame5
-                    ? static_cast<cocos2d::CCNode*>(cocos2d::CCSprite::createWithSpriteFrame(frame5))
-                    : cocos2d::CCNode::create();
+                cocos2d::CCNode* glow = makeFrameOrNode();
                 glow->setPosition(cocos2d::CCPoint(87.0f, 69.0f));
                 glow->setScale(1.2f);
                 cell->addNode(glow, -1, 101);
 
-                // BaseItemWithNameIcon_TM: iconQuality (100x100) + icon (98x98) + lbName ("Tiến Cấp Đơn")
                 auto* iconItem = cocos2d::ui::Layout::create();
                 iconItem->setPosition(cocos2d::CCPoint(40.0f, 0.0f));
                 cell->addChild(iconItem);
 
                 if (wglCtx.ready) {
-                    auto* iconQuality = cocos2d::ui::ImageView::create();
-                    iconQuality->ignoreContentAdaptWithSize(false);
-                    iconItem->addChild(iconQuality);
-                    iconQuality->loadTexture("gameImage/frame/frame_5.png", cocos2d::ui::UI_TEX_TYPE_LOCAL);
-                    iconQuality->setSize(cocos2d::CCSize(100.0f, 100.0f));
-
-                    auto* icon = cocos2d::ui::ImageView::create();
-                    icon->ignoreContentAdaptWithSize(false);
-                    iconItem->addChild(icon);
-                    icon->loadTexture("gameImage/item/jinjiedan.png", cocos2d::ui::UI_TEX_TYPE_LOCAL);
-                    icon->setSize(cocos2d::CCSize(98.0f, 98.0f));
-
+                    auto* iconQuality = createSizedLocalImage(iconItem, "gameImage/frame/frame_5.png", 100.0f);
+                    auto* icon = createSizedLocalImage(iconItem, "gameImage/item/jinjiedan.png", 98.0f);
                     auto* lbName = cocos2d::ui::Label::create();
                     lbName->setText("Tiến Cấp Đơn");
                     iconItem->addChild(lbName);
 
                     auto* qVr = dynamic_cast<cocos2d::CCSprite*>(iconQuality->getVirtualRenderer());
                     auto* iVr = dynamic_cast<cocos2d::CCSprite*>(icon->getVirtualRenderer());
-                    if (!qVr || !qVr->getTexture() || qVr->getContentSize().width <= 0.0f || qVr->getScaleX() <= 0.0f ||
-                        !iVr || !iVr->getTexture() || iVr->getContentSize().width <= 0.0f || iVr->getScaleX() <= 0.0f) {
-                        itemContainer->release();
-                        detail = "ImageView virtualRenderer missing texture or zero scale on iter=" + std::to_string(iter);
-                        return false;
-                    }
+                    PHASE_REQUIRE(qVr && qVr->getTexture() && qVr->getContentSize().width > 0.0f && qVr->getScaleX() > 0.0f &&
+                                      iVr && iVr->getTexture() && iVr->getContentSize().width > 0.0f && iVr->getScaleX() > 0.0f,
+                                  detail, "ImageView virtualRenderer missing texture or zero scale on iter=" + std::to_string(iter));
                 }
 
-                // CCFadeIn opacity step verification on UIWidget
                 auto* fade = cocos2d::CCFadeIn::create(14.0f / 60.0f);
                 fade->startWithTarget(cell);
                 fade->update(0.0f);
                 fade->update(1.0f);
-                if (cell->getOpacity() != 255 || cell->getDisplayedOpacity() != 255) {
-                    itemContainer->release();
-                    detail = "CCFadeIn failed to restore Widget/CCNodeRGBA opacity=255";
-                    return false;
-                }
+                PHASE_REQUIRE(cell->getOpacity() == 255 && cell->getDisplayedOpacity() == 255,
+                              detail, "CCFadeIn failed to restore Widget/CCNodeRGBA opacity=255");
 
-                // playArmatureOnce equivalent: addNode(fx) then fx->removeFromParentAndCleanup(true)
-                cocos2d::CCNode* fxNode = frame5
-                    ? static_cast<cocos2d::CCNode*>(cocos2d::CCSprite::createWithSpriteFrame(frame5))
-                    : cocos2d::CCNode::create();
+                cocos2d::CCNode* fxNode = makeFrameOrNode();
                 const unsigned int baseRef = fxNode->retainCount();
                 cell->addNode(fxNode, 0, 202);
-                if (!cell->getNodes() || cell->getNodes()->count() != 2u) {
-                    itemContainer->release();
-                    detail = "Expected 2 nodes after addNode(fxNode)";
-                    return false;
-                }
+                PHASE_REQUIRE(cell->getNodes() && cell->getNodes()->count() == 2u,
+                              detail, "Expected 2 nodes after addNode(fxNode)");
                 fxNode->removeFromParentAndCleanup(true);
-                if (cell->getNodes()->count() != 1u || cell->getNodes()->containsObject(fxNode) ||
-                    fxNode->retainCount() != baseRef) {
-                    itemContainer->release();
-                    detail = "Stale pointer or leaked retainCount in Widget::getNodes() after removeFromParentAndCleanup";
-                    return false;
-                }
+                PHASE_REQUIRE(cell->getNodes()->count() == 1u &&
+                                  !cell->getNodes()->containsObject(fxNode) &&
+                                  fxNode->retainCount() == baseRef,
+                              detail, "Stale pointer or leaked retainCount in Widget::getNodes() after removeFromParentAndCleanup");
 
-                // Clear cell: removeAllChildrenWithCleanup(true) must clear both _widgetChildren and _nodes!
                 if (c % 2 == 0) {
                     cell->removeAllChildrenWithCleanup(true);
-                    if (cell->getNodes()->count() != 0u || cell->getChildren()->count() != 0u) {
-                        itemContainer->release();
-                        detail = "Widget::removeAllChildrenWithCleanup failed to clear _nodes";
-                        return false;
-                    }
+                    PHASE_REQUIRE(cell->getNodes()->count() == 0u && cell->getChildren()->count() == 0u,
+                                  detail, "Widget::removeAllChildrenWithCleanup failed to clear _nodes");
                 }
             }
 
             itemContainer->removeAllChildrenWithCleanup(true);
-            if (itemContainer->getNodes()->count() != 0u || itemContainer->getChildren()->count() != 0u) {
-                itemContainer->release();
-                detail = "itemContainer->removeAllChildrenWithCleanup left stale children/nodes";
-                return false;
-            }
+            PHASE_REQUIRE(itemContainer->getNodes()->count() == 0u && itemContainer->getChildren()->count() == 0u,
+                          detail, "itemContainer->removeAllChildrenWithCleanup left stale children/nodes");
+            relContainer.release();
             itemContainer->release();
             cocos2d::CCPoolManager::sharedPoolManager()->pop();
         }
@@ -1467,14 +1328,11 @@ int main(int argc, char** argv) {
         return true;
     });
 
-    // Phase 6: Issue #8 Armature BitCache/Plistb + WGL Offscreen Starburst Seam & Glow Ring glReadPixels
+    // Phase 7: Issue #8 Armature BitCache/Plistb + WGL Offscreen Starburst Seam & Glow Ring glReadPixels
     runPhase("phase5_armature_seam_and_glow_wgl_pixels", [&](std::string& detail) -> bool {
-        // Verify BitCache color clamp & sticky additive blend on gclient_assets
-        if (gclient::assets::XmlbArmatureLoader::ClampColorChannel(260) != 255u ||
-            gclient::assets::XmlbArmatureLoader::ClampColorChannel(-5) != 0u) {
-            detail = "XmlbArmatureLoader::ClampColorChannel failed [0,255] bounds";
-            return false;
-        }
+        PHASE_REQUIRE(gclient::assets::XmlbArmatureLoader::ClampColorChannel(260) == 255u &&
+                          gclient::assets::XmlbArmatureLoader::ClampColorChannel(-5) == 0u,
+                      detail, "XmlbArmatureLoader::ClampColorChannel failed [0,255] bounds");
         if (!wglCtx.gl11Ready) {
             detail = "WGL 1.1 unavailable in headless session; skipped glReadPixels";
             return true;
@@ -1503,11 +1361,8 @@ int main(int argc, char** argv) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kAtlasDim, kAtlasDim, 0, GL_RGBA, GL_UNSIGNED_BYTE, atlas.data());
 
         glViewport(0, 0, 64, 64);
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glOrtho(0.0, 64.0, 0.0, 64.0, -1.0, 1.0);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
+        glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0.0, 64.0, 0.0, 64.0, -1.0, 1.0);
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity();
         glEnable(GL_TEXTURE_2D);
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
@@ -1515,7 +1370,6 @@ int main(int argc, char** argv) {
         glClear(GL_COLOR_BUFFER_BIT);
         glColor4ub(255, 255, 255, 255);
 
-        // Render 4 mirrored quadrants using CCSkin::setTextureCoords half-texel-clamped cut-seam UVs
         const float uCut = 2.5f / 64.0f, uOuter = 18.0f / 64.0f;
         const float vOuter = 2.0f / 64.0f, vCut = 17.5f / 64.0f;
         const float signs[4][2] = {{1.0f, 1.0f}, {-1.0f, 1.0f}, {1.0f, -1.0f}, {-1.0f, -1.0f}};
@@ -1539,34 +1393,18 @@ int main(int argc, char** argv) {
         const int seamXR  = fb[(40 * 64 + 32) * 4 + 0];
         const int seamYR  = fb[(32 * 64 + 40) * 4 + 0];
         const int innerR  = fb[(40 * 64 + 40) * 4 + 0];
-        const bool seamFree =
-            innerR >= 200 &&
-            std::abs(centerR - innerR) <= 2 &&
-            std::abs(seamXR - innerR) <= 2 &&
-            std::abs(seamYR - innerR) <= 2;
         detail = "centerR=" + std::to_string(centerR) +
                  " seamXR=" + std::to_string(seamXR) +
                  " seamYR=" + std::to_string(seamYR) +
                  " innerR=" + std::to_string(innerR);
-        return seamFree;
+        return innerR >= 200 && std::abs(centerR - innerR) <= 2 &&
+               std::abs(seamXR - innerR) <= 2 && std::abs(seamYR - innerR) <= 2;
     });
 
     g_watchdogStop.store(true, std::memory_order_release);
-    if (watchdog.joinable()) {
-        watchdog.join();
-    }
-    if (hMainThread != nullptr) {
-        ::CloseHandle(hMainThread);
-    }
+    if (watchdog.joinable()) watchdog.join();
+    if (hMainThread != nullptr) ::CloseHandle(hMainThread);
 
-    std::error_code ec;
-    fs::remove_all(tempFixture, ec);
-
-    const std::string verdict = anyFailed ? "FAILED" : "PASSED";
-    writeJsonReport(jsonOutPath, verdict, primaryRva, nearbySyms, "");
-
-    if (anyFailed && !probeOnly) {
-        return 1;
-    }
-    return 0;
+    writeJsonReport(jsonOutPath, anyFailed ? "FAILED" : "PASSED", primaryRva, nearbySyms, "");
+    return (anyFailed && !probeOnly) ? 1 : 0;
 }
