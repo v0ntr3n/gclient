@@ -7,6 +7,8 @@
 
 #include "assets/BtDecryptHook.h"
 #include "assets/PlistbLoader.h"
+#include "assets/SpineJsonCompat.h"
+#include "common/KestrelJson.h"
 #include "assets/XmlbArmatureLoader.h"
 #if defined(GCLIENT_TEST_EGL_GL)
 #define GL_GLEXT_PROTOTYPES 1
@@ -3940,6 +3942,221 @@ bool testIssue19PlistbXmlFallbackArmaturePathDedupAndSpineNullGuard() {
     return true;
 }
 
+
+bool testIssue20Spine41To42JsonNormalizationAndRuntimeCompatibility() {
+    using gclient::assets::NormalizeSpineJsonFor42;
+    using gclient::assets::SpineJsonCompatReport;
+    using gclient::json::JsonValue;
+    auto jnum = [](const JsonValue& v) -> float {
+        return v.type == JsonValue::Type::Int ? static_cast<float>(v.intVal) : static_cast<float>(v.doubleVal);
+    };
+
+    // 1. Spine 4.1.00 Loading11.json-style skeleton with UTF-8 BOM, bone "transform" modes,
+    //    4.1 multi-channel absolute Bezier curves, "stepped" curve, mesh + region attachments,
+    //    and null slot detach keyframe.
+    const std::string loading11Raw =
+        "\xEF\xBB\xBF"
+        R"JSON({
+  "skeleton": { "hash": "L11Hash41", "spine": "4.1.00", "x": -568, "y": -320, "width": 1136, "height": 640, "fps": 30 },
+  "bones": [
+    { "name": "root" },
+    { "name": "fx_glow", "parent": "root", "transform": "onlyTranslation" },
+    { "name": "fx_ring", "parent": "root", "transform": "noRotationOrReflection" },
+    { "name": "fx_beam", "parent": "fx_glow", "transform": "noScaleOrReflection" }
+  ],
+  "slots": [
+    { "name": "bg_slot", "bone": "root", "attachment": "bg_quad" },
+    { "name": "glow_slot", "bone": "fx_glow", "attachment": "glow_mesh", "blend": "additive" }
+  ],
+  "skins": [
+    {
+      "name": "default",
+      "attachments": {
+        "bg_slot": {
+          "bg_quad": { "x": 0, "y": 0, "width": 1136, "height": 640 }
+        },
+        "glow_slot": {
+          "glow_mesh": {
+            "type": "mesh",
+            "uvs": [0, 0, 1, 0, 1, 1, 0, 1],
+            "triangles": [0, 1, 2, 0, 2, 3],
+            "vertices": [-64, 64, 64, 64, 64, -64, -64, -64],
+            "hull": 4
+          }
+        }
+      }
+    }
+  ],
+  "animations": {
+    "LIHUI": {
+      "slots": {
+        "glow_slot": {
+          "attachment": [
+            { "time": 0, "name": "glow_mesh" },
+            { "time": 1.0, "name": null }
+          ],
+          "rgba": [
+            {
+              "time": 0,
+              "color": "ffffffff",
+              "curve": [0.25, 1.0, 0.75, 1.0, 0.25, 1.0, 0.75, 0.8, 0.25, 1.0, 0.75, 0.6, 0.25, 1.0, 0.75, 0.0]
+            },
+            { "time": 1.0, "color": "ffcc9900" }
+          ]
+        }
+      },
+      "bones": {
+        "fx_glow": {
+          "translate": [
+            { "time": 0, "x": 0, "y": 0, "curve": [0.2, 0, 0.8, 120, 0.2, 0, 0.8, -40] },
+            { "time": 1.0, "x": 120, "y": -40 }
+          ],
+          "rotate": [
+            { "time": 0, "value": 0, "curve": "stepped" },
+            { "time": 1.0, "value": 90 }
+          ]
+        }
+      }
+    }
+  }
+})JSON";
+
+    std::string norm41;
+    SpineJsonCompatReport rep41;
+    REQUIRE_TRUE(NormalizeSpineJsonFor42(loading11Raw, norm41, &rep41));
+    REQUIRE_TRUE(rep41.modified);
+    REQUIRE_TRUE(rep41.versionRewritten);
+    REQUIRE_EQ(rep41.sourceVersion, std::string("4.1.00"));
+    REQUIRE_EQ(rep41.targetVersion, std::string("4.2.00"));
+    REQUIRE_EQ(rep41.bonesInheritFixed, static_cast<size_t>(3));
+    REQUIRE_EQ(rep41.curvesNormalized, static_cast<size_t>(0));
+
+    JsonValue parsed41;
+    REQUIRE_TRUE(gclient::json::parse(norm41, parsed41, nullptr));
+    REQUIRE_EQ(parsed41.find("skeleton")->find("spine")->asString(), std::string("4.2.00"));
+    const auto& bones41 = parsed41.find("bones")->arrVal;
+    REQUIRE_EQ(bones41[1].find("inherit")->asString(), std::string("onlyTranslation"));
+    REQUIRE_TRUE(bones41[1].find("transform") == nullptr);
+    REQUIRE_EQ(bones41[2].find("inherit")->asString(), std::string("noRotationOrReflection"));
+    REQUIRE_EQ(bones41[3].find("inherit")->asString(), std::string("noScaleOrReflection"));
+
+    const auto& trCurve = parsed41.find("animations")->find("LIHUI")->find("bones")
+                              ->find("fx_glow")->find("translate")->arrVal[0].find("curve")->arrVal;
+    REQUIRE_EQ(trCurve.size(), static_cast<size_t>(8));
+    REQUIRE_EQ(trCurve[3].asInt64(), 120);
+    REQUIRE_EQ(trCurve[7].asInt64(), -40);
+
+    const auto& detachKf = parsed41.find("animations")->find("LIHUI")->find("slots")
+                               ->find("glow_slot")->find("attachment")->arrVal[1];
+    REQUIRE_TRUE(detachKf.find("name") == nullptr);
+
+    // 2. Legacy 3.8 / mixed converter skeleton: object skins, "skinnedmesh", "color"->"rgba",
+    //    "curve": "linear" (would segfault 4.2 readCurve), 4-float normalized Bezier on 2-channel
+    //    translate, scalar "curve" + c2/c3/c4 on rotate ("angle"->"value"), "ffd"->attachments.deform,
+    //    and "draworder"->"drawOrder".
+    const char* legacyJson = R"JSON({
+  "skeleton": { "spine": "3.8.99" },
+  "bones": [
+    { "name": "root" },
+    { "name": "orb", "parent": "root", "inheritRotation": false, "inheritScale": false, "flipX": true }
+  ],
+  "slots": [
+    { "name": "s1", "bone": "orb", "attachment": "m1" }
+  ],
+  "skins": {
+    "alt": { "s1": { "m1": { "type": "linkedmesh", "parent": "m1", "skin": "default", "deform": 1 } } },
+    "default": { "s1": { "m1": { "type": "skinnedmesh", "uvs": [0,0,1,0,1,1,0,1], "triangles": [0,1,2,0,2,3], "vertices": [0,0,10,0,10,10,0,10], "hull": 4 }, "orphan_slot": {} } }
+  },
+  "animations": {
+    "idle": {
+      "draworder": [ { "time": 0 } ],
+      "ffd": {
+        "default": {
+          "s1": {
+            "m1": [
+              { "time": 0, "curve": "linear" },
+              { "time": 1.0, "vertices": [1, 2] }
+            ]
+          }
+        }
+      },
+      "slots": {
+        "s1": {
+          "color": [
+            { "time": 0, "color": "ffffffff", "curve": [0.25, 0.0, 0.75, 1.0] },
+            { "time": 2.0, "color": "ff000000" }
+          ]
+        }
+      },
+      "bones": {
+        "orb": {
+          "rotate": [
+            { "time": 0, "angle": 10, "curve": 0.5, "c2": 0.25, "c3": 0.5, "c4": 0.75 },
+            { "time": 2.0, "angle": 110 }
+          ],
+          "translate": [
+            { "time": 0, "x": 10, "y": 20, "curve": [0.25, 0.5, 0.75, 0.5] },
+            { "time": 2.0, "x": 50, "y": -20 }
+          ]
+        }
+      }
+    }
+  }
+})JSON";
+
+    std::string normLegacy;
+    SpineJsonCompatReport repLeg;
+    REQUIRE_TRUE(NormalizeSpineJsonFor42(legacyJson, normLegacy, &repLeg));
+    REQUIRE_TRUE(repLeg.versionRewritten);
+    REQUIRE_EQ(repLeg.targetVersion, std::string("4.2.00"));
+    REQUIRE_TRUE(repLeg.bonesInheritFixed >= static_cast<size_t>(1));
+    REQUIRE_TRUE(repLeg.curvesNormalized >= static_cast<size_t>(4));
+
+    JsonValue parsedLeg;
+    REQUIRE_TRUE(gclient::json::parse(normLegacy, parsedLeg, nullptr));
+    const auto& orbBone = parsedLeg.find("bones")->arrVal[1];
+    REQUIRE_EQ(orbBone.find("inherit")->asString(), std::string("onlyTranslation"));
+    REQUIRE_NEAR(jnum(*orbBone.find("scaleX")), -1.0f, 1e-4f);
+
+    const auto& skinsArr = parsedLeg.find("skins")->arrVal;
+    REQUIRE_EQ(skinsArr.size(), static_cast<size_t>(2));
+    REQUIRE_EQ(skinsArr[0].find("name")->asString(), std::string("default"));
+    REQUIRE_EQ(skinsArr[0].find("attachments")->find("s1")->find("m1")->find("type")->asString(), std::string("mesh"));
+    REQUIRE_EQ(skinsArr[1].find("attachments")->find("s1")->find("m1")->find("timelines")->asInt64(), 1);
+
+    const JsonValue* idleAnim = parsedLeg.find("animations")->find("idle");
+    REQUIRE_TRUE(idleAnim->find("drawOrder") != nullptr);
+    REQUIRE_TRUE(idleAnim->find("draworder") == nullptr);
+    const auto& defFrames = idleAnim->find("attachments")->find("default")->find("s1")->find("m1")->find("deform")->arrVal;
+    REQUIRE_EQ(defFrames.size(), static_cast<size_t>(2));
+    REQUIRE_TRUE(defFrames[0].find("curve") == nullptr); // "linear" removed safely
+
+    const auto& rgbaCurve = idleAnim->find("slots")->find("s1")->find("rgba")->arrVal[0].find("curve")->arrVal;
+    REQUIRE_EQ(rgbaCurve.size(), static_cast<size_t>(16)); // 4 RGBA channels * 4 floats
+
+    const auto& rotKf0 = idleAnim->find("bones")->find("orb")->find("rotate")->arrVal[0];
+    REQUIRE_NEAR(static_cast<float>(rotKf0.find("value")->asInt64()), 10.0f, 1e-4f);
+    REQUIRE_EQ(rotKf0.find("curve")->arrVal.size(), static_cast<size_t>(4));
+    REQUIRE_NEAR(jnum(rotKf0.find("curve")->arrVal[0]), 1.0f, 1e-4f);  // t1 + 2.0 * 0.5
+    REQUIRE_NEAR(jnum(rotKf0.find("curve")->arrVal[1]), 35.0f, 1e-4f); // 10 + 100 * 0.25
+
+    const auto& trLegCurve = idleAnim->find("bones")->find("orb")->find("translate")->arrVal[0].find("curve")->arrVal;
+    REQUIRE_EQ(trLegCurve.size(), static_cast<size_t>(8));
+    REQUIRE_NEAR(jnum(trLegCurve[0]), 0.5f, 1e-4f);
+    REQUIRE_NEAR(jnum(trLegCurve[1]), 30.0f, 1e-4f);
+    REQUIRE_NEAR(jnum(trLegCurve[5]), 0.0f, 1e-4f);
+
+    // 3. Native 4.2 JSON fast-path leaves buffer unmodified.
+    const char* native42 = R"({"skeleton":{"spine":"4.2.35"},"bones":[{"name":"root","inherit":"normal"}]})";
+    std::string out42;
+    SpineJsonCompatReport rep42;
+    REQUIRE_TRUE(NormalizeSpineJsonFor42(native42, out42, &rep42));
+    REQUIRE_TRUE(!rep42.modified);
+    REQUIRE_TRUE(!rep42.versionRewritten);
+    REQUIRE_EQ(out42, std::string(native42));
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -3963,5 +4180,6 @@ int main() {
     suite.run("17_NetworkAndDataLoading_CrashResilience_And_BindableDataRecovery", testNetworkDataLoadingResilienceAndBindableDataRecovery);
     suite.run("18_InstantBuy_VngPlatformNormalization_And_BtPlatformPayShim", testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim);
     suite.run("19_Issue19_PlistbXmlFallback_NonDoubledArmaturePaths_And_SpineNullGuard", testIssue19PlistbXmlFallbackArmaturePathDedupAndSpineNullGuard);
+    suite.run("20_Issue20_Spine41To42JsonNormalization_BoneInherit_Curves_And_LegacyUpgrades", testIssue20Spine41To42JsonNormalizationAndRuntimeCompatibility);
     return suite.finishWithBanner();
 }

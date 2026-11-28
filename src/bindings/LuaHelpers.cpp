@@ -15,6 +15,7 @@
 #include "assets/BtDecryptHook.h"
 #include "assets/PbGuiLoader.h"
 #include "assets/PlistbLoader.h"
+#include "assets/SpineJsonCompat.h"
 #include "assets/XmlbArmatureLoader.h"
 #include "compat/Axmol226Compat.h"
 #include "diagnostics/CrashAndTelemetry.h"
@@ -1174,12 +1175,34 @@ bool ensureSpineAssetLoaded(CachedSpineAsset& entry) {
     spine::SkeletonData* parsedData = nullptr;
     std::string parseError;
     if (looksLikeJson) {
-        std::string jsonText(
+        const std::string_view rawJsonView(
             reinterpret_cast<const char*>(skelBuf.get() + bomOff),
             static_cast<size_t>(skelSize) - bomOff);
+        std::string normalizedJson;
+        std::string rawFallback;
+        gclient::assets::SpineJsonCompatReport compatReport;
+        const char* jsonPtr = nullptr;
+        if (gclient::assets::NormalizeSpineJsonFor42(rawJsonView, normalizedJson, &compatReport)) {
+            jsonPtr = normalizedJson.c_str();
+            if (compatReport.versionRewritten) {
+                gclient::diagnostics::CrashAndTelemetry::log(
+                    gclient::diagnostics::LogLevel::Info,
+                    "Spine",
+                    "Normalized Spine JSON '%s' from version '%s' to '%s' (bonesInherit=%zu, curves=%zu, legacy=%zu)",
+                    entry.jsonPath.c_str(),
+                    compatReport.sourceVersion.empty() ? "unspecified" : compatReport.sourceVersion.c_str(),
+                    compatReport.targetVersion.c_str(),
+                    compatReport.bonesInheritFixed,
+                    compatReport.curvesNormalized,
+                    compatReport.legacyUpgrades);
+            }
+        } else {
+            rawFallback.assign(rawJsonView.data(), rawJsonView.size());
+            jsonPtr = rawFallback.c_str();
+        }
         spine::SkeletonJson jsonReader(attachmentLoader.get());
         jsonReader.setScale(effScale);
-        parsedData = jsonReader.readSkeletonData(jsonText.c_str());
+        parsedData = jsonReader.readSkeletonData(jsonPtr);
         if (!parsedData && jsonReader.getError().buffer()) {
             parseError = jsonReader.getError().buffer();
         }
@@ -1585,6 +1608,14 @@ int lua_Spine_boundingBox(lua_State* L) {
     lua_pushnumber(L, box.origin.y);    lua_setfield(L, -2, "y");
     lua_pushnumber(L, box.size.width);  lua_setfield(L, -2, "width");
     lua_pushnumber(L, box.size.height); lua_setfield(L, -2, "height");
+    lua_newtable(L);
+    lua_pushnumber(L, box.origin.x);    lua_setfield(L, -2, "x");
+    lua_pushnumber(L, box.origin.y);    lua_setfield(L, -2, "y");
+    lua_setfield(L, -2, "origin");
+    lua_newtable(L);
+    lua_pushnumber(L, box.size.width);  lua_setfield(L, -2, "width");
+    lua_pushnumber(L, box.size.height); lua_setfield(L, -2, "height");
+    lua_setfield(L, -2, "size");
     return 1;
 }
 

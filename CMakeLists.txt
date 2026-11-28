@@ -485,6 +485,7 @@ if(GCLIENT_BUILD_TESTS)
         SOURCES
             src/assets/BtDecryptHook.cpp
             src/assets/PlistbLoader.cpp
+            src/assets/SpineJsonCompat.cpp
             src/assets/XmlbArmatureLoader.cpp
             src/net/Amf3Module.cpp
             src/net/LCPacket.cpp
