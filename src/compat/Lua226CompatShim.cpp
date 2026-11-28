@@ -500,6 +500,8 @@ do
     ax.Node.pauseSchedulerAndActions     = ax.Node.pauseSchedulerAndActions or ax.Node.pause
     ax.Node.resumeSchedulerAndActions    = ax.Node.resumeSchedulerAndActions or ax.Node.resume
     ax.Node.setShaderWithVertexShaderByteArray = ax.Node.setShaderWithVertexShaderByteArray or function(self) return self end
+    ax.Node.setSize = ax.Node.setSize or function(self, a, b) if b ~= nil then return self:setContentSize(a, b) end return self:setContentSize(a) end
+    ax.Node.getSize = ax.Node.getSize or function(self) return self:getContentSize() end
   end
 
   if ax.Layer then
@@ -558,18 +560,33 @@ do
       end
     end
 
+    kCCTouchesAllAtOnce = kCCTouchesAllAtOnce or 0
+    kCCTouchesOneByOne  = kCCTouchesOneByOne or 1
     ax.Layer.setTouchEnabled = ax.Layer.setTouchEnabled or function(self, en) _st(self).enabled = en and true or false; _rebuild(self) end
     ax.Layer.isTouchEnabled  = ax.Layer.isTouchEnabled or function(self) return _st(self).enabled end
+    ax.Layer.setTouchMode    = ax.Layer.setTouchMode or function(self, m)
+      local s = _st(self); s.mode = tonumber(m) or 1
+      local wantMulti = (s.mode == 0)
+      if s.isMulti ~= wantMulti then s.isMulti = wantMulti; _rebuild(self) end
+    end
+    ax.Layer.getTouchMode    = ax.Layer.getTouchMode or function(self) return _st(self).mode or 1 end
+    ax.Layer.setSwallowsTouches = ax.Layer.setSwallowsTouches or function(self, b) _st(self).swallows = b and true or false; _rebuild(self) end
+    ax.Layer.isSwallowsTouches  = ax.Layer.isSwallowsTouches or function(self) return _st(self).swallows end
     ax.Layer.setTouchPriority = ax.Layer.setTouchPriority or function(self, p) _st(self).priority = tonumber(p) or 0 end
     ax.Layer.getTouchPriority = ax.Layer.getTouchPriority or function(self) return _st(self).priority end
     ax.Layer.registerScriptTouchHandler = ax.Layer.registerScriptTouchHandler or function(self, fn, isMulti, prio, swallows)
       local s = _st(self)
       s.handler, s.isMulti, s.priority, s.swallows = fn, isMulti and true or false, tonumber(prio) or s.priority, swallows and true or false
+      s.mode = s.isMulti and 0 or 1
       _rebuild(self)
     end
     ax.Layer.unregisterScriptTouchHandler = ax.Layer.unregisterScriptTouchHandler or function(self)
       _st(self).handler = nil; _rebuild(self)
     end
+    ax.Layer.setKeypadEnabled = ax.Layer.setKeypadEnabled or function(self, en) _st(self).keypad = en and true or false end
+    ax.Layer.isKeypadEnabled  = ax.Layer.isKeypadEnabled or function(self) return _st(self).keypad or false end
+    ax.Layer.registerScriptKeypadHandler = ax.Layer.registerScriptKeypadHandler or function(self, fn) _st(self).keypadHandler = fn end
+    ax.Layer.unregisterScriptKeypadHandler = ax.Layer.unregisterScriptKeypadHandler or function(self) _st(self).keypadHandler = nil end
   end
 
   if ax.ScrollView then
@@ -606,8 +623,8 @@ do
   end
 
   if axui.Widget then
-    axui.Widget.setSize         = axui.Widget.setSize or axui.Widget.setContentSize
-    axui.Widget.getSize         = axui.Widget.getSize or axui.Widget.getContentSize
+    axui.Widget.setSize         = function(self, a, b) if b ~= nil then return self:setContentSize(a, b) end return self:setContentSize(a) end
+    axui.Widget.getSize         = function(self) return self:getContentSize() end
     axui.Widget.getWidgetByName = axui.Widget.getWidgetByName or function(self, n) return axui.Helper:seekWidgetByName(self, n) end
     axui.Widget.getWidgetByTag  = axui.Widget.getWidgetByTag or function(self, t) return axui.Helper:seekWidgetByTag(self, t) end
     if axui.Widget.addTouchEventListener then
@@ -652,11 +669,15 @@ do
           if okStr and type(src) == "string" and #src > 0 then
             local chunk = (loadstring or load)(src, "@" .. p)
             if chunk then
-              pcall(chunk)
-              if type(package) == "table" and type(package.loaded) == "table" then
-                package.loaded["compat_axmol_runtime"] = true
+              local okRun, runErr = pcall(chunk)
+              if okRun then
+                if type(package) == "table" and type(package.loaded) == "table" then
+                  package.loaded["compat_axmol_runtime"] = true
+                end
+                return true
+              elseif type(__GCLIENT_LOG_ERR__) == "function" then
+                __GCLIENT_LOG_ERR__("[Lua226CompatShim] " .. tostring(runErr))
               end
-              return true
             end
           end
         end

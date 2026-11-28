@@ -37,6 +37,7 @@ extern "C" {
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -978,13 +979,100 @@ void registerRichTextBindingsInternal(lua_State* L) {
 // SpineLuaAnimation (Powered by Axmol Spine 4.2 Runtime on Converted 4.1 Assets)
 // ============================================================================
 
-struct CachedSpineEntry {
-    std::string jsonPath;
-    std::string atlasPath;
-    float       scale = 1.0f;
+class GClientSpineTextureLoader final : public spine::TextureLoader {
+public:
+    explicit GClientSpineTextureLoader(std::string atlasFilePath)
+        : m_atlasFilePath(std::move(atlasFilePath)) {}
+
+    void load(spine::AtlasPage& page, const spine::String& path) override {
+        page.texture = nullptr;
+        auto* dir = ax::Director::getInstance();
+        auto* texCache = dir ? dir->getTextureCache() : nullptr;
+        if (!texCache) return;
+
+        const std::string rawTex = path.buffer() ? path.buffer() : "";
+        std::vector<std::string> baseList =
+            gclient::assets::PlistbLoader::ResolveSpriteSheetCandidates(rawTex, m_atlasFilePath);
+        std::vector<std::string> candidates;
+        for (const std::string& base : baseList) {
+            for (const std::string& cand :
+                 gclient::assets::PlistbLoader::BuildTextureCandidatePaths(base)) {
+                if (std::find(candidates.begin(), candidates.end(), cand) == candidates.end()) {
+                    candidates.push_back(cand);
+                }
+            }
+        }
+
+        ax::Texture2D* texture = nullptr;
+        if (auto* fu = ax::FileUtils::getInstance()) {
+            for (const std::string& cand : candidates) {
+                const std::string conv = gclient::compat::ResolveConvertedAssetPath(cand);
+                const std::string full = fu->fullPathForFilename(conv);
+                if (!full.empty() && fu->isFileExist(full)) {
+                    texture = texCache->addImage(full);
+                    if (texture) break;
+                }
+            }
+        }
+        if (!texture) return;
+
+        texture->retain();
+        auto mapFilter = [](spine::TextureFilter f) -> ax::backend::SamplerFilter {
+            switch (f) {
+                case spine::TextureFilter_Nearest:
+                case spine::TextureFilter_MipMapNearestNearest:
+                case spine::TextureFilter_MipMapLinearNearest:
+                    return ax::backend::SamplerFilter::NEAREST;
+                default:
+                    return ax::backend::SamplerFilter::LINEAR;
+            }
+        };
+        auto mapWrap = [](spine::TextureWrap w) -> ax::backend::SamplerAddressMode {
+            return w == spine::TextureWrap_ClampToEdge
+                       ? ax::backend::SamplerAddressMode::CLAMP_TO_EDGE
+                       : ax::backend::SamplerAddressMode::REPEAT;
+        };
+        ax::Texture2D::TexParams texParams(
+            mapFilter(page.minFilter),
+            mapFilter(page.magFilter),
+            mapWrap(page.uWrap),
+            mapWrap(page.vWrap));
+        texture->setTexParameters(texParams);
+
+        page.texture = texture;
+        if (texture->getPixelsWide() > 0) page.width = texture->getPixelsWide();
+        if (texture->getPixelsHigh() > 0) page.height = texture->getPixelsHigh();
+    }
+
+    void unload(void* texture) override {
+        if (texture) {
+            static_cast<ax::Texture2D*>(texture)->release();
+        }
+    }
+
+private:
+    std::string m_atlasFilePath;
 };
 
-std::unordered_map<std::string, CachedSpineEntry> g_spineCache;
+struct CachedSpineAsset {
+    std::string                                        jsonPath;
+    std::string                                        atlasPath;
+    float                                              scale         = 1.0f;
+    bool                                               loadAttempted = false;
+    std::unique_ptr<GClientSpineTextureLoader>         textureLoader;
+    std::unique_ptr<spine::Atlas>                      atlas;
+    std::unique_ptr<spine::AxmolAtlasAttachmentLoader> attachmentLoader;
+    std::unique_ptr<spine::SkeletonData>               skeletonData;
+
+    ~CachedSpineAsset() {
+        skeletonData.reset();
+        attachmentLoader.reset();
+        atlas.reset();
+        textureLoader.reset();
+    }
+};
+
+std::unordered_map<std::string, std::shared_ptr<CachedSpineAsset>> g_spineCache;
 
 std::string resolveSpinePath(const char* rawPath, const char* preferredExt) {
     if (!rawPath || !*rawPath) return {};
@@ -999,7 +1087,128 @@ std::string resolveSpinePath(const char* rawPath, const char* preferredExt) {
         const std::string alt = gclient::assets::ReplaceFileExtension(norm, preferredExt);
         if (fu && fu->isFileExist(alt)) return alt;
     }
+    if (std::string_view(preferredExt ? preferredExt : "") == ".json") {
+        const std::string skelAlt = gclient::assets::ReplaceFileExtension(norm, ".skel");
+        if (fu && fu->isFileExist(skelAlt)) return skelAlt;
+    }
     return conv;
+}
+
+bool ensureSpineAssetLoaded(CachedSpineAsset& entry) {
+    if (entry.skeletonData != nullptr) return true;
+    if (entry.loadAttempted) return false;
+    entry.loadAttempted = true;
+
+    if (entry.jsonPath.empty() || entry.atlasPath.empty()) return false;
+
+    unsigned long atlasSize = 0;
+    gclient::assets::DecryptResult atlasDiag;
+    std::unique_ptr<unsigned char[]> atlasBuf(
+        gclient::assets::LoadAndDecryptFileData(entry.atlasPath, &atlasSize, &atlasDiag));
+    if (!atlasBuf || atlasSize == 0) {
+        gclient::diagnostics::CrashAndTelemetry::log(
+            gclient::diagnostics::LogLevel::Warn,
+            "Spine",
+            "Spine atlas missing or unreadable: '%s' (for skeleton '%s')",
+            entry.atlasPath.c_str(),
+            entry.jsonPath.c_str());
+        return false;
+    }
+
+    auto texLoader = std::make_unique<GClientSpineTextureLoader>(entry.atlasPath);
+    auto atlas = std::make_unique<spine::Atlas>(
+        reinterpret_cast<const char*>(atlasBuf.get()),
+        static_cast<int>(atlasSize),
+        "",
+        texLoader.get(),
+        true);
+    atlasBuf.reset();
+
+    auto& pages = atlas->getPages();
+    if (pages.size() == 0) {
+        gclient::diagnostics::CrashAndTelemetry::log(
+            gclient::diagnostics::LogLevel::Warn,
+            "Spine",
+            "Spine atlas parsed 0 pages: '%s'",
+            entry.atlasPath.c_str());
+        return false;
+    }
+    for (size_t i = 0; i < pages.size(); ++i) {
+        if (!pages[i] || pages[i]->texture == nullptr) {
+            gclient::diagnostics::CrashAndTelemetry::log(
+                gclient::diagnostics::LogLevel::Warn,
+                "Spine",
+                "Spine atlas page texture missing in '%s' (page '%s')",
+                entry.atlasPath.c_str(),
+                (pages[i] && pages[i]->name.buffer()) ? pages[i]->name.buffer() : "");
+            return false;
+        }
+    }
+
+    unsigned long skelSize = 0;
+    gclient::assets::DecryptResult skelDiag;
+    std::unique_ptr<unsigned char[]> skelBuf(
+        gclient::assets::LoadAndDecryptFileData(entry.jsonPath, &skelSize, &skelDiag));
+    if (!skelBuf || skelSize == 0) {
+        gclient::diagnostics::CrashAndTelemetry::log(
+            gclient::diagnostics::LogLevel::Warn,
+            "Spine",
+            "Spine skeleton missing or unreadable: '%s'",
+            entry.jsonPath.c_str());
+        return false;
+    }
+
+    auto attachmentLoader = std::make_unique<spine::AxmolAtlasAttachmentLoader>(atlas.get());
+    const float effScale = entry.scale > 0.0f ? entry.scale : 1.0f;
+
+    size_t bomOff = (skelSize >= 3 && skelBuf[0] == 0xEFu && skelBuf[1] == 0xBBu && skelBuf[2] == 0xBFu)
+                        ? 3u
+                        : 0u;
+    const std::string_view trimmed = gclient::common::trimAscii(std::string_view(
+        reinterpret_cast<const char*>(skelBuf.get() + bomOff),
+        static_cast<size_t>(skelSize) - bomOff));
+    const bool looksLikeJson =
+        !gclient::common::endsWithAsciiCI(entry.jsonPath, ".skel") &&
+        !trimmed.empty() && trimmed.front() == '{';
+
+    spine::SkeletonData* parsedData = nullptr;
+    std::string parseError;
+    if (looksLikeJson) {
+        std::string jsonText(
+            reinterpret_cast<const char*>(skelBuf.get() + bomOff),
+            static_cast<size_t>(skelSize) - bomOff);
+        spine::SkeletonJson jsonReader(attachmentLoader.get());
+        jsonReader.setScale(effScale);
+        parsedData = jsonReader.readSkeletonData(jsonText.c_str());
+        if (!parsedData && jsonReader.getError().buffer()) {
+            parseError = jsonReader.getError().buffer();
+        }
+    } else {
+        spine::SkeletonBinary binReader(attachmentLoader.get());
+        binReader.setScale(effScale);
+        parsedData = binReader.readSkeletonData(skelBuf.get(), static_cast<int>(skelSize));
+        if (!parsedData && binReader.getError().buffer()) {
+            parseError = binReader.getError().buffer();
+        }
+    }
+    skelBuf.reset();
+
+    if (!parsedData) {
+        gclient::diagnostics::CrashAndTelemetry::log(
+            gclient::diagnostics::LogLevel::Warn,
+            "Spine",
+            "Failed to parse Spine skeleton '%s' (atlas '%s'): %s — using safe placeholder node",
+            entry.jsonPath.c_str(),
+            entry.atlasPath.c_str(),
+            parseError.empty() ? "incompatible or malformed skeleton data" : parseError.c_str());
+        return false;
+    }
+
+    entry.textureLoader    = std::move(texLoader);
+    entry.atlas            = std::move(atlas);
+    entry.attachmentLoader = std::move(attachmentLoader);
+    entry.skeletonData.reset(parsedData);
+    return true;
 }
 
 void invokeSpineTrackHandler(int handler, int trackIndex, int loopCount, bool passLoopCount) {
@@ -1040,31 +1249,71 @@ void invokeSpineEventLuaHandler(
 
 class GClientSpineAnimation final : public spine::SkeletonAnimation {
 public:
-    static GClientSpineAnimation* createSafe(
-        const std::string& jsonPath,
-        const std::string& atlasPath,
-        float scale)
-    {
-        auto* fu = ax::FileUtils::getInstance();
-        const std::string rJson  = resolveSpinePath(jsonPath.c_str(), ".json");
-        const std::string rAtlas = resolveSpinePath(atlasPath.c_str(), ".atlas");
+    explicit GClientSpineAnimation(std::shared_ptr<CachedSpineAsset> asset = nullptr)
+        : spine::SkeletonAnimation(), m_cachedAsset(std::move(asset)) {
+        // Explicitly zero-initialize all protected SkeletonRenderer & SkeletonAnimation
+        // fields left uninitialized by Axmol's default Spine constructors so placeholder
+        // instances are completely deterministic across update/draw/destruction.
+        _ownsSkeletonData       = false;
+        _ownsSkeleton           = false;
+        _ownsAtlas              = false;
+        _atlas                  = nullptr;
+        _attachmentLoader       = nullptr;
+        _premultipliedAlpha     = true;
+        _skeleton               = nullptr;
+        _clipper                = nullptr;
+        _twoColorTint           = false;
+        _state                  = nullptr;
+        _ownsAnimationStateData = false;
+        _updateOnlyIfVisible    = false;
+        _firstDraw              = false;
+    }
 
-        if (fu && !rJson.empty() && !rAtlas.empty() &&
-            fu->isFileExist(rJson) && fu->isFileExist(rAtlas)) {
-            auto* ret = new GClientSpineAnimation();
-            ret->initWithJsonFile(rJson, rAtlas, scale > 0.0f ? scale : 1.0f);
-            if (ret->getSkeleton() != nullptr) {
+    static GClientSpineAnimation* createPlaceholder() {
+        auto* dummy = new GClientSpineAnimation();
+        dummy->ax::Node::init();
+        dummy->autorelease();
+        return dummy;
+    }
+
+    static GClientSpineAnimation* createFromCachedAsset(
+        const std::shared_ptr<CachedSpineAsset>& asset)
+    {
+        if (asset && ensureSpineAssetLoaded(*asset) && asset->skeletonData != nullptr) {
+            auto* ret = new GClientSpineAnimation(asset);
+            ret->ax::Node::init();
+            ret->initWithData(asset->skeletonData.get(), /*ownsSkeletonData=*/false);
+            if (ret->getSkeleton() != nullptr && ret->getState() != nullptr) {
                 ret->bindInternalListeners();
                 ret->autorelease();
                 return ret;
             }
             delete ret;
         }
+        return createPlaceholder();
+    }
 
-        auto* dummy = new GClientSpineAnimation();
-        dummy->ax::Node::init();
-        dummy->autorelease();
-        return dummy;
+    static GClientSpineAnimation* createSafe(
+        const std::string& jsonPath,
+        const std::string& atlasPath,
+        float scale)
+    {
+        const std::string rJson  = resolveSpinePath(jsonPath.c_str(), ".json");
+        const std::string rAtlas = resolveSpinePath(atlasPath.c_str(), ".atlas");
+        if (rJson.empty() || rAtlas.empty()) {
+            return createPlaceholder();
+        }
+        const float effScale = scale > 0.0f ? scale : 1.0f;
+        const std::string cacheKey =
+            "__file__:" + rJson + "|" + rAtlas + "|" + std::to_string(effScale);
+        auto& slot = g_spineCache[cacheKey];
+        if (!slot) {
+            slot = std::make_shared<CachedSpineAsset>();
+            slot->jsonPath  = rJson;
+            slot->atlasPath = rAtlas;
+            slot->scale     = effScale;
+        }
+        return createFromCachedAsset(slot);
     }
 
     ~GClientSpineAnimation() override {
@@ -1072,6 +1321,21 @@ public:
         releaseEngineScriptHandler(m_endHandler);
         releaseEngineScriptHandler(m_completeHandler);
         releaseEngineScriptHandler(m_eventHandler);
+    }
+
+    void update(float deltaTime) override {
+        if (!_skeleton || !_state) return;
+        spine::SkeletonAnimation::update(deltaTime);
+    }
+
+    void draw(ax::Renderer* renderer, const ax::Mat4& transform, uint32_t transformFlags) override {
+        if (!_skeleton || !_state) return;
+        spine::SkeletonAnimation::draw(renderer, transform, transformFlags);
+    }
+
+    ax::Rect getBoundingBox() const override {
+        if (!_skeleton) return ax::Rect::ZERO;
+        return spine::SkeletonAnimation::getBoundingBox();
     }
 
     void setStartLuaHandler(int h) { releaseEngineScriptHandler(m_startHandler); m_startHandler = h; }
@@ -1114,6 +1378,7 @@ private:
         });
     }
 
+    std::shared_ptr<CachedSpineAsset> m_cachedAsset;
     int m_startHandler    = 0;
     int m_endHandler      = 0;
     int m_completeHandler = 0;
@@ -1142,19 +1407,23 @@ int lua_Spine_setSkeletonDataToCache(lua_State* L) {
     const char* jsonPath  = lua_tostring(L, 3);
     const char* atlasPath = lua_tostring(L, 4);
     const float scale     = lua_isnumber(L, 5) ? static_cast<float>(lua_tonumber(L, 5)) : 1.0f;
-    if (modelId && jsonPath && atlasPath) {
-        g_spineCache[modelId] = CachedSpineEntry{
-            resolveSpinePath(jsonPath, ".json"), resolveSpinePath(atlasPath, ".atlas"), scale};
+    if (modelId && *modelId && jsonPath && atlasPath) {
+        auto asset       = std::make_shared<CachedSpineAsset>();
+        asset->jsonPath  = resolveSpinePath(jsonPath, ".json");
+        asset->atlasPath = resolveSpinePath(atlasPath, ".atlas");
+        asset->scale     = scale > 0.0f ? scale : 1.0f;
+        (void)ensureSpineAssetLoaded(*asset);
+        g_spineCache[modelId] = std::move(asset);
     }
     return 0;
 }
 
 int lua_Spine_createFromCache(lua_State* L) {
     const char* modelId = lua_tostring(L, 2);
-    auto it = modelId ? g_spineCache.find(modelId) : g_spineCache.end();
+    auto it = (modelId && *modelId) ? g_spineCache.find(modelId) : g_spineCache.end();
     auto* anim = (it != g_spineCache.end())
-        ? GClientSpineAnimation::createSafe(it->second.jsonPath, it->second.atlasPath, it->second.scale)
-        : GClientSpineAnimation::createSafe("", "", 1.0f);
+        ? GClientSpineAnimation::createFromCachedAsset(it->second)
+        : GClientSpineAnimation::createPlaceholder();
     pushAxObj(L, anim, "SpineLuaAnimation");
     return 1;
 }
@@ -1226,7 +1495,7 @@ int lua_Spine_setMix(lua_State* L) {
     auto* self = lb::getAxObject<spine::SkeletonAnimation>(L, 1);
     const char* from = lua_tostring(L, 2);
     const char* to   = lua_tostring(L, 3);
-    if (self && self->getSkeleton() && from && to) {
+    if (self && self->getSkeleton() && self->getState() && from && to) {
         self->setMix(from, to, static_cast<float>(lua_tonumber(L, 4)));
     }
     return 0;
@@ -1235,14 +1504,14 @@ int lua_Spine_setMix(lua_State* L) {
 int lua_Spine_clearTrack(lua_State* L) {
     auto* self = lb::getAxObject<spine::SkeletonAnimation>(L, 1);
     const int track = lua_isnumber(L, 2) ? (std::max)(0, static_cast<int>(lua_tointeger(L, 2))) : 0;
-    if (self && self->getSkeleton()) self->clearTrack(track);
+    if (self && self->getSkeleton() && self->getState()) self->clearTrack(track);
     return 0;
 }
 
 template <auto Fn>
 int luaSpineSkelVoid(lua_State* L) {
     auto* self = lb::getAxObject<spine::SkeletonAnimation>(L, 1);
-    if (self && self->getSkeleton()) (self->*Fn)();
+    if (self && self->getSkeleton() && self->getState()) (self->*Fn)();
     return 0;
 }
 
@@ -1321,7 +1590,9 @@ int lua_Spine_boundingBox(lua_State* L) {
 
 int lua_Spine_update(lua_State* L) {
     auto* self = lb::getAxObject<spine::SkeletonAnimation>(L, 1);
-    if (self && self->getSkeleton()) self->update(static_cast<float>(lua_tonumber(L, 2)));
+    if (self && self->getSkeleton() && self->getState()) {
+        self->update(static_cast<float>(lua_tonumber(L, 2)));
+    }
     return 0;
 }
 

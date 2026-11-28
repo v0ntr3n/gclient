@@ -426,12 +426,23 @@ cocos2d::CCTexture2D* LoadExplicitTextureWithFallback(const std::string& imagePa
     return nullptr;
 }
 
+bool DoesSpriteSheetFileExist(const std::string& normSheet) {
+    if (normSheet.empty()) return false;
+    if (!ax::FileUtils::getInstance()) return true;
+    if (DoesAnyFileExist(normSheet)) return true;
+    const std::string plistbCand = ReplaceFileExtension(normSheet, ".plistb");
+    if (plistbCand != normSheet && DoesAnyFileExist(plistbCand)) return true;
+    const std::string plistCand = ReplaceFileExtension(normSheet, ".plist");
+    return plistCand != normSheet && DoesAnyFileExist(plistCand);
+}
+
 bool TryLoadSpriteSheetCandidate(const std::string& sheetPath,
                                  cocos2d::CCTexture2D* explicitTex,
                                  std::unordered_set<std::string>& loadedSet) {
     const std::string normSheet = NormalizeAssetPath(sheetPath);
     if (normSheet.empty()) return false;
     if (loadedSet.contains(normSheet)) return true;
+    if (!DoesSpriteSheetFileExist(normSheet)) return false;
 
     if (PlistbLoader::AddSpriteFramesWithBinary(normSheet, explicitTex)) {
         loadedSet.insert(normSheet);
@@ -462,16 +473,13 @@ bool LoadResolvedSpriteSheet(const std::string& rawSheetPath,
                              const std::string& effectiveBase,
                              cocos2d::CCTexture2D* explicitTex,
                              std::unordered_set<std::string>& loadedSet) {
-    const std::string normSheet = NormalizeAssetPath(rawSheetPath);
-    if (normSheet.empty()) return false;
-    if (!effectiveBase.empty()) {
-        const std::string relResolved = ResolveRelativeAssetPath(normSheet, effectiveBase);
-        if (!relResolved.empty() &&
-            TryLoadSpriteSheetCandidate(relResolved, explicitTex, loadedSet)) {
+    for (const std::string& cand :
+         PlistbLoader::ResolveSpriteSheetCandidates(rawSheetPath, effectiveBase)) {
+        if (TryLoadSpriteSheetCandidate(cand, explicitTex, loadedSet)) {
             return true;
         }
     }
-    return TryLoadSpriteSheetCandidate(normSheet, explicitTex, loadedSet);
+    return false;
 }
 
 void PreloadArmatureSpriteSheets(const std::string& normConfigPath,

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <span>
@@ -91,28 +92,11 @@ std::string BuildPlistbPath(const std::string& plistPath) {
     return ReplaceFileExtension(norm, ".plistb");
 }
 
-#if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
-
-std::string BuildXmlPlistPath(const std::string& plistPath) {
+[[maybe_unused]] std::string BuildXmlPlistPath(const std::string& plistPath) {
     const std::string norm = NormalizeAssetPath(plistPath);
     if (norm.empty() || endsWithAsciiCI(norm, ".plist")) return norm;
     if (endsWithAsciiCI(norm, ".plistb")) return norm.substr(0, norm.size() - 1);
     return ReplaceFileExtension(norm, ".plist");
-}
-
-void SetDictString(cocos2d::CCDictionary* dict, const std::string& key, const std::string& val) {
-    auto* strObj = new cocos2d::CCString(val);
-    dict->setObject(strObj, key);
-    strObj->release();
-}
-
-void SetDictFmt(cocos2d::CCDictionary* dict, const std::string& key, const char* fmt, ...) {
-    char    buf[128];
-    va_list args;
-    va_start(args, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    SetDictString(dict, key, buf);
 }
 
 std::string UnescapeXmlText(const char* s, size_t len) {
@@ -211,6 +195,118 @@ struct XmlCursor {
         return false;
     }
 };
+
+bool SkipXmlPlistValue(XmlCursor& cur, const std::string& openTag, bool selfClosing, int depth) {
+    if (depth > 32) return false;
+    if (selfClosing) return true;
+    if (openTag == "dict") {
+        while (true) {
+            std::string tag;
+            bool        isClosing = false, sc = false;
+            if (!cur.readNextTag(&tag, &isClosing, &sc)) return false;
+            if (isClosing) return tag == "dict";
+            if (tag != "key") return false;
+            if (!sc && !cur.readElementTextUntilClose("key", nullptr)) return false;
+            std::string valTag;
+            bool        valClosing = false, valSc = false;
+            if (!cur.readNextTag(&valTag, &valClosing, &valSc) || valClosing) return false;
+            if (!SkipXmlPlistValue(cur, valTag, valSc, depth + 1)) return false;
+        }
+    }
+    if (openTag == "array") {
+        while (true) {
+            std::string tag;
+            bool        isClosing = false, sc = false;
+            if (!cur.readNextTag(&tag, &isClosing, &sc)) return false;
+            if (isClosing) return tag == "array";
+            if (!SkipXmlPlistValue(cur, tag, sc, depth + 1)) return false;
+        }
+    }
+    return cur.readElementTextUntilClose(openTag, nullptr);
+}
+
+bool ReadXmlPlistScalarMap(XmlCursor& cur,
+                           std::unordered_map<std::string, std::string>* outStrings,
+                           std::unordered_map<std::string, bool>* outBools,
+                           int depth = 1) {
+    if (depth > 32) return false;
+    while (true) {
+        std::string tag;
+        bool        isClosing = false, selfClosing = false;
+        if (!cur.readNextTag(&tag, &isClosing, &selfClosing)) return false;
+        if (isClosing) return tag == "dict";
+        if (tag != "key") return false;
+
+        std::string keyName;
+        if (!selfClosing && !cur.readElementTextUntilClose("key", &keyName)) return false;
+
+        std::string valTag;
+        bool        valClosing = false, valSelfClosing = false;
+        if (!cur.readNextTag(&valTag, &valClosing, &valSelfClosing) || valClosing) return false;
+
+        if (valTag == "true" || valTag == "false") {
+            if (!valSelfClosing && !cur.readElementTextUntilClose(valTag, nullptr)) return false;
+            const bool b = (valTag == "true");
+            if (outBools) (*outBools)[keyName] = b;
+            if (outStrings) (*outStrings)[keyName] = b ? "true" : "false";
+        } else if (valTag == "string" || valTag == "integer" || valTag == "real") {
+            std::string text;
+            if (!valSelfClosing && !cur.readElementTextUntilClose(valTag, &text)) return false;
+            if (outStrings) (*outStrings)[keyName] = std::move(text);
+        } else {
+            if (!SkipXmlPlistValue(cur, valTag, valSelfClosing, depth + 1)) return false;
+        }
+    }
+}
+
+size_t ExtractBraceFloats(std::string_view sv, float* outVals, size_t maxCount) {
+    size_t      count = 0;
+    const char* p     = sv.data();
+    const char* end   = p + sv.size();
+    while (p < end && count < maxCount) {
+        while (p < end && !((*p >= '0' && *p <= '9') || *p == '-' || *p == '+' || *p == '.')) {
+            ++p;
+        }
+        if (p >= end) break;
+        std::string tmp(p, static_cast<size_t>(end - p));
+        char*       parseEnd = nullptr;
+        const float v        = std::strtof(tmp.c_str(), &parseEnd);
+        if (parseEnd == tmp.c_str()) {
+            ++p;
+            continue;
+        }
+        outVals[count++] = v;
+        p += static_cast<size_t>(parseEnd - tmp.c_str());
+    }
+    return count;
+}
+
+float ParseScalarFloat(const std::unordered_map<std::string, std::string>& m,
+                       const char* key,
+                       float fallback = 0.0f) {
+    auto it = m.find(key);
+    if (it == m.end() || it->second.empty()) return fallback;
+    char* endPtr = nullptr;
+    const float v = std::strtof(it->second.c_str(), &endPtr);
+    return (endPtr == it->second.c_str()) ? fallback : v;
+}
+
+#if defined(GCLIENT_ENABLE_COCOS2DX) || !defined(GCLIENT_STANDALONE_BUILD)
+
+void SetDictString(cocos2d::CCDictionary* dict, const std::string& key, const std::string& val) {
+    auto* strObj = new cocos2d::CCString(val);
+    dict->setObject(strObj, key);
+    strObj->release();
+}
+
+void SetDictFmt(cocos2d::CCDictionary* dict, const std::string& key, const char* fmt, ...) {
+    char    buf[128];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    SetDictString(dict, key, buf);
+}
 
 cocos2d::CCObject* ParseXmlPlistValue(XmlCursor& cur,
                                       const std::string& openTag,
@@ -445,6 +541,251 @@ bool PlistbLoader::ParseBuffer(const uint8_t* data,
     return true;
 }
 
+bool PlistbLoader::ParseXmlSpriteSheetBuffer(const uint8_t* data,
+                                             size_t size,
+                                             PlistbFileData* outData,
+                                             std::string* outError) {
+    auto fail = [&](std::string msg) -> bool {
+        if (outError) *outError = std::move(msg);
+        return false;
+    };
+
+    if (data == nullptr || size == 0 || outData == nullptr) {
+        return fail("Null or empty XML plist buffer");
+    }
+    if (size >= 4 && readLE<uint32_t>(data) == kBtDecryptMagic) {
+        return fail("Undecrypted 0xFEFEFEFE buffer passed to PlistbLoader::ParseXmlSpriteSheetBuffer");
+    }
+    if (!LooksLikePlaintextXmlPlist(data, size)) {
+        return fail("Non-XML buffer passed to PlistbLoader::ParseXmlSpriteSheetBuffer");
+    }
+
+    const size_t off =
+        (size >= 3 && data[0] == 0xEFu && data[1] == 0xBBu && data[2] == 0xBFu) ? 3u : 0u;
+    XmlCursor cur{reinterpret_cast<const char*>(data + off),
+                  reinterpret_cast<const char*>(data + size)};
+
+    std::string tag;
+    bool        isClosing = false, selfClosing = false;
+    if (!cur.readNextTag(&tag, &isClosing, &selfClosing) || isClosing) {
+        return fail("Malformed XML plist header");
+    }
+    if (tag == "plist") {
+        if (selfClosing || !cur.readNextTag(&tag, &isClosing, &selfClosing) || isClosing) {
+            return fail("Empty or malformed <plist> root element");
+        }
+    }
+    if (tag != "dict") {
+        return fail("Expected root <dict> in XML sprite-sheet plist");
+    }
+    if (selfClosing) {
+        return fail("Empty root <dict/> in XML sprite-sheet plist");
+    }
+
+    bool                           hasFramesDict = false;
+    bool                           rootClosed    = false;
+    std::string                    realTexName;
+    std::string                    texName;
+    std::string                    fmt0TexName;
+    std::vector<PlistbFrameRecord> parsedFrames;
+
+    while (true) {
+        std::string keyTag;
+        bool        kClose = false, kSelf = false;
+        if (!cur.readNextTag(&keyTag, &kClose, &kSelf)) break;
+        if (kClose) {
+            rootClosed = (keyTag == "dict");
+            break;
+        }
+        if (keyTag != "key") break;
+
+        std::string topKey;
+        if (!kSelf && !cur.readElementTextUntilClose("key", &topKey)) break;
+
+        std::string valTag;
+        bool        vClose = false, vSelf = false;
+        if (!cur.readNextTag(&valTag, &vClose, &vSelf) || vClose) break;
+
+        if (topKey == "metadata" && valTag == "dict") {
+            if (!vSelf) {
+                std::unordered_map<std::string, std::string> metaStrs;
+                if (!ReadXmlPlistScalarMap(cur, &metaStrs, nullptr, 1)) break;
+                if (auto it = metaStrs.find("realTextureFileName");
+                    it != metaStrs.end() && !it->second.empty()) {
+                    realTexName = it->second;
+                }
+                if (auto it = metaStrs.find("textureFileName");
+                    it != metaStrs.end() && !it->second.empty()) {
+                    texName = it->second;
+                }
+            }
+        } else if (topKey == "texture" && valTag == "dict") {
+            if (!vSelf) {
+                std::unordered_map<std::string, std::string> texStrs;
+                if (!ReadXmlPlistScalarMap(cur, &texStrs, nullptr, 1)) break;
+                if (auto it = texStrs.find("filename");
+                    it != texStrs.end() && !it->second.empty()) {
+                    fmt0TexName = it->second;
+                }
+            }
+        } else if (topKey == "frames" && valTag == "dict") {
+            hasFramesDict = true;
+            if (!vSelf) {
+                bool framesClosed = false;
+                while (true) {
+                    std::string fTag;
+                    bool        fClose = false, fSelf = false;
+                    if (!cur.readNextTag(&fTag, &fClose, &fSelf)) break;
+                    if (fClose) {
+                        framesClosed = (fTag == "dict");
+                        break;
+                    }
+                    if (fTag != "key") break;
+
+                    std::string frameName;
+                    if (!fSelf && !cur.readElementTextUntilClose("key", &frameName)) break;
+
+                    std::string entryTag;
+                    bool        eClose = false, eSelf = false;
+                    if (!cur.readNextTag(&entryTag, &eClose, &eSelf) || eClose) break;
+                    if (entryTag != "dict") {
+                        if (!SkipXmlPlistValue(cur, entryTag, eSelf, 2)) break;
+                        continue;
+                    }
+
+                    std::unordered_map<std::string, std::string> fStrs;
+                    std::unordered_map<std::string, bool>        fBools;
+                    if (!eSelf && !ReadXmlPlistScalarMap(cur, &fStrs, &fBools, 2)) break;
+                    if (frameName.empty()) continue;
+
+                    PlistbFrameRecord rec;
+                    rec.frameName = std::move(frameName);
+
+                    if (auto itFrame = fStrs.find("frame");
+                        itFrame != fStrs.end() && !itFrame->second.empty()) {
+                        float r[4]{};
+                        ExtractBraceFloats(itFrame->second, r, 4);
+                        rec.rectX      = r[0];
+                        rec.rectY      = r[1];
+                        rec.rectWidth  = r[2];
+                        rec.rectHeight = r[3];
+
+                        if (auto itOff = fStrs.find("offset"); itOff != fStrs.end()) {
+                            float o[2]{};
+                            if (ExtractBraceFloats(itOff->second, o, 2) >= 2) {
+                                rec.offsetX = o[0];
+                                rec.offsetY = o[1];
+                            }
+                        }
+                        float s[2]{rec.rectWidth, rec.rectHeight};
+                        if (auto itSrc = fStrs.find("sourceSize"); itSrc != fStrs.end()) {
+                            ExtractBraceFloats(itSrc->second, s, 2);
+                        }
+                        rec.originalWidth  = s[0];
+                        rec.originalHeight = s[1];
+                        if (auto itRot = fBools.find("rotated"); itRot != fBools.end()) {
+                            rec.rotated = itRot->second;
+                        }
+                    } else if (auto itTexRect = fStrs.find("textureRect");
+                               itTexRect != fStrs.end() && !itTexRect->second.empty()) {
+                        float tr[4]{};
+                        ExtractBraceFloats(itTexRect->second, tr, 4);
+                        rec.rectX      = tr[0];
+                        rec.rectY      = tr[1];
+                        rec.rectWidth  = tr[2];
+                        rec.rectHeight = tr[3];
+
+                        if (auto itSprSz = fStrs.find("spriteSize");
+                            itSprSz != fStrs.end() && !itSprSz->second.empty()) {
+                            float ss[2]{};
+                            if (ExtractBraceFloats(itSprSz->second, ss, 2) >= 2) {
+                                rec.rectWidth  = ss[0];
+                                rec.rectHeight = ss[1];
+                            }
+                        }
+                        if (auto itOff = fStrs.find("spriteOffset"); itOff != fStrs.end()) {
+                            float so[2]{};
+                            if (ExtractBraceFloats(itOff->second, so, 2) >= 2) {
+                                rec.offsetX = so[0];
+                                rec.offsetY = so[1];
+                            }
+                        }
+                        float sss[2]{rec.rectWidth, rec.rectHeight};
+                        if (auto itSrc = fStrs.find("spriteSourceSize"); itSrc != fStrs.end()) {
+                            ExtractBraceFloats(itSrc->second, sss, 2);
+                        }
+                        rec.originalWidth  = sss[0];
+                        rec.originalHeight = sss[1];
+                        if (auto itRot = fBools.find("textureRotated"); itRot != fBools.end()) {
+                            rec.rotated = itRot->second;
+                        } else if (auto itRot2 = fBools.find("rotated"); itRot2 != fBools.end()) {
+                            rec.rotated = itRot2->second;
+                        }
+                    } else {
+                        rec.rectX          = ParseScalarFloat(fStrs, "x");
+                        rec.rectY          = ParseScalarFloat(fStrs, "y");
+                        rec.rectWidth      = ParseScalarFloat(fStrs, "width");
+                        rec.rectHeight     = ParseScalarFloat(fStrs, "height");
+                        rec.offsetX        = ParseScalarFloat(fStrs, "offsetX");
+                        rec.offsetY        = ParseScalarFloat(fStrs, "offsetY");
+                        rec.originalWidth  = ParseScalarFloat(fStrs, "originalWidth", rec.rectWidth);
+                        rec.originalHeight = ParseScalarFloat(fStrs, "originalHeight", rec.rectHeight);
+                        rec.rotated        = false;
+                    }
+
+                    parsedFrames.push_back(std::move(rec));
+                }
+                if (!framesClosed) break;
+            }
+        } else {
+            if (!SkipXmlPlistValue(cur, valTag, vSelf, 1)) break;
+        }
+    }
+
+    if (!rootClosed || !hasFramesDict) {
+        return fail("Invalid or truncated XML sprite-sheet plist (missing <frames> dictionary)");
+    }
+
+    outData->textureFileName = !realTexName.empty()
+                                   ? std::move(realTexName)
+                                   : (!texName.empty() ? std::move(texName) : std::move(fmt0TexName));
+    outData->frames          = std::move(parsedFrames);
+    return true;
+}
+
+std::vector<std::string> PlistbLoader::ResolveSpriteSheetCandidates(
+    const std::string& rawSheetPath,
+    const std::string& baseFilePath) {
+    std::vector<std::string> candidates;
+    const std::string        normSheet = NormalizeAssetPath(rawSheetPath);
+    if (normSheet.empty()) return candidates;
+
+    const std::string normBase = NormalizeAssetPath(baseFilePath);
+    if (normBase.empty()) {
+        candidates.push_back(normSheet);
+        return candidates;
+    }
+
+    const size_t      slashPos = normBase.find_last_of('/');
+    const std::string baseDir =
+        (slashPos != std::string::npos) ? normBase.substr(0, slashPos + 1) : std::string{};
+
+    if (baseDir.empty() || startsWithAsciiCI(normSheet, baseDir)) {
+        candidates.push_back(normSheet);
+        return candidates;
+    }
+
+    const std::string relCand = ResolveRelativeAssetPath(normSheet, normBase);
+    if (normSheet.find('/') == std::string::npos) {
+        AppendUniqueCandidate(candidates, relCand);
+        AppendUniqueCandidate(candidates, normSheet);
+    } else {
+        AppendUniqueCandidate(candidates, normSheet);
+        AppendUniqueCandidate(candidates, relCand);
+    }
+    return candidates;
+}
+
 std::vector<std::string> PlistbLoader::BuildTextureCandidatePaths(const std::string& texturePath) {
     std::vector<std::string> candidates;
     const std::string        norm = NormalizeAssetPath(texturePath);
@@ -477,9 +818,15 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
     const std::string xmlPlistPath = BuildXmlPlistPath(normBasePath);
     if (plistbPath.empty()) return false;
 
-    unsigned long  fileSize = 0;
+    std::string    loadedPath = plistbPath;
+    unsigned long  fileSize   = 0;
     DecryptResult  diag;
     unsigned char* rawData = LoadAndDecryptFileData(plistbPath, &fileSize, &diag);
+    if ((!rawData || fileSize == 0) && !xmlPlistPath.empty() && xmlPlistPath != plistbPath) {
+        delete[] rawData;
+        rawData    = LoadAndDecryptFileData(xmlPlistPath, &fileSize, &diag);
+        loadedPath = xmlPlistPath;
+    }
     if (!rawData || fileSize == 0) {
         cocos2d::CCLog("[PlistbLoader] Failed to load binary plist: %s", plistbPath.c_str());
         delete[] rawData;
@@ -488,23 +835,35 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
 
     PlistbFileData parsed;
     std::string    parseErr;
-    const bool     ok = ParseBuffer(rawData, static_cast<size_t>(fileSize), &parsed, &parseErr);
+    const size_t   byteLen = static_cast<size_t>(fileSize);
+    const bool     ok      = LooksLikePlaintextXmlPlist(rawData, byteLen)
+                                 ? ParseXmlSpriteSheetBuffer(rawData, byteLen, &parsed, &parseErr)
+                                 : ParseBuffer(rawData, byteLen, &parsed, &parseErr);
     delete[] rawData;
     if (!ok) {
         cocos2d::CCLog("[PlistbLoader] Parse failed for %s: %s",
-                       plistbPath.c_str(),
+                       loadedPath.c_str(),
                        parseErr.c_str());
         return false;
+    }
+
+    if (parsed.textureFileName.empty()) {
+        parsed.textureFileName = StripTextureExtension(loadedPath) + ".png";
     }
 
     cocos2d::CCTexture2D* targetTexture = texture;
     if (!targetTexture) {
         const std::string        texRelPath    = NormalizeAssetPath(parsed.textureFileName);
-        const std::string        relBaseTex    = ResolveRelativeAssetPath(texRelPath, plistbPath);
+        const std::string        relBaseTex    = startsWithAsciiCI(texRelPath, loadedPath.substr(0, loadedPath.find_last_of('/') + 1))
+                                                     ? texRelPath
+                                                     : ResolveRelativeAssetPath(texRelPath, loadedPath);
         std::vector<std::string> candidateList = BuildTextureCandidatePaths(relBaseTex);
+        for (const std::string& c : BuildTextureCandidatePaths(texRelPath)) {
+            AppendUniqueCandidate(candidateList, c);
+        }
         if (auto* fu = ax::FileUtils::getInstance()) {
             const std::string fromFu = NormalizeAssetPath(
-                fu->fullPathFromRelativeFile(texRelPath.c_str(), plistbPath.c_str()));
+                fu->fullPathFromRelativeFile(texRelPath.c_str(), loadedPath.c_str()));
             if (!fromFu.empty() && fromFu != relBaseTex) {
                 for (const std::string& c : BuildTextureCandidatePaths(fromFu)) {
                     AppendUniqueCandidate(candidateList, c);
@@ -515,7 +874,7 @@ bool PlistbLoader::AddSpriteFramesWithBinary(const std::string& plistPath,
         if (!targetTexture) {
             cocos2d::CCLog("cocos2d: CCSpriteFrameCache: Couldn't load texture: %s (from %s)",
                            relBaseTex.c_str(),
-                           plistbPath.c_str());
+                           loadedPath.c_str());
             return false;
         }
     }

@@ -1261,8 +1261,9 @@ do
       end
       if type(gTbl.SDKUtil) == "table" then _patchSDKUtilTable(gTbl.SDKUtil) end
       for _, dmKey in ipairs({ "databaseManager", "databaseManager_TM" }) do
-        if type(gTbl[dmKey]) == "table" and type(gTbl[dmKey].payReader) == "table" then
-          _patchPayReaderTarget(gTbl[dmKey].payReader)
+        local dm = gTbl[dmKey]
+        if type(dm) == "table" and type(rawget(dm, "payReader")) == "table" then
+          _patchPayReaderTarget(rawget(dm, "payReader"))
         end
       end
       for _, mdKey in ipairs({ "mainData", "mainData_TM" }) do

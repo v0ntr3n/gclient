@@ -22,7 +22,7 @@ namespace gclient {
 namespace assets {
 
 // ============================================================================
-// PlistbLoader - Binary Sprite Sheet (.plistb) Parser & Loader
+// PlistbLoader - Binary Sprite Sheet (.plistb) & XML Fallback Parser / Loader
 //
 // Ported from libcocos2dlua.so (arm64-v8a):
 //   - cocos2d::CCSpriteFrameCache::addSpriteFramesWithBinary @ 0x66f100
@@ -70,7 +70,7 @@ struct PlistbFileData {
 
 class PlistbLoader {
 public:
-    // Parses an in-memory decrypted .plistb buffer into PlistbFileData.
+    // Parses an in-memory decrypted binary .plistb buffer into PlistbFileData.
     // Rejects undecrypted 0xFEFEFEFE buffers, plaintext XML plists, and
     // unterminated fixed-length strings immediately.
     static bool ParseBuffer(const uint8_t* data,
@@ -78,18 +78,34 @@ public:
                             PlistbFileData* outData,
                             std::string* outError = nullptr);
 
+    // Parses an in-memory decrypted plaintext XML sprite-sheet plist buffer
+    // (Cocos2d / TexturePacker formats 0, 1, 2, and 3) into PlistbFileData.
+    // Used when converted .plistb files contain plaintext XML sprite-sheet data.
+    static bool ParseXmlSpriteSheetBuffer(const uint8_t* data,
+                                          size_t size,
+                                          PlistbFileData* outData,
+                                          std::string* outError = nullptr);
+
+    // Resolves candidate sprite-sheet paths for `rawSheetPath` against `baseFilePath`
+    // without duplicating already-present directory prefixes (e.g. prevents
+    // "ArmatureRes/common/ArmatureRes/common/shuaxindaiji.plistb").
+    static std::vector<std::string> ResolveSpriteSheetCandidates(
+        const std::string& rawSheetPath,
+        const std::string& baseFilePath);
+
     // Builds deduplicated texture candidate paths in priority order:
-    //   1. original normalized path
-    //   2. .pvr.ccz
-    //   3. .pkm   (Android ETC1 + _alpha)
-    //   4. .png
+    //   1. .png
+    //   2. original normalized path
+    //   3. .pvr.ccz
+    //   4. .pkm   (Android ETC1 + _alpha)
     //   5. .webp
     //   6. .jpg
     static std::vector<std::string> BuildTextureCandidatePaths(const std::string& texturePath);
 
     // Port of CCSpriteFrameCache::addSpriteFramesWithBinary(plistPath, texture).
-    // Automatically resolves ".plist" -> ".plistb" and probes texture fallbacks
-    // (.pvr.ccz, .pkm, .png, .webp, .jpg) via CCTextureCache if `texture` is nullptr.
+    // Automatically resolves ".plist" -> ".plistb", transparently parses either
+    // binary .plistb or converted plaintext XML .plistb/.plist buffers, and probes
+    // texture fallbacks (.png, .pvr.ccz, .pkm, .webp, .jpg) via CCTextureCache.
     static bool AddSpriteFramesWithBinary(const std::string& plistPath,
                                           cocos2d::CCTexture2D* texture = nullptr,
                                           cocos2d::CCSpriteFrameCache* cache = nullptr);

@@ -3734,6 +3734,212 @@ bool testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim() {
     return true;
 }
 
+
+// ============================================================================
+// Scenario 19 (Issue #19): Plaintext XML .plistb Fallback, Non-Doubled
+// Armature Sprite-Sheet Candidate Resolution, & Null-Safe Spine Cache Contract
+// ============================================================================
+bool testIssue19PlistbXmlFallbackArmaturePathDedupAndSpineNullGuard() {
+    using gclient::assets::PlistbFileData;
+    using gclient::assets::PlistbLoader;
+
+    // 1. Binary PlistbLoader::ParseBuffer continues to strictly reject plaintext XML,
+    //    while PlistbLoader::ParseXmlSpriteSheetBuffer parses Format 2 & Format 3 XML
+    //    sprite-sheet plists (such as ArmatureRes/common/shuaxindaiji.plistb).
+    const std::string xmlFmt2 = R"XML(<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>frames</key>
+        <dict>
+            <key>shuaxindaiji_01.png</key>
+            <dict>
+                <key>frame</key>
+                <string>{{2,4},{64,68}}</string>
+                <key>offset</key>
+                <string>{-1,2}</string>
+                <key>rotated</key>
+                <true/>
+                <key>sourceColorRect</key>
+                <string>{{3,2},{64,68}}</string>
+                <key>sourceSize</key>
+                <string>{72,76}</string>
+            </dict>
+            <key>shuaxindaiji_02.png</key>
+            <dict>
+                <key>frame</key>
+                <string>{{70,4},{48,52}}</string>
+                <key>offset</key>
+                <string>{0,0}</string>
+                <key>rotated</key>
+                <false/>
+                <key>sourceSize</key>
+                <string>{48,52}</string>
+            </dict>
+        </dict>
+        <key>metadata</key>
+        <dict>
+            <key>format</key>
+            <integer>2</integer>
+            <key>realTextureFileName</key>
+            <string>shuaxindaiji.pvr.ccz</string>
+            <key>size</key>
+            <string>{256,256}</string>
+            <key>textureFileName</key>
+            <string>shuaxindaiji.pvr.ccz</string>
+        </dict>
+    </dict>
+</plist>)XML";
+
+    PlistbFileData binRejected;
+    std::string    binErr;
+    REQUIRE_TRUE(!PlistbLoader::ParseBuffer(
+        reinterpret_cast<const uint8_t*>(xmlFmt2.data()), xmlFmt2.size(), &binRejected, &binErr));
+    REQUIRE_TRUE(binErr.find("Plaintext XML") != std::string::npos);
+
+    PlistbFileData xmlParsed2;
+    std::string    xmlErr2;
+    REQUIRE_TRUE(PlistbLoader::ParseXmlSpriteSheetBuffer(
+        reinterpret_cast<const uint8_t*>(xmlFmt2.data()), xmlFmt2.size(), &xmlParsed2, &xmlErr2));
+    REQUIRE_EQ(xmlParsed2.textureFileName, std::string("shuaxindaiji.pvr.ccz"));
+    REQUIRE_EQ(xmlParsed2.frames.size(), static_cast<size_t>(2));
+    REQUIRE_EQ(xmlParsed2.frames[0].frameName, std::string("shuaxindaiji_01.png"));
+    REQUIRE_NEAR(xmlParsed2.frames[0].rectX, 2.0f, 1e-4f);
+    REQUIRE_NEAR(xmlParsed2.frames[0].rectY, 4.0f, 1e-4f);
+    REQUIRE_NEAR(xmlParsed2.frames[0].rectWidth, 64.0f, 1e-4f);
+    REQUIRE_NEAR(xmlParsed2.frames[0].rectHeight, 68.0f, 1e-4f);
+    REQUIRE_TRUE(xmlParsed2.frames[0].rotated);
+    REQUIRE_NEAR(xmlParsed2.frames[0].offsetX, -1.0f, 1e-4f);
+    REQUIRE_NEAR(xmlParsed2.frames[0].offsetY, 2.0f, 1e-4f);
+    REQUIRE_NEAR(xmlParsed2.frames[0].originalWidth, 72.0f, 1e-4f);
+    REQUIRE_NEAR(xmlParsed2.frames[0].originalHeight, 76.0f, 1e-4f);
+    REQUIRE_TRUE(!xmlParsed2.frames[1].rotated);
+
+    // Format 3 with nested <aliases><array>...</array> must also parse cleanly
+    const std::string xmlFmt3 = "\xEF\xBB\xBF" R"XML(<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>frames</key>
+    <dict>
+        <key>fx_glow.png</key>
+        <dict>
+            <key>aliases</key>
+            <array><string>fx_glow_alias.png</string></array>
+            <key>spriteOffset</key>
+            <string>{3,-4}</string>
+            <key>spriteSize</key>
+            <string>{90,110}</string>
+            <key>spriteSourceSize</key>
+            <string>{100,120}</string>
+            <key>textureRect</key>
+            <string>{{12,16},{110,90}}</string>
+            <key>textureRotated</key>
+            <true/>
+        </dict>
+    </dict>
+    <key>metadata</key>
+    <dict>
+        <key>format</key>
+        <integer>3</integer>
+        <key>textureFileName</key>
+        <string>fx_sheet.pkm</string>
+    </dict>
+</dict>
+</plist>)XML";
+
+    PlistbFileData xmlParsed3;
+    REQUIRE_TRUE(PlistbLoader::ParseXmlSpriteSheetBuffer(
+        reinterpret_cast<const uint8_t*>(xmlFmt3.data()), xmlFmt3.size(), &xmlParsed3, &xmlErr2));
+    REQUIRE_EQ(xmlParsed3.textureFileName, std::string("fx_sheet.pkm"));
+    REQUIRE_EQ(xmlParsed3.frames.size(), static_cast<size_t>(1));
+    REQUIRE_NEAR(xmlParsed3.frames[0].rectX, 12.0f, 1e-4f);
+    REQUIRE_NEAR(xmlParsed3.frames[0].rectY, 16.0f, 1e-4f);
+    REQUIRE_NEAR(xmlParsed3.frames[0].rectWidth, 90.0f, 1e-4f);
+    REQUIRE_NEAR(xmlParsed3.frames[0].rectHeight, 110.0f, 1e-4f);
+    REQUIRE_NEAR(xmlParsed3.frames[0].offsetX, 3.0f, 1e-4f);
+    REQUIRE_NEAR(xmlParsed3.frames[0].offsetY, -4.0f, 1e-4f);
+    REQUIRE_TRUE(xmlParsed3.frames[0].rotated);
+
+    // 2. Verify ResolveSpriteSheetCandidates never produces doubled directory prefixes
+    const auto candsPrefixed = PlistbLoader::ResolveSpriteSheetCandidates(
+        "ArmatureRes/common/shuaxindaiji.plist",
+        "ArmatureRes/common/shuaxindaiji.xmlb");
+    REQUIRE_EQ(candsPrefixed.size(), static_cast<size_t>(1));
+    REQUIRE_EQ(candsPrefixed[0], std::string("ArmatureRes/common/shuaxindaiji.plist"));
+
+    const auto candsBare = PlistbLoader::ResolveSpriteSheetCandidates(
+        "shuaxindaiji0.plist",
+        "ArmatureRes/common/shuaxindaiji.xmlb");
+    REQUIRE_EQ(candsBare.size(), static_cast<size_t>(2));
+    REQUIRE_EQ(candsBare[0], std::string("ArmatureRes/common/shuaxindaiji0.plist"));
+    REQUIRE_EQ(candsBare[1], std::string("shuaxindaiji0.plist"));
+
+    const auto candsCrossDir = PlistbLoader::ResolveSpriteSheetCandidates(
+        "UIRes/common/shared_icons.plist",
+        "ArmatureRes/common/shuaxindaiji.xmlb");
+    REQUIRE_TRUE(!candsCrossDir.empty());
+    REQUIRE_EQ(candsCrossDir[0], std::string("UIRes/common/shared_icons.plist"));
+
+    // 3. Verify LoginBackgroundScene -> EffectSpineSprite -> SpineSprite Lua call flow
+    //    when cached SkeletonData fails to parse (placeholder node returned, zero NULL+0x30 AV).
+    ScopedLuaVm spineVm(true);
+    const char* spineContractLua = R"LUA(
+        local cache = {}
+        local function makePlaceholderNode()
+            local n = { _timeScale = 1, _children = {} }
+            function n:getAnimationCount() return 0 end
+            function n:getAnimationName(_) return "" end
+            function n:setAnimation(_, _, _) return nil end
+            function n:addAnimation(_, _, _, _) return nil end
+            function n:setMix(_, _, _) end
+            function n:clearTrack(_) end
+            function n:clearTracks() end
+            function n:setTimeScale(s) self._timeScale = s end
+            function n:getCurrent(_) return nil end
+            function n:setSkin(_) return false end
+            function n:findBone(_) return nil end
+            function n:setAttachment(_, _) return false end
+            function n:boundingBox() return { x = 0, y = 0, width = 0, height = 0 } end
+            function n:update(_) end
+            function n:setStartListener(_) end
+            function n:setEndListener(_) end
+            function n:setCompleteListener(_) end
+            function n:setEventListener(_) end
+            return n
+        end
+        spine = {
+            SpineLuaAnimation = {
+                hasSkeletonData = function(_, id) return cache[id] ~= nil end,
+                setSkeletonDataToCache = function(_, id, j, a, sc)
+                    cache[id] = { json = j, atlas = a, scale = sc, skeletonData = nil, loadAttempted = true }
+                end,
+                createFromCache = function(_, id)
+                    local entry = cache[id]
+                    if entry and entry.skeletonData then return entry.skeletonData end
+                    return makePlaceholderNode()
+                end,
+                removeAllSkeletonData = function(_) cache = {} end,
+            }
+        }
+        -- Simulate SpineSprite.lua:67-82 called by LoginBackgroundScene:addSceneTX("Loading11")
+        local modelId = "Loading11"
+        if not spine.SpineLuaAnimation:hasSkeletonData(modelId) then
+            spine.SpineLuaAnimation:setSkeletonDataToCache(
+                modelId, "SpineRes/effect/Loading11.json", "SpineRes/effect/Loading11.atlas", 1.0)
+        end
+        assert(spine.SpineLuaAnimation:hasSkeletonData(modelId) == true)
+        local anim = spine.SpineLuaAnimation:createFromCache(modelId)
+        assert(anim ~= nil)
+        assert(anim:getAnimationCount() == 0)
+        assert(anim:setAnimation(0, "animation", true) == nil)
+        anim:setTimeScale(2.0)
+        anim:clearTracks()
+        anim:update(0.016)
+    )LUA";
+    REQUIRE_TRUE(spineVm.execChecked(spineContractLua, "SpineNullGuardContract FAIL"));
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -3756,5 +3962,6 @@ int main() {
     suite.run("16_Win32MouseRouting_DpiViewport_And_FuncMenuTouchGroupCycles", testWin32MouseRoutingDpiViewportAndFuncMenuCycles);
     suite.run("17_NetworkAndDataLoading_CrashResilience_And_BindableDataRecovery", testNetworkDataLoadingResilienceAndBindableDataRecovery);
     suite.run("18_InstantBuy_VngPlatformNormalization_And_BtPlatformPayShim", testInstantBuyVngPlatformNormalizationAndBtPlatformPayShim);
+    suite.run("19_Issue19_PlistbXmlFallback_NonDoubledArmaturePaths_And_SpineNullGuard", testIssue19PlistbXmlFallbackArmaturePathDedupAndSpineNullGuard);
     return suite.finishWithBanner();
 }
